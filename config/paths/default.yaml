@@ -1,0 +1,3 @@
+output_dir: ${hydra:runtime.output_dir}
+results_dir: ./results
+checkpoint_dir: ./checkpoints

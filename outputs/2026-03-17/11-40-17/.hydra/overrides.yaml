@@ -1,0 +1,4 @@
+- step=train
+- training.epochs=10
+- training.scheduler.enabled=true
+- model.activation=gelu

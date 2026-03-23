@@ -1,0 +1,4 @@
+- step=train
+- training.epochs=10
+- training.early_stopping.enabled=true
+- training.early_stopping.patience=3

@@ -1,0 +1,30 @@
+epochs: 1000
+learning_rate: 0.001
+batch_size: 32
+optimizer: adam
+weight_decay: 1.0e-5
+ 
+scheduler:
+  enabled: false
+  type: cosine
+  warmup_steps: 100
+ 
+early_stopping:
+  enabled: false
+  patience: 50
+  min_delta: 1.0e-6
+ 
+# ── Maximum relative Entropy (Giffin, 2009) ───────────────────────────────────
+mre:
+  enabled: false              # true per attivare MrE, false per MSE puro
+ 
+  update_mode: simultaneous   # "simultaneous" (Sez. 5) | "sequential" (Sez. 4)
+ 
+  lambda_entropy: 0.05        # peso del termine KL verso la prior storica
+  lambda_moment: 0.1          # peso del vincolo sui momenti ⟨f(θ)⟩ = F
+ 
+  # moment_target: [100.0, 250.0]   # opzionale: F per ticker, in ordine di cfg.data.tickers
+                                     # se assente → calcolato come media del training set
+ 
+  epochs_phase1: 30           # solo per update_mode: sequential
+ 

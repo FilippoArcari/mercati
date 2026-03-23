@@ -1,0 +1,72 @@
+tickers:
+  - AAPL
+  - MSFT
+  - AMZN
+  - GOOGL
+  - META
+  - NVDA
+  - TSLA
+  - JPM
+  - V
+  - MA
+  - UNH
+  - JNJ
+  - LDO.MI
+  - ENI.MI
+  - ENEL.MI
+  - ISP.MI
+  - RACE.MI
+  - "^GSPC"
+  - "^IXIC"
+  - FTSEMIB.MI
+  - SPY
+  - QQQ
+  - IVV
+  - EEM
+  - EFA
+  - XLF
+  - VNQ
+  - GC=F
+  - CL=F
+  - SI=F
+  - NG=F
+  - HG=F
+  - GLD
+  - SLV
+  - USO
+  - EURUSD=X
+  - USDJPY=X
+  - TLT
+  - BND
+  - IEF
+  - XLE
+  - BTC-USD
+  - ETH-USD
+  - XOM
+  - CVX
+  - WMT
+  - NFLX
+  - BA
+  - KO
+  - PFE
+  - SHOP
+inflation_series:
+  - CPILFESL
+  - T10YIE
+  - MICH
+  - FEDFUNDS
+  - GS10
+  - T10Y2Y
+  - VIXCLS
+  - STLFSI4
+  - BAMLH0A0HYM2
+  - CP0000EZ19M086NEST
+  #- CP0000ITM086NEST # inflazione italiana 
+  - CP0000ITM086NEST
+  - IR3TIB01EZM156N #Euribor 3 mesi
+  
+start_date: "2018-01-01"
+end_date: "2025-12-31"
+cache_path: "./data.csv"
+fred_api_key: ${oc.env:FRED_API_KEY}
+split_date: "2023-01-01"

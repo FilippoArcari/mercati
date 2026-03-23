@@ -1,0 +1,3 @@
+- step=train
+- training.epochs=5
+- training.optimizer=sgd

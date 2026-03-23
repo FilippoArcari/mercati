@@ -1,0 +1,15 @@
+defaults:
+  - data: default
+  - model: cnn
+  - training: default
+  - prediction: default
+  - buyer: default
+  - paths: default
+  - frequency: daily     # daily | weekly | monthly
+  - _self_
+ 
+step: train  # train | test | trade
+ 
+
+
+

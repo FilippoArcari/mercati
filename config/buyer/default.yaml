@@ -1,0 +1,27 @@
+# config/buyer/default.yaml — Configurazione agente DDPG
+
+initial_capital:  100    # liquidità iniziale in USD
+transaction_cost: 0.001       # costo per transazione (0.1%)
+
+# ── Architettura reti ─────────────────────────────────────────────────────────
+actor_hidden:  [128, 128]     # layer nascosti dell'Actor
+critic_hidden: [128, 128]     # layer nascosti del Critic
+
+# ── Iperparametri DDPG ────────────────────────────────────────────────────────
+lr_actor:   0.0001            # learning rate Actor
+lr_critic:  0.0003            # learning rate Critic
+gamma:      0.99              # fattore di sconto
+tau:        0.005             # coefficiente soft update (Polyak)
+
+buffer_capacity: 100000       # dimensione replay buffer
+batch_size:      32          # dimensione mini-batch
+update_every:    10          # aggiorna ogni N step
+
+# ── Esplorazione ──────────────────────────────────────────────────────────────
+noise_sigma:       0.2        # sigma iniziale Ornstein-Uhlenbeck
+noise_decay:       0.995      # moltiplicatore sigma per episodio
+
+# ── Training ──────────────────────────────────────────────────────────────────
+n_episodes:  100 # 200              # episodi di addestramento
+warmup:      1000             # step iniziali con azioni casuali
+log_every:   10               # ogni quanti episodi stampare le metriche

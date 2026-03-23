@@ -1,0 +1,120 @@
+provare con DQN algorithm 
+
+La mia idea è la seguente: dato che l'entropia può essere vista come S = k_b \log(W) oppure come = dQ / T. Considerando il mercato come un gas perfetto, allora possiamo dire che PV = N k_b T, dove P è la pressione, V è il volume, N è il numero di particelle, k_b è la costante di Boltzmann e T è la temperatura. Se consideriamo il portafoglio come un gas perfetto, allora possiamo dire che PV = N k_b T, dove P è la pressione del mercato, V è il volume del portafoglio, N è il numero di asset nel portafoglio, k_b è la costante di Boltzmann e T è la temperatura del mercato.
+dato che non sappiamo quale sia la temperatura del mercato in modo analitico (esistono stime tipo RSI (Relative Strength Index oppure L"Indice "Fear & Greed" ma non sono quello che voglio ) possiamo mettere a sistema PV = N k_b T ed S = k_b * log(W) cercando di isolare P e T (questo non so come farlo).
+La mia idea è quella di capire come cambia la pressione del mercato (Teoria cinetica dei gas) in funzione del portafoglio (volume) e del numero di asset (particelle) e della temperatura . In questo modo potrei avere una stima della pressione del mercato e quindi capire quando è il momento migliore per entrare o uscire dal mercato.
+Vorrei dire anche che probabilmente la pressione si oppone ai tassi di interesse però non sono sicuro di questo, quindi non voglio fare supposizioni senza dati alla mano.
+
+
+ddestramento DDPG (100 episodi)...
+[DDPG] Ep 1/100 | Step 2160 | Reward: +0.5623[DDPG] Ep 1/100 | Reward: +0.5623 | 
+[DDPG] Ep 2/100 | Step 4320 | Reward: +0.7641[DDPG] Ep 2/100 | Reward: +0.7641 | 
+[DDPG] Ep 3/100 | Step 6480 | Reward: +1.0545[DDPG] Ep 3/100 | Reward: +1.0545 | 
+[DDPG] Ep 4/100 | Step 8640 | Reward: +1.4542[DDPG] Ep 4/100 | Reward: +1.4542 | 
+[DDPG] Ep 5/100 | Step 10800 | Reward: +0.7371[DDPG] Ep 5/100 | Reward: +0.7371 | 
+[DDPG] Ep 6/100 | Step 12960 | Reward: +0.8820[DDPG] Ep 6/100 | Reward: +0.8820 | 
+[DDPG] Ep 7/100 | Step 15120 | Reward: +1.3544[DDPG] Ep 7/100 | Reward: +1.3544 | 
+[DDPG] Ep 8/100 | Step 17280 | Reward: +0.9168[DDPG] Ep 8/100 | Reward: +0.9168 | 
+[DDPG] Ep 9/100 | Step 19440 | Reward: +0.8841[DDPG] Ep 9/100 | Reward: +0.8841 | 
+[DDPG] Ep 10/100 | Step 21600 | Reward: +0.8990[DDPG] Ep 10/100 | Reward: +0.8990 | 
+Ep   10/100 | Reward: +0.8990 | Portfolio: $219 | Sharpe: 0.641 | MaxDD: -0.340 | C-loss: 0.00014 | A-loss: -0.06959
+[DDPG] Ep 11/100 | Step 23760 | Reward: +0.8998[DDPG] Ep 11/100 | Reward: +0.8998 | 
+[DDPG] Ep 12/100 | Step 25920 | Reward: +0.9161[DDPG] Ep 12/100 | Reward: +0.9161 | 
+[DDPG] Ep 13/100 | Step 28080 | Reward: +0.9308[DDPG] Ep 13/100 | Reward: +0.9308 | 
+[DDPG] Ep 14/100 | Step 30240 | Reward: +0.8795[DDPG] Ep 14/100 | Reward: +0.8795 | 
+[DDPG] Ep 15/100 | Step 32400 | Reward: +0.8788[DDPG] Ep 15/100 | Reward: +0.8788 | 
+[DDPG] Ep 16/100 | Step 34560 | Reward: +0.9278[DDPG] Ep 16/100 | Reward: +0.9278 | 
+[DDPG] Ep 17/100 | Step 36720 | Reward: +0.8363[DDPG] Ep 17/100 | Reward: +0.8363 | 
+[DDPG] Ep 18/100 | Step 38880 | Reward: +0.8823[DDPG] Ep 18/100 | Reward: +0.8823 | 
+[DDPG] Ep 19/100 | Step 41040 | Reward: +0.9192[DDPG] Ep 19/100 | Reward: +0.9192 | 
+[DDPG] Ep 20/100 | Step 43200 | Reward: +0.9282[DDPG] Ep 20/100 | Reward: +0.9282 | 
+Ep   20/100 | Reward: +0.9282 | Portfolio: $224 | Sharpe: 0.640 | MaxDD: -0.402 | C-loss: 0.00012 | A-loss: -0.06731
+[DDPG] Ep 21/100 | Step 45360 | Reward: +0.8689[DDPG] Ep 21/100 | Reward: +0.8689 | 
+[DDPG] Ep 22/100 | Step 47520 | Reward: +0.8290[DDPG] Ep 22/100 | Reward: +0.8290 | 
+[DDPG] Ep 23/100 | Step 49680 | Reward: +0.9352[DDPG] Ep 23/100 | Reward: +0.9352 | 
+[DDPG] Ep 24/100 | Step 51840 | Reward: +1.1348[DDPG] Ep 24/100 | Reward: +1.1348 | 
+[DDPG] Ep 25/100 | Step 54000 | Reward: +1.0565[DDPG] Ep 25/100 | Reward: +1.0565 | 
+[DDPG] Ep 26/100 | Step 56160 | Reward: +1.0810[DDPG] Ep 26/100 | Reward: +1.0810 | 
+[DDPG] Ep 27/100 | Step 58320 | Reward: +1.0819[DDPG] Ep 27/100 | Reward: +1.0819 | 
+[DDPG] Ep 28/100 | Step 60480 | Reward: +1.0838[DDPG] Ep 28/100 | Reward: +1.0838 | 
+[DDPG] Ep 29/100 | Step 62640 | Reward: +1.1385[DDPG] Ep 29/100 | Reward: +1.1385 | 
+[DDPG] Ep 30/100 | Step 64800 | Reward: +1.2297[DDPG] Ep 30/100 | Reward: +1.2297 | 
+Ep   30/100 | Reward: +1.2297 | Portfolio: $287 | Sharpe: 0.710 | MaxDD: -0.420 | C-loss: 0.00012 | A-loss: -0.06530
+[DDPG] Ep 31/100 | Step 66960 | Reward: +1.1674[DDPG] Ep 31/100 | Reward: +1.1674 | 
+[DDPG] Ep 32/100 | Step 69120 | Reward: +1.2340[DDPG] Ep 32/100 | Reward: +1.2340 | 
+[DDPG] Ep 33/100 | Step 71280 | Reward: +1.2014[DDPG] Ep 33/100 | Reward: +1.2014 | 
+[DDPG] Ep 34/100 | Step 73440 | Reward: +1.1634[DDPG] Ep 34/100 | Reward: +1.1634 | 
+[DDPG] Ep 35/100 | Step 75600 | Reward: +1.1377[DDPG] Ep 35/100 | Reward: +1.1377 | 
+[DDPG] Ep 36/100 | Step 77760 | Reward: +1.1286[DDPG] Ep 36/100 | Reward: +1.1286 | 
+[DDPG] Ep 37/100 | Step 79920 | Reward: +1.1095[DDPG] Ep 37/100 | Reward: +1.1095 | 
+[DDPG] Ep 38/100 | Step 82080 | Reward: +1.0917[DDPG] Ep 38/100 | Reward: +1.0917 | 
+[DDPG] Ep 39/100 | Step 84240 | Reward: +1.0929[DDPG] Ep 39/100 | Reward: +1.0929 | 
+[DDPG] Ep 40/100 | Step 86400 | Reward: +1.0894[DDPG] Ep 40/100 | Reward: +1.0894 | 
+Ep   40/100 | Reward: +1.0894 | Portfolio: $252 | Sharpe: 0.650 | MaxDD: -0.410 | C-loss: 0.00014 | A-loss: -0.06324
+[DDPG] Ep 41/100 | Step 88560 | Reward: +1.0380[DDPG] Ep 41/100 | Reward: +1.0380 | 
+[DDPG] Ep 42/100 | Step 90720 | Reward: +1.0281[DDPG] Ep 42/100 | Reward: +1.0281 | 
+[DDPG] Ep 43/100 | Step 92880 | Reward: +1.0134[DDPG] Ep 43/100 | Reward: +1.0134 | 
+[DDPG] Ep 44/100 | Step 95040 | Reward: +1.0209[DDPG] Ep 44/100 | Reward: +1.0209 | 
+[DDPG] Ep 45/100 | Step 97200 | Reward: +1.0312[DDPG] Ep 45/100 | Reward: +1.0312 | 
+[DDPG] Ep 46/100 | Step 99360 | Reward: +1.0541[DDPG] Ep 46/100 | Reward: +1.0541 | 
+[DDPG] Ep 47/100 | Step 101520 | Reward: +1.0554[DDPG] Ep 47/100 | Reward: +1.0554 | 
+[DDPG] Ep 48/100 | Step 103680 | Reward: +1.0659[DDPG] Ep 48/100 | Reward: +1.0659 | 
+[DDPG] Ep 49/100 | Step 105840 | Reward: +1.0956[DDPG] Ep 49/100 | Reward: +1.0956 | 
+[DDPG] Ep 50/100 | Step 108000 | Reward: +1.0586[DDPG] Ep 50/100 | Reward: +1.0586 | 
+Ep   50/100 | Reward: +1.0586 | Portfolio: $248 | Sharpe: 0.658 | MaxDD: -0.406 | C-loss: 0.00014 | A-loss: -0.06203
+[DDPG] Ep 51/100 | Step 110160 | Reward: +1.0263[DDPG] Ep 51/100 | Reward: +1.0263 | 
+[DDPG] Ep 52/100 | Step 112320 | Reward: +1.0187[DDPG] Ep 52/100 | Reward: +1.0187 | 
+[DDPG] Ep 53/100 | Step 114480 | Reward: +0.9936[DDPG] Ep 53/100 | Reward: +0.9936 | 
+[DDPG] Ep 54/100 | Step 116640 | Reward: +0.9040[DDPG] Ep 54/100 | Reward: +0.9040 | 
+[DDPG] Ep 55/100 | Step 118800 | Reward: +0.8410[DDPG] Ep 55/100 | Reward: +0.8410 | 
+[DDPG] Ep 56/100 | Step 120960 | Reward: +1.0478[DDPG] Ep 56/100 | Reward: +1.0478 | 
+[DDPG] Ep 57/100 | Step 123120 | Reward: +1.0518[DDPG] Ep 57/100 | Reward: +1.0518 | 
+[DDPG] Ep 58/100 | Step 125280 | Reward: +1.0585[DDPG] Ep 58/100 | Reward: +1.0585 | 
+[DDPG] Ep 59/100 | Step 127440 | Reward: +1.0794[DDPG] Ep 59/100 | Reward: +1.0794 | 
+[DDPG] Ep 60/100 | Step 129600 | Reward: +1.0881[DDPG] Ep 60/100 | Reward: +1.0881 | 
+Ep   60/100 | Reward: +1.0881 | Portfolio: $254 | Sharpe: 0.663 | MaxDD: -0.387 | C-loss: 0.00013 | A-loss: -0.05977
+[DDPG] Ep 61/100 | Step 131760 | Reward: +1.0678[DDPG] Ep 61/100 | Reward: +1.0678 | 
+[DDPG] Ep 62/100 | Step 133920 | Reward: +1.0738[DDPG] Ep 62/100 | Reward: +1.0738 | 
+[DDPG] Ep 63/100 | Step 136080 | Reward: +1.0814[DDPG] Ep 63/100 | Reward: +1.0814 | 
+[DDPG] Ep 64/100 | Step 138240 | Reward: +1.0722[DDPG] Ep 64/100 | Reward: +1.0722 | 
+[DDPG] Ep 65/100 | Step 140400 | Reward: +1.1106[DDPG] Ep 65/100 | Reward: +1.1106 | 
+[DDPG] Ep 66/100 | Step 142560 | Reward: +1.0685[DDPG] Ep 66/100 | Reward: +1.0685 | 
+[DDPG] Ep 67/100 | Step 144720 | Reward: +1.0627[DDPG] Ep 67/100 | Reward: +1.0627 | 
+[DDPG] Ep 68/100 | Step 146880 | Reward: +1.0934[DDPG] Ep 68/100 | Reward: +1.0934 | 
+[DDPG] Ep 69/100 | Step 149040 | Reward: +1.0766[DDPG] Ep 69/100 | Reward: +1.0766 | 
+[DDPG] Ep 70/100 | Step 151200 | Reward: +1.0928[DDPG] Ep 70/100 | Reward: +1.0928 | 
+Ep   70/100 | Reward: +1.0928 | Portfolio: $255 | Sharpe: 0.670 | MaxDD: -0.415 | C-loss: 0.00014 | A-loss: -0.05847
+[DDPG] Ep 71/100 | Step 153360 | Reward: +0.9961[DDPG] Ep 71/100 | Reward: +0.9961 | 
+[DDPG] Ep 72/100 | Step 155520 | Reward: +0.9932[DDPG] Ep 72/100 | Reward: +0.9932 | 
+[DDPG] Ep 73/100 | Step 157680 | Reward: +0.9929[DDPG] Ep 73/100 | Reward: +0.9929 | 
+[DDPG] Ep 74/100 | Step 159840 | Reward: +0.9996[DDPG] Ep 74/100 | Reward: +0.9996 | 
+[DDPG] Ep 75/100 | Step 162000 | Reward: +0.9601[DDPG] Ep 75/100 | Reward: +0.9601 | 
+[DDPG] Ep 76/100 | Step 164160 | Reward: +0.9510[DDPG] Ep 76/100 | Reward: +0.9510 | 
+[DDPG] Ep 77/100 | Step 166320 | Reward: +0.9582[DDPG] Ep 77/100 | Reward: +0.9582 | 
+[DDPG] Ep 78/100 | Step 168480 | Reward: +0.9593[DDPG] Ep 78/100 | Reward: +0.9593 | 
+[DDPG] Ep 79/100 | Step 170640 | Reward: +0.9966[DDPG] Ep 79/100 | Reward: +0.9966 | 
+[DDPG] Ep 80/100 | Step 172800 | Reward: +1.0225[DDPG] Ep 80/100 | Reward: +1.0225 | 
+Ep   80/100 | Reward: +1.0225 | Portfolio: $238 | Sharpe: 0.627 | MaxDD: -0.416 | C-loss: 0.00014 | A-loss: -0.05647
+[DDPG] Ep 81/100 | Step 174960 | Reward: +0.9845[DDPG] Ep 81/100 | Reward: +0.9845 | 
+[DDPG] Ep 82/100 | Step 177120 | Reward: +0.9966[DDPG] Ep 82/100 | Reward: +0.9966 | 
+[DDPG] Ep 83/100 | Step 179280 | Reward: +0.9911[DDPG] Ep 83/100 | Reward: +0.9911 | 
+[DDPG] Ep 84/100 | Step 181440 | Reward: +0.9952[DDPG] Ep 84/100 | Reward: +0.9952 | 
+[DDPG] Ep 85/100 | Step 183600 | Reward: +1.0100[DDPG] Ep 85/100 | Reward: +1.0100 | 
+[DDPG] Ep 86/100 | Step 185760 | Reward: +0.9966[DDPG] Ep 86/100 | Reward: +0.9966 | 
+[DDPG] Ep 87/100 | Step 187920 | Reward: +0.9638[DDPG] Ep 87/100 | Reward: +0.9638 | 
+[DDPG] Ep 88/100 | Step 190080 | Reward: +0.5030[DDPG] Ep 88/100 | Reward: +0.5030 | 
+[DDPG] Ep 89/100 | Step 192240 | Reward: +0.5203[DDPG] Ep 89/100 | Reward: +0.5203 | 
+[DDPG] Ep 90/100 | Step 194400 | Reward: +0.5272[DDPG] Ep 90/100 | Reward: +0.5272 | 
+Ep   90/100 | Reward: +0.5272 | Portfolio: $159 | Sharpe: 0.496 | MaxDD: -0.261 | C-loss: 0.00013 | A-loss: -0.05492
+[DDPG] Ep 91/100 | Step 196560 | Reward: +0.4973[DDPG] Ep 91/100 | Reward: +0.4973 | 
+[DDPG] Ep 92/100 | Step 198720 | Reward: +0.5044[DDPG] Ep 92/100 | Reward: +0.5044 | 
+[DDPG] Ep 93/100 | Step 200880 | Reward: +0.5520[DDPG] Ep 93/100 | Reward: +0.5520 | 
+[DDPG] Ep 94/100 | Step 203040 | Reward: +0.5435[DDPG] Ep 94/100 | Reward: +0.5435 | 
+[DDPG] Ep 95/100 | Step 205200 | Reward: +0.5462[DDPG] Ep 95/100 | Reward: +0.5462 | 
+[DDPG] Ep 96/100 | Step 207360 | Reward: +0.5888[DDPG] Ep 96/100 | Reward: +0.5888 | 
+[DDPG] Ep 97/100 | Step 209520 | Reward: +0.6402[DDPG] Ep 97/100 | Reward: +0.6402 | 
+[DDPG] Ep 98/100 | Step 211680 | Reward: +0.5973[DDPG] Ep 98/100 | Reward: +0.5973 | 
+[DDPG] Ep 99/100 | Step 213840 | Reward: +0.5180[DDPG] Ep 99/100 | Reward: +0.5180 | 
+[DDPG] Ep 100/100 | Step 216000 | Reward: +0.5555[DDPG] Ep 100/100 | Reward: +0.5555 | 
+Ep  100/100 | Reward: +0.5555 | Portfolio: $162 | Sharpe: 0.491 | MaxDD: -0.288 | C-loss: 0.00012 | A-loss: -0.05302
+[DDPG] Checkpoint salvato in ./checkpoints/ddpg.pth 

@@ -1,0 +1,98 @@
+data:
+  tickers:
+  - AAPL
+  - MSFT
+  - AMZN
+  - GOOGL
+  - META
+  - NVDA
+  - TSLA
+  - JPM
+  - V
+  - MA
+  - UNH
+  - JNJ
+  - LDO.MI
+  - ENI.MI
+  - ENEL.MI
+  - ISP.MI
+  - RACE.MI
+  - ^GSPC
+  - ^IXIC
+  - FTSEMIB.MI
+  - SPY
+  - QQQ
+  - IVV
+  - EEM
+  - EFA
+  - XLF
+  - VNQ
+  - GC=F
+  - CL=F
+  - SI=F
+  - NG=F
+  - HG=F
+  - GLD
+  - SLV
+  - USO
+  - EURUSD=X
+  - USDJPY=X
+  - TLT
+  - BND
+  - IEF
+  - XLE
+  - BTC-USD
+  - ETH-USD
+  - XOM
+  - CVX
+  - WMT
+  - NFLX
+  - BA
+  - KO
+  - PFE
+  - SHOP
+  start_date: '2022-01-01'
+  end_date: '2026-02-14'
+  cache_path: ./data.csv
+model:
+  name: cnn
+  dimensions:
+  - 64
+  - 32
+  - 16
+  dilations:
+  - 1
+  - 2
+  - 4
+  kernel_size: 3
+  activation: leaky_relu
+training:
+  epochs: 1000
+  learning_rate: 0.001
+  batch_size: 32
+  optimizer: adam
+  weight_decay: 1.0e-05
+  scheduler:
+    enabled: false
+    type: cosine
+    warmup_steps: 100
+  early_stopping:
+    enabled: false
+    patience: 50
+    min_delta: 1.0e-06
+prediction:
+  window_size: 30
+  stride: 1
+  split_date: '2024-01-01'
+buyer:
+  initial_capital: 100000.0
+  commission: 0.001
+  max_position_pct: 0.1
+  stop_loss: 0.05
+  take_profit: 0.1
+  risk_free_rate: 0.02
+paths:
+  output_dir: ${hydra:runtime.output_dir}
+  results_dir: ./results
+  checkpoint_dir: ./checkpoints
+step: train

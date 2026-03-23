@@ -1,0 +1,10 @@
+# config/frequency/daily.yaml
+interval: "1d"
+label: "daily"
+bars_per_day: 1
+cache_path: "./data_daily.csv"
+max_history_days: null
+
+# Split: se split_ratio è impostato, ha priorità su data.split_date
+# null → usa data.split_date del config data/default.yaml
+split_ratio: null

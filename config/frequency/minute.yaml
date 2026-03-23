@@ -1,0 +1,10 @@
+# config/frequency/minute.yaml
+interval: "1m"
+label: "minute"
+bars_per_day: 390
+cache_path: "./data_minute.csv"
+max_history_days: 7
+
+# Con 1m hai ~2730 barre totali: data fissa è inutile, usa una percentuale
+# 0.8 → 80% training, 20% test
+split_ratio: 0.8
