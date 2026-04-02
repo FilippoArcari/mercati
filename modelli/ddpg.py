@@ -1,7 +1,3 @@
-"""
-modelli/ddpg.py — Deep Deterministic Policy Gradient per trading
-"""
-
 from __future__ import annotations
 
 import numpy as np
@@ -12,6 +8,8 @@ from collections import deque
 import random
 import os
 from typing import Optional
+
+from modelli.utils import get_device
 
 
 # ─── Ornstein-Uhlenbeck Noise ─────────────────────────────────────────────────
@@ -36,15 +34,16 @@ class OUNoise:
         self.state = self.state + dx
         return self.state.astype(np.float32)
 
-    def decay(self, factor=0.995):
-        self.sigma = max(self.sigma * factor, 0.01)
+    def decay(self, factor=0.995, floor=0.05):
+        self.sigma = max(self.sigma * factor, floor)
 
 
 # ─── Replay Buffer ─────────────────────────────────────────────────────────────
 
 class ReplayBuffer:
-    def __init__(self, capacity):
+    def __init__(self, capacity, device: torch.device = None):
         self.buffer: deque = deque(maxlen=capacity)
+        self.device = device or torch.device('cpu')
 
     def push(self, state, action, reward, next_state, done):
         self.buffer.append((state, action, reward, next_state, done))
@@ -53,18 +52,18 @@ class ReplayBuffer:
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
         return (
-            torch.tensor(np.array(states),      dtype=torch.float32),
-            torch.tensor(np.array(actions),     dtype=torch.float32),
-            torch.tensor(np.array(rewards),     dtype=torch.float32).unsqueeze(1),
-            torch.tensor(np.array(next_states), dtype=torch.float32),
-            torch.tensor(np.array(dones),       dtype=torch.float32).unsqueeze(1),
+            torch.tensor(np.array(states),      dtype=torch.float32, device=self.device),
+            torch.tensor(np.array(actions),     dtype=torch.float32, device=self.device),
+            torch.tensor(np.array(rewards),     dtype=torch.float32, device=self.device).unsqueeze(1),
+            torch.tensor(np.array(next_states), dtype=torch.float32, device=self.device),
+            torch.tensor(np.array(dones),       dtype=torch.float32, device=self.device).unsqueeze(1),
         )
 
     def __len__(self):
         return len(self.buffer)
 
 
-# ─── Actor ────────────────────────────────────────────────────────────────────
+# ─── Actor (Dinamico) ─────────────────────────────────────────────────────────
 
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim, hidden=None):
@@ -75,8 +74,14 @@ class Actor(nn.Module):
         layers = []
         in_dim = state_dim
         for h in hidden:
-            layers += [nn.Linear(in_dim, h), nn.LayerNorm(h), nn.ReLU()]
+            layers += [
+                nn.Linear(in_dim, h),
+                nn.LayerNorm(h),
+                nn.LeakyReLU(0.2) # LeakyReLU aiuta a prevenire neuroni morti in reti profonde
+            ]
             in_dim = h
+        
+        # Output layer: Tanh per mappare azioni in [-1, 1]
         layers += [nn.Linear(in_dim, action_dim), nn.Tanh()]
 
         self.net = nn.Sequential(*layers)
@@ -85,14 +90,17 @@ class Actor(nn.Module):
     def _init_weights(self):
         for m in self.net:
             if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=0.01)
+                # Orthogonal init per stabilità in reti profonde
+                nn.init.orthogonal_(m.weight, gain=1.0)
                 nn.init.zeros_(m.bias)
+        # Gain basso per l'ultimo layer per favorire esplorazione iniziale
+        nn.init.orthogonal_(self.net[-2].weight, gain=0.01)
 
     def forward(self, state):
         return self.net(state)
 
 
-# ─── Critic ───────────────────────────────────────────────────────────────────
+# ─── Critic (Dinamico) ────────────────────────────────────────────────────────
 
 class Critic(nn.Module):
     def __init__(self, state_dim, action_dim, hidden=None):
@@ -100,22 +108,41 @@ class Critic(nn.Module):
         if hidden is None:
             hidden = [256, 256]
 
-        self.fc1 = nn.Linear(state_dim, hidden[0])
-        self.ln1 = nn.LayerNorm(hidden[0])
-        self.fc2 = nn.Linear(hidden[0] + action_dim, hidden[1])
-        self.ln2 = nn.LayerNorm(hidden[1])
-        self.out = nn.Linear(hidden[1], 1)
+        # Primo layer processa solo lo stato (standard DDPG architecture)
+        self.state_in = nn.Sequential(
+            nn.Linear(state_dim, hidden[0]),
+            nn.LayerNorm(hidden[0]),
+            nn.LeakyReLU(0.2)
+        )
+
+        # Layer intermedi processano (output_state_in + action)
+        layers = []
+        in_dim = hidden[0] + action_dim
+        
+        # Se ci sono altri layer oltre al primo
+        for h in hidden[1:]:
+            layers += [
+                nn.Linear(in_dim, h),
+                nn.LayerNorm(h),
+                nn.LeakyReLU(0.2)
+            ]
+            in_dim = h
+            
+        self.mid_layers = nn.Sequential(*layers)
+        self.out = nn.Linear(in_dim, 1)
+        
         self._init_weights()
 
     def _init_weights(self):
-        for m in [self.fc1, self.fc2, self.out]:
-            nn.init.orthogonal_(m.weight, gain=0.01)
-            nn.init.zeros_(m.bias)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=1.0)
+                nn.init.zeros_(m.bias)
 
     def forward(self, state, action):
-        x = F.relu(self.ln1(self.fc1(state)))
-        x = torch.cat([x, action], dim=1)
-        x = F.relu(self.ln2(self.fc2(x)))
+        s_h = self.state_in(state)
+        combined = torch.cat([s_h, action], dim=1)
+        x = self.mid_layers(combined)
         return self.out(x)
 
 
@@ -136,9 +163,14 @@ class DDPGAgent:
         batch_size=64,
         update_every=1,
         noise_sigma=0.2,
+        device: torch.device = None,
     ):
-        if actor_hidden  is None: actor_hidden  = [256, 256]
-        if critic_hidden is None: critic_hidden = [256, 256]
+        # Setup device
+        self.device = device or get_device()
+
+        # Setup hidden layers dinamico
+        self.actor_hidden = actor_hidden or [256, 256]
+        self.critic_hidden = critic_hidden or [256, 256]
 
         self.state_dim    = state_dim
         self.action_dim   = action_dim
@@ -148,10 +180,10 @@ class DDPGAgent:
         self.update_every = update_every
         self._step_count  = 0
 
-        self.actor         = Actor(state_dim,  action_dim, actor_hidden)
-        self.actor_target  = Actor(state_dim,  action_dim, actor_hidden)
-        self.critic        = Critic(state_dim, action_dim, critic_hidden)
-        self.critic_target = Critic(state_dim, action_dim, critic_hidden)
+        self.actor         = Actor(state_dim,  action_dim, self.actor_hidden).to(self.device)
+        self.actor_target  = Actor(state_dim,  action_dim, self.actor_hidden).to(self.device)
+        self.critic        = Critic(state_dim, action_dim, self.critic_hidden).to(self.device)
+        self.critic_target = Critic(state_dim, action_dim, self.critic_hidden).to(self.device)
 
         self._hard_update(self.actor_target,  self.actor)
         self._hard_update(self.critic_target, self.critic)
@@ -160,14 +192,14 @@ class DDPGAgent:
         self.opt_critic = torch.optim.Adam(self.critic.parameters(), lr=lr_critic,
                                            weight_decay=1e-4)
 
-        self.buffer = ReplayBuffer(buffer_capacity)
+        self.buffer = ReplayBuffer(buffer_capacity, device=self.device)
         self.noise  = OUNoise(action_dim, sigma=noise_sigma)
 
     def act(self, state, explore=True):
-        s = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+        s = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         self.actor.eval()
         with torch.no_grad():
-            action = self.actor(s).squeeze(0).numpy()
+            action = self.actor(s).squeeze(0).cpu().numpy()
         self.actor.train()
         if explore:
             action = action + self.noise.sample()
@@ -189,7 +221,7 @@ class DDPGAgent:
             q_target     = rewards + self.gamma * (1 - dones) * self.critic_target(next_states, next_actions)
 
         q_current   = self.critic(states, actions)
-        critic_loss = F.mse_loss(q_current, q_target)
+        critic_loss = F.smooth_l1_loss(q_current, q_target)
 
         self.opt_critic.zero_grad()
         critic_loss.backward()
@@ -208,7 +240,7 @@ class DDPGAgent:
 
         return {"critic_loss": critic_loss.item(), "actor_loss": actor_loss.item()}
 
-    def _soft_update(self, target, source):
+    def     _soft_update(self, target, source):
         for t_p, s_p in zip(target.parameters(), source.parameters()):
             t_p.data.copy_(self.tau * s_p.data + (1.0 - self.tau) * t_p.data)
 
@@ -216,45 +248,46 @@ class DDPGAgent:
     def _hard_update(target, source):
         target.load_state_dict(source.state_dict())
 
-    def decay_noise(self, factor=0.995):
-        self.noise.decay(factor)
+    def decay_noise(self, factor=0.995, floor=0.05):
+        self.noise.decay(factor, floor)
 
     def reset_noise(self):
         self.noise.reset()
 
-    # ── checkpoint ────────────────────────────────────────────────────────────
-
-    def save(self, path: str) -> None:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        torch.save({
-            "state_dim":     self.state_dim,     # ← salvato per verifica compatibilità
+    def _state(self) -> dict:
+        return {
+            "state_dim":     self.state_dim,
             "action_dim":    self.action_dim,
+            "actor_hidden":  self.actor_hidden,
+            "critic_hidden": self.critic_hidden,
             "actor":         self.actor.state_dict(),
             "actor_target":  self.actor_target.state_dict(),
             "critic":        self.critic.state_dict(),
             "critic_target": self.critic_target.state_dict(),
-        }, path)
-        print(f"[DDPG] Checkpoint salvato in {path} "
-              f"(state_dim={self.state_dim}, action_dim={self.action_dim})")
+        }
+
+    def save(self, path: str, tag: str = "") -> None:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        torch.save(self._state(), path)
+        label = f" [{tag}]" if tag else ""
+        print(f"[DDPG] Checkpoint salvato{label}: {path} "
+              f"(arch: {self.actor_hidden})")
 
     def load(self, path: str) -> bool:
-        """
-        Carica il checkpoint se è compatibile con le dimensioni correnti.
-
-        Ritorna True se il caricamento ha avuto successo,
-                False se il checkpoint è incompatibile (l'agente riparte da zero).
-        """
-        ckpt = torch.load(path, weights_only=True)
+        ckpt = torch.load(path, weights_only=False) # Necessario per caricare le liste hidden
 
         saved_state_dim  = ckpt.get("state_dim")
         saved_action_dim = ckpt.get("action_dim")
+        saved_actor_h    = ckpt.get("actor_hidden")
 
-        # Verifica compatibilità dimensioni
-        if saved_state_dim != self.state_dim or saved_action_dim != self.action_dim:
+        # Verifica compatibilità architettura
+        if (saved_state_dim != self.state_dim or 
+            saved_action_dim != self.action_dim or
+            saved_actor_h != self.actor_hidden):
             print(
-                f"[DDPG] Checkpoint incompatibile — ignorato.\n"
-                f"  Checkpoint : state_dim={saved_state_dim}, action_dim={saved_action_dim}\n"
-                f"  Corrente   : state_dim={self.state_dim},  action_dim={self.action_dim}\n"
+                f"[DDPG] Checkpoint incompatibile (Architettura differente).\n"
+                f"  Checkpoint : {saved_actor_h}\n"
+                f"  Corrente   : {self.actor_hidden}\n"
                 f"  L'agente riparte da zero."
             )
             return False
@@ -263,16 +296,28 @@ class DDPGAgent:
         self.actor_target.load_state_dict(ckpt["actor_target"])
         self.critic.load_state_dict(ckpt["critic"])
         self.critic_target.load_state_dict(ckpt["critic_target"])
-        print(f"[DDPG] Checkpoint caricato da {path} "
-              f"(state_dim={self.state_dim}, action_dim={self.action_dim})")
+        print(f"[DDPG] Checkpoint caricato correttamente: {path}")
         return True
 
 
 # ─── Training loop ─────────────────────────────────────────────────────────────
 
-def train_ddpg(agent, env, n_episodes=200, warmup=1000, log_every=10):
-    history    = []
-    total_step = 0
+def train_ddpg(
+    agent:        DDPGAgent,
+    env,
+    n_episodes:   int   = 200,
+    warmup:       int   = 1000,
+    log_every:    int   = 10,
+    noise_decay:  float = 0.995,
+    noise_floor:  float = 0.05,
+    es_patience:  int   = 20,
+    es_metric:    str   = "sharpe",
+    best_path:    Optional[str] = None,
+) -> list[dict]:
+    history       = []
+    total_step    = 0
+    best_metric   = -float("inf")
+    no_improve    = 0
 
     for ep in range(1, n_episodes + 1):
         state = env.reset()
@@ -288,41 +333,72 @@ def train_ddpg(agent, env, n_episodes=200, warmup=1000, log_every=10):
             else:
                 action = agent.act(state, explore=True)
 
-            next_state, reward, done, info = env.step(action)
+            next_state, reward, done, _ = env.step(action)
             agent.store(state, action, reward, next_state, done)
 
             losses = agent.update()
             if losses:
                 critic_losses.append(losses["critic_loss"])
                 actor_losses.append(losses["actor_loss"])
-            print( f"\r[DDPG] Ep {ep}/{n_episodes} | Step {total_step} | Reward: {ep_reward:+.4f}", end="")
+
             state       = next_state
             ep_reward  += reward
             total_step += 1
 
-        agent.decay_noise()
+        agent.decay_noise(factor=noise_decay, floor=noise_floor)
+
+        sharpe    = env.sharpe_ratio()
+        portfolio = env.portfolio_history()[-1]
+        max_dd    = env.max_drawdown()
 
         ep_info = {
             "episode":         ep,
             "total_reward":    ep_reward,
-            "portfolio_value": env.portfolio_history()[-1],
-            "sharpe":          env.sharpe_ratio(),
-            "max_drawdown":    env.max_drawdown(),
+            "portfolio_value": portfolio,
+            "sharpe":          sharpe,
+            "max_drawdown":    max_dd,
+            "noise_sigma":     agent.noise.sigma,
             "critic_loss":     float(np.mean(critic_losses)) if critic_losses else None,
             "actor_loss":      float(np.mean(actor_losses))  if actor_losses  else None,
         }
         history.append(ep_info)
 
+        metric_map = {
+            "sharpe":    sharpe,
+            "portfolio": portfolio,
+            "reward":    ep_reward,
+        }
+        current_metric = metric_map.get(es_metric, sharpe)
+
+        if current_metric > best_metric:
+            best_metric = current_metric
+            no_improve  = 0
+            if best_path:
+                agent.save(best_path, tag=f"BEST ep{ep} {es_metric}={best_metric:.4f}")
+        else:
+            no_improve += 1
+
         if ep % log_every == 0:
-            cl = f"{ep_info['critic_loss']:.5f}" if ep_info["critic_loss"] else "n/a"
-            al = f"{ep_info['actor_loss']:.5f}"  if ep_info["actor_loss"]  else "n/a"
+            cl    = f"{ep_info['critic_loss']:.5f}" if ep_info["critic_loss"] else "n/a"
+            al    = f"{ep_info['actor_loss']:.5f}"  if ep_info["actor_loss"]  else "n/a"
+            best_tag = " ★" if no_improve == 0 else f" (no improve: {no_improve}/{es_patience})"
             print(
                 f"Ep {ep:4d}/{n_episodes} | "
                 f"Reward: {ep_reward:+.4f} | "
-                f"Portfolio: ${ep_info['portfolio_value']:,.2f} | "
-                f"Sharpe: {ep_info['sharpe']:.3f} | "
-                f"MaxDD: {ep_info['max_drawdown']:.3f} | "
-                f"C-loss: {cl} | A-loss: {al}"
+                f"Portfolio: ${portfolio:,.0f} | "
+                f"Sharpe: {sharpe:.3f} | "
+                f"MaxDD: {max_dd:.3f} | "
+                f"σ: {agent.noise.sigma:.3f} | "
+                f"C: {cl} | A: {al}"
+                f"{best_tag}"
             )
+
+        if es_patience > 0 and no_improve >= es_patience:
+            print(
+                f"\n[DDPG] Early stopping a ep {ep} — "
+                f"{es_metric} non migliora da {es_patience} episodi "
+                f"(best: {best_metric:.4f})"
+            )
+            break
 
     return history

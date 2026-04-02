@@ -1,2 +1,4 @@
+# config/prediction/default.yaml
+# Parametri di predizione per frequenza giornaliera
 window_size: 30
 stride: 1

@@ -1,0 +1,2 @@
+- step=trade
+- buyer.agent_type=dqn

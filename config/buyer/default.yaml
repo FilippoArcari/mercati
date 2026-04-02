@@ -1,27 +1,44 @@
-# config/buyer/default.yaml — Configurazione agente DDPG
+# config/buyer/default.yaml
+agent: ddpg
+initial_capital:  100.0
+transaction_cost: 0.001
 
-initial_capital:  100    # liquidità iniziale in USD
-transaction_cost: 0.001       # costo per transazione (0.1%)
+buffer_capacity: 100000
+batch_size:      32
+n_episodes:      300           # ← Aumentato da 100 (più training)
+warmup:          5000          # ← Aumentato da 3000 (più esplorazione)
+log_every:       10
+es_patience:     40            # ← Aumentato da 20 (less aggressive stopping)
+es_metric:       sharpe        # "sharpe" | "portfolio" | "reward"
 
-# ── Architettura reti ─────────────────────────────────────────────────────────
-actor_hidden:  [128, 128]     # layer nascosti dell'Actor
-critic_hidden: [128, 128]     # layer nascosti del Critic
+# ── Reward shaping per INTRADAY ───────────────────────────────────────────────
+# Aggressivo: spingiamo l'agente a VENDERE e DIVERSIFICARE
+lambda_concentration: 0.8      # ← Aumentato da 0.1 (penalizza concentration)
+lambda_inaction:      0.3      # ← Aumentato da 0.05 (penalizza HOLD eccessivo)
+action_threshold:     0.01     # ← Ridotto da 0.05 (più sensibile alle azioni)
 
-# ── Iperparametri DDPG ────────────────────────────────────────────────────────
-lr_actor:   0.0001            # learning rate Actor
-lr_critic:  0.0003            # learning rate Critic
-gamma:      0.99              # fattore di sconto
-tau:        0.005             # coefficiente soft update (Polyak)
+# ── DDPG INTRADAY ────────────────────────────────────────────────────────────
+ddpg:
+  actor_hidden:  [512, 256, 128]
+  critic_hidden: [512, 256, 128]
+  lr_actor:      0.0002        # ← Aumentato da 0.0001 (convergenza più veloce)
+  lr_critic:     0.0005        # ← Aumentato da 0.0003
+  gamma:         0.99
+  tau:           0.005
+  update_every:  10
+  noise_sigma:   0.1           # ← Ridotto da 0.2 (meno esplorazione random)
+  noise_decay:   0.99          # ← Ridotto da 0.995 (decay più lento, esplora più a lungo)
+  noise_floor:   0.02          # ← Ridotto da 0.05 (rumore minimo più basso)
 
-buffer_capacity: 100000       # dimensione replay buffer
-batch_size:      32          # dimensione mini-batch
-update_every:    10          # aggiorna ogni N step
-
-# ── Esplorazione ──────────────────────────────────────────────────────────────
-noise_sigma:       0.2        # sigma iniziale Ornstein-Uhlenbeck
-noise_decay:       0.995      # moltiplicatore sigma per episodio
-
-# ── Training ──────────────────────────────────────────────────────────────────
-n_episodes:  100 # 200              # episodi di addestramento
-warmup:      1000             # step iniziali con azioni casuali
-log_every:   10               # ogni quanti episodi stampare le metriche
+# ── DQN (placeholder) ────────────────────────────────────────────────────────
+dqn:
+  n_actions:           5
+  hidden:              [512, 256, 128]
+  lr:                  0.0003
+  gamma:               0.99
+  tau:                 0.005
+  update_every:        4
+  target_update_every: 100
+  epsilon_start:       1.0
+  epsilon_end:         0.05
+  epsilon_decay:       0.992

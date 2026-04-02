@@ -4,14 +4,61 @@ import pandas as pd
 import torch
 import os
 import hydra
+import sys
 
 from modelli.pred import Pred
 from modelli.trade import run_trade
-from modelli.utils import load_data, make_windows
+from modelli.utils import load_data, make_windows, make_stats, get_device
 from modelli.evaluate_pred import evaluate_predictions
+# ObsNormalizer è usato internamente da trade.py — non serve importarlo qui.
+# Se in futuro aggiungi un passo "eval" standalone, importa da modelli.obs_normalizer.
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+# ─── Frequency-based defaults setup ────────────────────────────────────────────
+
+def _apply_frequency_defaults():
+    """
+    Se nella CLI viene specificato frequency=..., aggiunge automaticamente
+    training=..., prediction=..., e buyer=... basato sulla frequenza.
+    """
+    frequency_map = {
+        'daily':  {'training': 'default', 'prediction': 'default', 'buyer': 'default'},
+        'minute': {'training': 'minute',  'prediction': 'minute',  'buyer': 'minute'},
+    }
+    freq_override = None
+    for arg in sys.argv[1:]:
+        if arg.startswith('frequency='):
+            freq_override = arg.split('=', 1)[1]
+            break
+    if freq_override and freq_override in frequency_map:
+        defaults = frequency_map[freq_override]
+        for key, value in defaults.items():
+            override = f"{key}={value}"
+            if override not in sys.argv:
+                sys.argv.append(override)
+
+
+_apply_frequency_defaults()
+
+
+def checkpoint_name(cfg, name: str) -> str:
+    """
+    Costruisce il path di un checkpoint includendo la frequenza e la window size.
+
+    Esempi:
+      pred_1d_w30.pth    / pred_1m_w10.pth
+      ddpg_1d.pth        / ddpg_best_1m.pth
+      normalizer_1d.npz  / normalizer_1m.npz
+    """
+    freq = cfg.frequency.interval
+    ws   = cfg.prediction.window_size
+    # ddpg e normalizer usano solo la frequenza (niente window_size)
+    tag  = f"_{freq}" if any(k in name for k in ("ddpg", "normalizer")) else f"_{freq}_w{ws}"
+    stem, ext = os.path.splitext(name)
+    return os.path.join(cfg.paths.checkpoint_dir, f"{stem}{tag}{ext}")
 
 
 def compute_moment_target(train_df, tickers, cfg):
@@ -36,36 +83,25 @@ def build_predictor(cfg, num_features: int) -> Pred:
         dilations=list(cfg.model.dilations),
         kernel_size=cfg.model.kernel_size,
         activation=cfg.model.activation,
+        prediction_steps=cfg.model.prediction_steps,
     )
 
 
-def split_dataframe(
-    df: pd.DataFrame,
-    cfg,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+def split_dataframe(df: pd.DataFrame, cfg) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Divide df in train/test.
-
-    Priorità:
-      1. frequency.split_ratio  (float 0-1) → split percentuale
-         es. 0.8 → primi 80% come train, ultimi 20% come test
-      2. data.split_date         → split per data (comportamento originale)
-
-    Il motivo per cui split_ratio ha priorità è che per dati intraday
-    (es. 1m, solo 7 giorni disponibili) una data fissa come "2024-01-01"
-    non ha senso: tutte le barre sarebbero nello stesso lato dello split.
+    Split per percentuale (intraday) o per data (giornaliero).
     """
     split_ratio = getattr(cfg.frequency, "split_ratio", None)
 
     if split_ratio is not None:
-        n         = len(df)
-        n_train   = int(n * split_ratio)
-        train_df  = df.iloc[:n_train]
-        test_df   = df.iloc[n_train:]
+        n        = len(df)
+        n_train  = int(n * split_ratio)
+        train_df = df.iloc[:n_train]
+        test_df  = df.iloc[n_train:]
         print(
             f"Split percentuale ({split_ratio:.0%}): "
             f"{len(train_df)} barre train | {len(test_df)} barre test "
-            f"(da {train_df.index[-1]} a {test_df.index[0]})"
+            f"(split a {train_df.index[-1]})"
         )
     else:
         split_date = cfg.data.split_date
@@ -76,20 +112,17 @@ def split_dataframe(
             f"{len(train_df)} barre train | {len(test_df)} barre test"
         )
 
-    # Controllo minimo: il test set deve avere almeno window_size + 1 barre
     min_bars = cfg.prediction.window_size + 1
     if len(test_df) < min_bars:
         raise RuntimeError(
             f"Test set troppo piccolo: {len(test_df)} barre, "
-            f"servono almeno {min_bars} (window_size={cfg.prediction.window_size}). "
-            f"Aumenta split_ratio o riduci window_size."
+            f"servono almeno {min_bars}."
         )
     if len(train_df) < min_bars:
         raise RuntimeError(
             f"Train set troppo piccolo: {len(train_df)} barre, "
             f"servono almeno {min_bars}."
         )
-
     return train_df, test_df
 
 
@@ -101,11 +134,16 @@ def my_app(cfg: DictConfig) -> None:
     inflation_series = list(cfg.data.inflation_series)
     start = datetime.datetime.fromisoformat(cfg.data.start_date)
     end   = datetime.datetime.fromisoformat(cfg.data.end_date)
+    raw_df_with_volumes = None
+    cache_path = cfg.frequency.cache_path
+    if os.path.exists(cache_path):
+        raw_df_with_volumes = pd.read_csv(
+        cache_path, index_col=0, parse_dates=True
+    )
+
 
     df, scaler = load_data(
-        tickers,
-        start,
-        end,
+        tickers, start, end,
         cfg.data.fred_api_key,
         inflation_series,
         interval         = cfg.frequency.interval,
@@ -121,50 +159,63 @@ def my_app(cfg: DictConfig) -> None:
     X_train, Y_train = make_windows(train_df, cfg.prediction.window_size, cfg.prediction.stride)
     X_test,  Y_test  = make_windows(test_df,  cfg.prediction.window_size, cfg.prediction.stride)
 
-    model_name = f"pred_{cfg.frequency.interval}_{cfg.prediction.window_size}"
+    freq = cfg.frequency.interval
+    print(f"[Checkpoint] Frequenza attiva: {freq} — "
+          f"i checkpoint useranno il suffisso '_{freq}'")
+
     # ── TRAIN ─────────────────────────────────────────────────────────────────
     if cfg.step == "train":
+        device = get_device()
         train_loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(X_train, Y_train),
             batch_size=cfg.training.batch_size,
             shuffle=True,
         )
-        predictor     = build_predictor(cfg, num_features)
+        predictor     = build_predictor(cfg, num_features).to(device)
         moment_target = compute_moment_target(train_df, tickers, cfg)
+        if moment_target is not None:
+            moment_target = moment_target.to(device)
 
         mre_cfg  = getattr(cfg.training, "mre", None)
         mre_mode = getattr(mre_cfg, "update_mode", "mse") if mre_cfg else "mse"
-        print(f"\nInizio addestramento (modalità: {mre_mode})...")
+        print(f"\nInizio addestramento (modalità: {mre_mode}, freq: {freq})...")
 
         predictor.fit(train_loader, training_cfg=cfg.training, moment_target=moment_target)
 
-        checkpoint_dir = cfg.paths.checkpoint_dir
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        pred_path = checkpoint_name(cfg, "pred.pth")
+        os.makedirs(cfg.paths.checkpoint_dir, exist_ok=True)
         torch.save({
             "model_state_dict": predictor.state_dict(),
             "scaler":           scaler,
             "num_features":     num_features,
+            "frequency":        freq,
+            "window_size":      cfg.prediction.window_size,
             "config":           OmegaConf.to_container(cfg, resolve=True),
-        }, os.path.join(checkpoint_dir, f"{model_name}.pth"))
-
-        print(f"\nModello salvato in: {checkpoint_dir}/{model_name}.pth")
-
+        }, pred_path)
+        print(f"\nModello salvato in: {pred_path}")
+    elif cfg.step == "stats":
+        make_stats(cfg)
     # ── TEST ──────────────────────────────────────────────────────────────────
     elif cfg.step == "test":
-        checkpoint_path = os.path.join(cfg.paths.checkpoint_dir, f"pred_{cfg.frequency.interval}_{cfg.prediction.window_size}.pth")
-        if not os.path.exists(checkpoint_path):
-            print("Errore: esegui prima step=train")
+        device = get_device()
+        pred_path = checkpoint_name(cfg, "pred.pth")
+        if not os.path.exists(pred_path):
+            print(f"Errore: nessun checkpoint trovato in {pred_path}")
+            print(f"Esegui prima: uv run main.py step=train frequency={freq}")
             return
 
-        checkpoint     = torch.load(checkpoint_path, weights_only=False)
+        checkpoint     = torch.load(pred_path, weights_only=False)
         saved_features = checkpoint.get("num_features", num_features)
-        predictor      = build_predictor(cfg, saved_features)
+        predictor      = build_predictor(cfg, saved_features).to(device)
         predictor.load_state_dict(checkpoint["model_state_dict"])
         predictor.eval()
 
+        X_test_device  = X_test.to(device)
+        X_train_device = X_train.to(device)
+
         with torch.no_grad():
-            predictions_scaled = predictor(X_test).numpy()
-            predictions_train  = predictor(X_train).numpy()
+            predictions_scaled = predictor(X_test_device).cpu().numpy()
+            predictions_train  = predictor(X_train_device).cpu().numpy()
 
         predictions       = scaler.inverse_transform(predictions_scaled)
         train_predictions = scaler.inverse_transform(predictions_train)
@@ -172,8 +223,8 @@ def my_app(cfg: DictConfig) -> None:
         Y_train_denorm    = scaler.inverse_transform(Y_train)
 
         all_columns = list(df.columns)
-        test_dates  = test_df.index[cfg.prediction.window_size:]
-        train_dates = train_df.index[cfg.prediction.window_size:]
+        test_dates  = test_df.index[cfg.prediction.window_size::cfg.prediction.stride]
+        train_dates = train_df.index[cfg.prediction.window_size::cfg.prediction.stride]
 
         results_dir = cfg.paths.results_dir
         os.makedirs(results_dir, exist_ok=True)
@@ -192,9 +243,12 @@ def my_app(cfg: DictConfig) -> None:
 
     # ── TRADE ─────────────────────────────────────────────────────────────────
     elif cfg.step == "trade":
+        device = get_device()
+        # run_trade gestisce internamente ObsNormalizer e device — nessuna modifica qui
         run_trade(
             cfg=cfg,
             df=df,
+            df_raw=raw_df_with_volumes,
             tickers=tickers,
             X_train=X_train,
             Y_train=Y_train,
@@ -202,6 +256,7 @@ def my_app(cfg: DictConfig) -> None:
             Y_test=Y_test,
             train_df=train_df,
             test_df=test_df,
+            device=device,
         )
 
     else:

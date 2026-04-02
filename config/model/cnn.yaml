@@ -3,3 +3,4 @@ dimensions: [64, 32, 16]
 dilations: [1, 2, 4]
 kernel_size: 3
 activation: leaky_relu
+prediction_steps: 3

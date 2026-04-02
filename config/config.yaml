@@ -8,7 +8,7 @@ defaults:
   - frequency: daily     # daily | weekly | monthly
   - _self_
  
-step: train  # train | test | trade
+step: train  # train | test | trade | stats 
  
 
 

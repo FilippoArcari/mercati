@@ -1,0 +1,170 @@
+# Daily vs Intraday: QUICK REFERENCE
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                   TRAINING CONFIGURATION CARD                  │
+└────────────────────────────────────────────────────────────────┘
+
+┌─ DAILY (frequency=daily) ─────────────────────────────────────┐
+│                                                                 │
+│ 📊 DATASET                                                     │
+│    • Size: ~2000 samples                                       │
+│    • Source: 252 days/year × 50+ tickers                       │
+│    • Split: Per date (2020-2022 train, 2023+ test)             │
+│                                                                 │
+│ 🧠 CNN LEARNING                                                │
+│    • Learning rate: 0.001  (CONSERVATIVE)                      │
+│    • Batch size: 32        (SMALL)                             │
+│    • Patience: 50          (WAIT LONG)                         │
+│    • Weight decay: 1.0e-5  (HIGH REGULARIZATION)              │
+│    • Epochs phase1: 30     (LONG ENTROPY)                      │
+│                                                                 │
+│ 🔬 WINDOWING                                                   │
+│    • Window size: 30 days                                      │
+│    • Stride: 1 (use ALL samples)                               │
+│    • Pattern: momentum, mean-reversion (SLOW)                  │
+│                                                                 │
+│ 💰 TRADING (DDPG)                                              │
+│    • Episodes: 100                                             │
+│    • Position limit: NONE (unlimited)                          │
+│    • Max holding: UNLIMITED                                    │
+│    • Concentration penalty: 0.8  (MODERATE)                    │
+│    • Inaction penalty: 0.05      (WEAK)                        │
+│    • Target Sharpe: 0.5-1.0                                    │
+│                                                                 │
+│ ✓ CONVERGENCE: Slow, stable (500-800 epochs)                   │
+│ ✓ RISK: Lower overfitting risk (few data)                      │
+│ ✓ USE: Position trading, swing trades                          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+
+┌─ INTRADAY (frequency=minute) ─────────────────────────────────┐
+│                                                                 │
+│ 📊 DATASET                                                     │
+│    • Size: ~5800 samples                                       │
+│    • Source: 30 days × 390 bars/day × 50+ tickers              │
+│    • Split: 80/20 temporal split (contiguous time)             │
+│                                                                 │
+│ 🧠 CNN LEARNING                                                │
+│    • Learning rate: 0.002       (2x FASTER ←)                 │
+│    • Batch size: 128            (4x LARGER ←)                 │
+│    • Patience: 20               (STOP EARLY ←)                │
+│    • Weight decay: 0.5e-4       (1/20th ← MINIMAL)            │
+│    • Epochs phase1: 10          (QUICK ← ENTROPY)             │
+│                                                                 │
+│ 🔬 WINDOWING                                                   │
+│    • Window size: 15 minutes                                   │
+│    • Stride: 2 (dense sampling)                                │
+│    • Pattern: microstructure, reversals (FAST)                 │
+│                                                                 │
+│ 💰 TRADING (DDPG)                                              │
+│    • Episodes: 400           (4x MORE ←)                       │
+│    • Position limit: 10%/ticker  (CAPPED ←)                   │
+│    • Max holding: 100 steps (~25 min) (FORCE LIQUIDATE ←)      │
+│    • Concentration penalty: 1.2 (STRONG ←)                    │
+│    • Inaction penalty: 0.3      (AGGRESSIVE ←)                │
+│    • Target Sharpe: 1.0-2.0                                    │
+│                                                                 │
+│ ✓ CONVERGENCE: Fast (250-400 epochs)                           │
+│ ✓ RISK: Higher overfitting risk (train on recent data only)    │
+│ ✓ USE: Day trading, scalping, frequent turnover                │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────┐
+│                      COMMAND CHEATSHEET                          │
+└─────────────────────────────────────────────────────────────────┘
+
+DAILY TRAINING:
+  $ uv run main.py step=train frequency=daily
+  
+  →  Loads: training/default.yaml, prediction/default.yaml, buyer/default.yaml
+  →  CNN converges: ~600 epoch
+  →  Typical Sharpe: 0.5-1.0
+  →  Position style: Holds for days/weeks
+
+DAILY TEST:
+  $ uv run main.py step=test frequency=daily
+
+
+INTRADAY TRAINING:
+  $ uv run main.py step=train frequency=minute
+  
+  →  Loads: training/minute.yaml, prediction/minute.yaml, buyer/minute.yaml
+  →  CNN converges: ~250 epoch
+  →  Typical Sharpe: 1.0-2.0
+  →  Position style: Holds for minutes, frequent exits
+
+
+INTRADAY TEST:
+  $ uv run main.py step=test frequency=minute
+
+
+┌─────────────────────────────────────────────────────────────────┐
+│                     DECISION FLOWCHART                           │
+└─────────────────────────────────────────────────────────────────┘
+
+START
+  ↓
+Want to hold positions for DAYS/WEEKS?
+  ├─ YES → frequency=daily ✓
+  │        • Sharpe target: 0.5-1.0
+  │        • Good for: Long-term trends
+  │        • Risk: Lower (fewer trades)
+  │
+  └─ NO → Want to hold for MINUTES?
+           ├─ YES → frequency=minute ✓
+           │        • Sharpe target: 1.0-2.0
+           │        • Good for: Scalping, microstructure
+           │        • Risk: Higher (more trades, recent data)
+           │
+           └─ NO → Maybe both? Training pipelines independent!
+
+
+┌─────────────────────────────────────────────────────────────────┐
+│                   CONFIGURATION FILES AT A GLANCE                │
+└─────────────────────────────────────────────────────────────────┘
+
+DAILY (default.yaml set)
+├─ frequency/daily.yaml          Data loading: date-based split
+├─ training/default.yaml         CNN: conservative (lr=0.001)
+├─ prediction/default.yaml       Windows: long (w=30 stride=1)
+└─ buyer/default.yaml            DDPG: 100 episodes
+
+INTRADAY (minute.yaml set)
+├─ frequency/minute.yaml         Data loading: ratio-based, recent 30 days
+├─ training/minute.yaml          CNN: aggressive (lr=0.002)
+├─ prediction/minute.yaml        Windows: short (w=15 stride=2)
+└─ buyer/minute.yaml             DDPG: 400 episodes + position limits
+
+
+┌─────────────────────────────────────────────────────────────────┐
+│                         KEY METRICS                              │
+└─────────────────────────────────────────────────────────────────┘
+
+Metric                    DAILY              INTRADAY
+─────────────────────────────────────────────────────────
+Learning Rate             0.001              0.002 (2x)
+Batch Size                32                 128 (4x)
+Dataset Size              ~2000              ~5800
+Convergence Speed         Slow               Fast
+Patience (Early Stop)     50                 20
+Max Position Size         Unlimited          10% per asset
+Max Holding Time          Unlimited          100 steps
+Sell Incentive (λ)        0.05               0.3 (6x)
+Target Sharpe Ratio       0.5-1.0            1.0-2.0
+Expected Trades/Day       2-5                50-150
+Risk Level                MODERATE           HIGH
+
+```
+
+## Use This Card To:
+
+✓ Decide which `frequency=` parameter to use  
+✓ Understand why learning_rate differs by 2x  
+✓ Know what position limits apply  
+✓ Predict expected Sharpe ratio range  
+✓ Choose between scalping vs position trading  
+

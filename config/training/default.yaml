@@ -1,30 +1,37 @@
-epochs: 1000
-learning_rate: 0.001
-batch_size: 32
+# ═══════════════════════════════════════════════════════════════════════════════
+# TRAINING CONFIG: DAILY (End-of-Day Trading)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Strategia: Momentum e mean-reversion lentamente varianti. Pattern settimanali.
+# Dati: 252 closing price/anno → ~2000 campioni dopo windowing (w=30, stride=1)
+# Obiettivo: Convergenza lenta e stabile, generalizzazione su lungo termine
+
+# CNN predictor learning
+epochs: 1000                  # ← Lungo (convergenza pattern giornalieri è lenta)
+learning_rate: 0.001         # ← Conservativo (dataset piccolo ~2000 sample)
+batch_size: 32               # ← Piccolo (pochi campioni, batch piccoli stabili)
 optimizer: adam
-weight_decay: 1.0e-5
- 
+weight_decay: 1.0e-5         # ← Minimo (poco rischio overfitting con pochi dati)
+
 scheduler:
   enabled: false
   type: cosine
   warmup_steps: 100
- 
+
 early_stopping:
-  enabled: false
-  patience: 50
-  min_delta: 1.0e-6
- 
-# ── Maximum relative Entropy (Giffin, 2009) ───────────────────────────────────
+  enabled: true
+  patience: 50                # ← Alto (convergenza lenta, aspetta stabilizzazione)
+  min_delta: 1.0e-5
+
+# Maximum Relative Entropy (Giffin, 2009)
+# Vincolo sui momenti per evitare degenerazione su trend mono-direzionali
 mre:
-  enabled: false              # true per attivare MrE, false per MSE puro
- 
-  update_mode: simultaneous   # "simultaneous" (Sez. 5) | "sequential" (Sez. 4)
- 
-  lambda_entropy: 0.05        # peso del termine KL verso la prior storica
-  lambda_moment: 0.1          # peso del vincolo sui momenti ⟨f(θ)⟩ = F
- 
-  # moment_target: [100.0, 250.0]   # opzionale: F per ticker, in ordine di cfg.data.tickers
-                                     # se assente → calcolato come media del training set
- 
+  enabled: true
+  update_mode: simultaneous
+  
+  lambda_entropy: 0.05        # ← Conservativo (limita KL divergence, usa prior)
+  lambda_moment: 0.1          # ← Conservativo (vincolo morbido, focalizza su MSE)
+  
+  # moment_target: [100.0, 250.0]  # opzionale: usa media training set se assente
+  
   epochs_phase1: 30           # solo per update_mode: sequential
  

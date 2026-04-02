@@ -1,0 +1,43 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# TRAINING CONFIG: INTRADAY (1-Minute Bar Trading)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Strategia: Microstructure, liquidity detection, high-frequency reversals.
+# Dati: 30 giorni × 390 bar/day × 50+ tickers → ~5800 campioni dopo windowing (w=15, stride=2)
+# Obiettivo: Convergenza veloce, sfruttare pattern corti, adattarsi a sudden changes
+#
+# ✓ DIFFERENZE CRITICHE vs training/default.yaml:
+#   • Learning rate: 0.001 → 0.002 (dataset 50x più grande)
+#   • Batch size: 32 → 128 (dati abbondanti, batch ampi stabili)
+#   • Early stopping patience: 50 → 20 (convergenza molto più veloce)
+#   • Weight decay: 1.0e-5 → 0.5e-4 (regolarizzazione bassa, abbondanza dati)
+#   • Warmup steps: 100 → 50 (meno necesario con dati)
+#   • MrE entropy: 0.05 → 0.02 (priorità a prediction, entropy secondaria)
+
+epochs: 1000                  # ← Lungo (5800+ campioni comunque richiedono epoche)
+learning_rate: 0.002          # ← DOPPIO vs daily (dati 50x aumentati, convergenza 2x veloce)
+batch_size: 128               # ← 4x vs daily (5800+ campioni disponibili)
+optimizer: adam
+weight_decay: 0.5e-4          # ← BASSISSIMO (regolarizzazione poco utile con data abundance)
+
+scheduler:
+  enabled: false
+  type: cosine
+  warmup_steps: 50            # ← Ridotto (dati veloci su minute bar)
+
+early_stopping:
+  enabled: true
+  patience: 20                # ← MOLTO BASSO vs daily (patterns intraday veloci, convergenza rapida)
+  min_delta: 1.0e-5
+
+# Maximum Relative Entropy (Giffin, 2009)
+# Data il rumore alto su minute bars, entropia ancora CRITICA per evitare overfitting
+mre:
+  enabled: true
+  update_mode: simultaneous
+  
+  lambda_entropy: 0.02        # ← AGGRESSIVO (forza exploration vs prior, resist false patterns)
+  lambda_moment: 0.05         # ← AGGRESSIVO (vincolo loose, focus sulla prediction accuracy)
+  
+  # moment_target: [100.0, 250.0]  # opzionale: usa media training set se assente
+  
+  epochs_phase1: 10           # ← Corto (phase 1 quick entropy, poi subito CNN focus)

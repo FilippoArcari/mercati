@@ -1,0 +1,4 @@
+- step=trade
+- buyer.gamma=0.95
+- buyer.noise_floor=0.1
+- buyer.noise_sigma=0.3

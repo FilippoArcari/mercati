@@ -1,0 +1,114 @@
+Ho scritto una funzione calcoli delle statistiche che ritengo utili. Questo è il risultato, ti allego la funzione ed il ragionamento che ci sta dietro. Vorrei che implementassi questa idea nel mio agente di predizione(oppure in ddpg ma non so quale sia meglio)
+Report Tecnico: Modellazione Termodinamica e Analisi dei Lag di Pressione Monetaria
+
+1. Introduzione
+
+Il presente documento descrive l'architettura analitica sviluppata per interpretare i mercati finanziari come un sistema fisico complesso. L'obiettivo è quantificare la "pressione" del mercato e la sua risposta ritardata (lag) alle variazioni dei tassi di interesse, utilizzando un'analogia basata sulla termodinamica statistica e sulle equazioni di stato dei gas reali.
+
+2. Fondamenti Matematici e Termodinamici
+
+2.1 Equazione di Stato di Van der Waals Applicata
+
+Il cuore del modello risiede nell'adattamento dell'equazione di Van der Waals per descrivere il comportamento del portafoglio:
+
+$$(P + a \frac{n^2}{V^2}) (V - nb) = nRT$$
+
+Dove:
+
+$V$ (Volume): Media logaritmica del volume di scambio ($log(Volume)$).
+
+$n$ (Numero di Particelle): Numero di asset analizzati.
+
+$a$ (Parametro di Attrazione): Misura le forze intermolecolari (momentum/herding).
+
+$b$ (Volume Escluso): Volume minimo strutturale (limite di liquidità).
+
+$T$ (Temperatura): Energia cinetica dei prezzi derivata dall'entropia.
+
+2.2 Lavoro del Mercato ($W$): Integrazione di Linea
+
+A differenza di un modello isobarico semplificato, riconosciamo che la pressione $P$ è una funzione dinamica del volume e del tempo. Il lavoro compiuto dal (o sul) sistema durante una trasformazione tra lo stato 1 e lo stato 2 è definito dall'integrale:
+
+$$W = \int_{V_1}^{V_2} P(V) \, dV$$
+
+Per una serie temporale discreta, utilizziamo l'integrazione numerica:
+
+
+$$W_{cumulativo} = \sum_{t=1}^{T} \left( \frac{P_t + P_{t-1}}{2} \right) (V_t - V_{t-1})$$
+
+Questo parametro indica l'energia netta trasferita al mercato. Un lavoro positivo indica espansione del sistema (immissione di energia/liquidità), mentre un lavoro negativo indica una compressione forzata (spesso guidata dall'aumento dei tassi).
+
+3. Analisi Statistica dei Lag (Cross-Correlation)
+
+3.1 Evidenze Empiriche
+
+I test effettuati hanno mostrato che la correlazione cresce fino a un picco massimo:
+
+Peak Lag rilevato: ~58-72 giorni di borsa.
+
+Coefficiente di correlazione ($\rho$): Incremento significativo $> 0.60$.
+
+Il sistema impiega circa un trimestre per metabolizzare l'effetto del "costo del denaro" ($1/r$) sulla propria struttura di pressione interna.
+
+4. Stato dell'Arte e Precedenti
+
+Milton Friedman (1961): "Long and Variable Lags" (6-18 mesi). Il nostro modello rileva il lag finanziario anticipatore (3 mesi).
+
+Econofisica (Mantegna & Stanley): Studio dell'entropia e delle transizioni di fase.
+
+Michael Howell: Cicli di liquidità globale (lag di 8-12 settimane).
+
+5. Conclusioni e Sviluppi
+
+L'integrazione del lavoro calcolato per via integrale permette di mappare l'efficienza degli scambi: se la pressione aumenta ma il lavoro compiuto è minimo, siamo in presenza di una fase di stasi compressiva, tipica dei periodi che precedono grandi correzioni.
+. Architettura del Modello
+
+Il modello attuale ha superato la fase di semplice monitoraggio del prezzo, evolvendo in un sistema a due componenti che analizza la salute del trend attraverso le leggi della termodinamica dei gas reali.
+
+Variabili Termodinamiche Implementate:
+
+Temperatura (T): Rappresenta l'agitazione del sistema (volatilità ed entropia).
+
+Pressione (P): Calcolata tramite l'equazione di Van der Waals, dove l'autocorrelazione dei rendimenti funge da forza di attrazione tra le "particelle" di mercato.
+
+Lavoro ($\mathbf{W}$): Definito come $\int P dV$. È l'indicatore più "sano": se il lavoro cresce con il prezzo, il trend è sostenuto da energia reale.
+
+2. Innovazioni dell'Ultima Versione
+
+L'ultimo aggiornamento ha introdotto tre pilastri di analisi che rendono il sistema unico:
+
+A. Divergenza Z-Score (Lo "Stress")
+
+Non misuriamo più la divergenza in modo lineare. Utilizziamo lo StandardScaler per calcolare quanto la pressione attuale devia statisticamente dalla "Pressione Attesa" (generata dai tassi d'interesse a 10 anni con lag ottimizzato).
+
+Area Rossa (Z > 0): Stress termico. Il mercato sta "bruciando" troppo per quello che i tassi permetterebbero. Rischio di esaurimento.
+
+Area Blu (Z < 0): Espansione sana. Il mercato è "fresco" e ha spazio per crescere senza surriscaldarsi.
+
+B. Oscillatore di Efficienza (Work-Price Index)
+
+Questo indicatore (pannello inferiore) misura il rendimento della macchina-mercato:
+
+Efficienza > 0 (Dissipazione): Il sistema compie molto lavoro ma il prezzo non sale proporzionalmente. È un segnale di attrito estremo e distribuzione (mani forti che vendono).
+
+Efficienza < 0 o Neutrale: Il movimento è fluido e l'energia si trasforma efficacemente in valore.
+
+C. Lag Monetario Dinamico
+
+Il sistema identifica automaticamente il best_lag (fino a 90 giorni) tra i tassi e la pressione di mercato, riconoscendo che la politica monetaria non ha un effetto istantaneo ma "viaggia" nel tempo prima di colpire gli asset.
+
+3. Valutazione della "Salute" del Codice
+
+Il codice è considerato Stabile e Corretto per i seguenti motivi:
+
+Normalizzazione Duale: L'uso combinato di MinMaxScaler per la visualizzazione e StandardScaler per il calcolo dei segnali evita distorsioni da outlier.
+
+Resilienza al Rumore: L'entropia di Shannon calcolata su finestra mobile (20gg) filtra i movimenti erratici intraday concentrandosi sulla struttura del disordine informativo.
+
+Validità Fisica: Il calcolo del lavoro cumulativo segue correttamente la prima legge della termodinamica applicata ai flussi finanziari.
+
+4. Conclusioni Operative
+
+Il sistema è ora in grado di distinguere tra un Rally Energetico (Lavoro in salita, Divergenza Blu) e un Rally da Esaurimento (Lavoro in salita, Divergenza Rossa, Efficienza in calo). Quest'ultimo scenario è quello che storicamente precede i grandi "crash" o le correzioni strutturali.
+
+Documento generato dal sistema di analisi termodinamica v2.5

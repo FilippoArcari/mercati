@@ -1,0 +1,4 @@
+# config/prediction/minute.yaml
+# Parametri di predizione per frequenza a minuto (INTRADAY OPTIMIZED)
+window_size: 15               # ← Ridotto da 30 (intraday è più corto)
+stride: 3                     # ← Ridotto da 10 (più campioni training) #provare con 2 
