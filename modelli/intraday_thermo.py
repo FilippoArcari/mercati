@@ -500,25 +500,3 @@ def detect_market_regime(thermo_df: pd.DataFrame) -> pd.Series:
     regime[mask_bounce] = 4
 
     return regime
-
-#Calcola l'entropia del mercato con l'equazione di Sackur-Tetrode e dopo guardo la differenza con l'entropia di Shannon classica. Se la differenza è positiva, significa che il mercato è più disordinato di quanto ci si aspetterebbe da una distribuzione normale, indicando un regime di alta volatilità o stress. Se la differenza è negativa, il mercato è più ordinato, suggerendo un regime più stabile.
-def compute_sackur_tetrode_entropy(close: pd.Series) -> pd.Series:
-    close = _sanitize_close(close)
-    returns = _sanitize(close.pct_change(), fill=0.0)
-
-    n_bins = min(len(returns) // 10, 20)
-    hist, _ = np.histogram(returns.dropna(), bins=n_bins, density=True)
-
-    hist = hist[hist > 0]
-    hist = np.clip(hist, 1e-10, 1e6)
-
-    shannon_h = -np.sum(hist * np.log(hist + 1e-10))
-
-    n = len(returns.dropna())
-    if n < 2:
-        return pd.Series(0.0, index=close.index)
-
-    sackur_tetrode_h = shannon_h + 0.5 * np.log(n)
-
-    entropy_diff = sackur_tetrode_h - shannon_h
-    return pd.Series(entropy_diff, index=close.index)
