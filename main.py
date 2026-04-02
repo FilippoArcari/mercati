@@ -10,14 +10,12 @@ from modelli.pred import Pred
 from modelli.trade import run_trade
 from modelli.utils import load_data, make_windows, make_stats, get_device
 from modelli.evaluate_pred import evaluate_predictions
-# ObsNormalizer è usato internamente da trade.py — non serve importarlo qui.
-# Se in futuro aggiungi un passo "eval" standalone, importa da modelli.obs_normalizer.
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
-# ─── Frequency-based defaults setup ────────────────────────────────────────────
+# ─── Frequency-based defaults setup ───────────────────────────────────────────
 
 def _apply_frequency_defaults():
     """
@@ -25,13 +23,13 @@ def _apply_frequency_defaults():
     training=..., prediction=..., e buyer=... basato sulla frequenza.
     """
     frequency_map = {
-        'daily':  {'training': 'default', 'prediction': 'default', 'buyer': 'default'},
-        'minute': {'training': 'minute',  'prediction': 'minute',  'buyer': 'minute'},
+        "daily":  {"training": "default", "prediction": "default", "buyer": "default"},
+        "minute": {"training": "minute",  "prediction": "minute",  "buyer": "minute"},
     }
     freq_override = None
     for arg in sys.argv[1:]:
-        if arg.startswith('frequency='):
-            freq_override = arg.split('=', 1)[1]
+        if arg.startswith("frequency="):
+            freq_override = arg.split("=", 1)[1]
             break
     if freq_override and freq_override in frequency_map:
         defaults = frequency_map[freq_override]
@@ -44,6 +42,8 @@ def _apply_frequency_defaults():
 _apply_frequency_defaults()
 
 
+# ─── Helpers ───────────────────────────────────────────────────────────────────
+
 def checkpoint_name(cfg, name: str) -> str:
     """
     Costruisce il path di un checkpoint includendo la frequenza e la window size.
@@ -55,8 +55,11 @@ def checkpoint_name(cfg, name: str) -> str:
     """
     freq = cfg.frequency.interval
     ws   = cfg.prediction.window_size
-    # ddpg e normalizer usano solo la frequenza (niente window_size)
-    tag  = f"_{freq}" if any(k in name for k in ("ddpg", "normalizer")) else f"_{freq}_w{ws}"
+    tag  = (
+        f"_{freq}"
+        if any(k in name for k in ("ddpg", "normalizer"))
+        else f"_{freq}_w{ws}"
+    )
     stem, ext = os.path.splitext(name)
     return os.path.join(cfg.paths.checkpoint_dir, f"{stem}{tag}{ext}")
 
@@ -84,6 +87,7 @@ def build_predictor(cfg, num_features: int) -> Pred:
         kernel_size=cfg.model.kernel_size,
         activation=cfg.model.activation,
         prediction_steps=cfg.model.prediction_steps,
+        max_grad_norm=getattr(cfg.training, "max_grad_norm", 1.0),
     )
 
 
@@ -126,21 +130,21 @@ def split_dataframe(df: pd.DataFrame, cfg) -> tuple[pd.DataFrame, pd.DataFrame]:
     return train_df, test_df
 
 
+# ─── Entry point ───────────────────────────────────────────────────────────────
+
 @hydra.main(version_base=None, config_path="config", config_name="config")
 def my_app(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
 
     tickers          = list(cfg.data.tickers)
     inflation_series = list(cfg.data.inflation_series)
-    start = datetime.datetime.fromisoformat(cfg.data.start_date)
-    end   = datetime.datetime.fromisoformat(cfg.data.end_date)
-    raw_df_with_volumes = None
-    cache_path = cfg.frequency.cache_path
-    if os.path.exists(cache_path):
-        raw_df_with_volumes = pd.read_csv(
-        cache_path, index_col=0, parse_dates=True
-    )
+    start            = datetime.datetime.fromisoformat(cfg.data.start_date)
+    end              = datetime.datetime.fromisoformat(cfg.data.end_date)
 
+    raw_df_with_volumes = None
+    cache_path          = cfg.frequency.cache_path
+    if os.path.exists(cache_path):
+        raw_df_with_volumes = pd.read_csv(cache_path, index_col=0, parse_dates=True)
 
     df, scaler = load_data(
         tickers, start, end,
@@ -160,10 +164,12 @@ def my_app(cfg: DictConfig) -> None:
     X_test,  Y_test  = make_windows(test_df,  cfg.prediction.window_size, cfg.prediction.stride)
 
     freq = cfg.frequency.interval
-    print(f"[Checkpoint] Frequenza attiva: {freq} — "
-          f"i checkpoint useranno il suffisso '_{freq}'")
+    print(
+        f"[Checkpoint] Frequenza attiva: {freq} — "
+        f"i checkpoint useranno il suffisso '_{freq}'"
+    )
 
-    # ── TRAIN ─────────────────────────────────────────────────────────────────
+    # ── TRAIN ──────────────────────────────────────────────────────────────────
     if cfg.step == "train":
         device = get_device()
         train_loader = torch.utils.data.DataLoader(
@@ -180,24 +186,33 @@ def my_app(cfg: DictConfig) -> None:
         mre_mode = getattr(mre_cfg, "update_mode", "mse") if mre_cfg else "mse"
         print(f"\nInizio addestramento (modalità: {mre_mode}, freq: {freq})...")
 
-        predictor.fit(train_loader, training_cfg=cfg.training, moment_target=moment_target)
+        predictor.fit(
+            train_loader,
+            training_cfg=cfg.training,
+            moment_target=moment_target,
+        )
 
         pred_path = checkpoint_name(cfg, "pred.pth")
         os.makedirs(cfg.paths.checkpoint_dir, exist_ok=True)
-        torch.save({
-            "model_state_dict": predictor.state_dict(),
-            "scaler":           scaler,
-            "num_features":     num_features,
-            "frequency":        freq,
-            "window_size":      cfg.prediction.window_size,
-            "config":           OmegaConf.to_container(cfg, resolve=True),
-        }, pred_path)
+        torch.save(
+            {
+                "model_state_dict": predictor.state_dict(),
+                "scaler":           scaler,
+                "num_features":     num_features,
+                "frequency":        freq,
+                "window_size":      cfg.prediction.window_size,
+                "config":           OmegaConf.to_container(cfg, resolve=True),
+            },
+            pred_path,
+        )
         print(f"\nModello salvato in: {pred_path}")
+
     elif cfg.step == "stats":
         make_stats(cfg)
-    # ── TEST ──────────────────────────────────────────────────────────────────
+
+    # ── TEST ───────────────────────────────────────────────────────────────────
     elif cfg.step == "test":
-        device = get_device()
+        device    = get_device()
         pred_path = checkpoint_name(cfg, "pred.pth")
         if not os.path.exists(pred_path):
             print(f"Errore: nessun checkpoint trovato in {pred_path}")
@@ -241,10 +256,9 @@ def my_app(cfg: DictConfig) -> None:
         )
         print("\nTest completato.")
 
-    # ── TRADE ─────────────────────────────────────────────────────────────────
+    # ── TRADE ──────────────────────────────────────────────────────────────────
     elif cfg.step == "trade":
         device = get_device()
-        # run_trade gestisce internamente ObsNormalizer e device — nessuna modifica qui
         run_trade(
             cfg=cfg,
             df=df,
@@ -260,7 +274,10 @@ def my_app(cfg: DictConfig) -> None:
         )
 
     else:
-        print(f"Errore: step sconosciuto '{cfg.step}'. Scegli tra 'train', 'test', 'trade'.")
+        print(
+            f"Errore: step sconosciuto '{cfg.step}'. "
+            "Scegli tra 'train', 'test', 'trade', 'stats'."
+        )
 
 
 if __name__ == "__main__":
