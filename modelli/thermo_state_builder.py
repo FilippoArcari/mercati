@@ -274,17 +274,23 @@ class ThermoStateBuilder:
 
     def __init__(
         self,
-        interval:     str   = "1d",
-        a_attraction: float = 0.5,
-        b_excluded:   float = 0.01,
-        max_lag:      int   = 90,
+        interval:      str   = "1d",
+        a_attraction:  float = 0.5,
+        b_excluded:    float = 0.01,
+        max_lag:       int   = 90,
+        add_trust:     bool  = True,
+        trust_horizon: int   = 1,
+        trust_window:  int   = 40,
     ):
-        self.is_daily     = (interval == "1d")
-        self.a_attraction = a_attraction
-        self.b_excluded   = b_excluded
-        self.max_lag      = max_lag
-        self.windows      = _WINDOWS["daily"] if self.is_daily else _WINDOWS["intraday"]
-        self._best_lag:   Optional[int] = None
+        self.is_daily      = (interval == "1d")
+        self.a_attraction  = a_attraction
+        self.b_excluded    = b_excluded
+        self.max_lag       = max_lag
+        self.windows       = _WINDOWS["daily"] if self.is_daily else _WINDOWS["intraday"]
+        self._best_lag:    Optional[int] = None
+        self.add_trust     = add_trust
+        self.trust_horizon = trust_horizon
+        self.trust_window  = trust_window
 
     # ── API principale ─────────────────────────────────────────────────────────
 
@@ -355,11 +361,29 @@ class ThermoStateBuilder:
 
         result = result.ffill().bfill().fillna(0.0)
 
-        n_psi = len([c for c in result.columns if c.startswith("Thm_Psi")])
+        # ── Trust scores ────────────────────────────────────────────────────
+        if self.add_trust:
+            try:
+                from signal_trust import SignalTrustEngine
+            except ImportError:
+                from modelli.signal_trust import SignalTrustEngine
+
+            engine = SignalTrustEngine(
+                horizon     = self.trust_horizon,
+                window      = self.trust_window,
+                is_intraday = not self.is_daily,
+            )
+            trust_df = engine.fit_transform(result, close)
+            if not trust_df.empty:
+                result = pd.concat([result, trust_df], axis=1)
+                result = result.ffill().bfill().fillna(0.0)
+
+        n_trust = len([c for c in result.columns if c.startswith("Trust_")])
+        n_psi   = len([c for c in result.columns if c.startswith("Thm_Psi")])
         print(
             f"[ThermoBuilder] {'Daily' if self.is_daily else 'Intraday'} | "
-            f"{len(result.columns)} colonne: {list(result.columns[:7])} "
-            f"+ {n_psi} Psi"
+            f"{len(result.columns)} col totali: "
+            f"{len(CANONICAL_COLS)} canonical + {n_psi} Psi + {n_trust} Trust"
         )
         return result
 

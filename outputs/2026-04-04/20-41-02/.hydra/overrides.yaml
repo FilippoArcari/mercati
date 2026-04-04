@@ -1,0 +1,5 @@
+- step=stats
+- frequency=minute
+- training=minute
+- prediction=minute
+- buyer=minute

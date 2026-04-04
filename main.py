@@ -11,6 +11,7 @@ from modelli.trade import run_trade
 from modelli.utils import load_data, make_windows, make_stats, get_device
 from modelli.evaluate_pred import evaluate_predictions
 from dotenv import load_dotenv
+import yfinance as yf
 
 load_dotenv()
 

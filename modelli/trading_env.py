@@ -208,8 +208,14 @@ class TradingEnv:
         # Bonus take-profit (vettorizzato — calcolato fuori)
         sell_bonus = 0.0002 * float(sell_profit_mask.sum())
 
-        return base_reward - concentration_penalty - inaction_penalty + sell_bonus
+        cash_ratio = self._cash / (new_value + 1e-8)
+        cash_penalty = 0.0
 
+        # Penalizza solo se il cash supera una certa soglia "sana" (es. 10%)
+        if cash_ratio > 0.10:
+            cash_penalty = 0.05 * (cash_ratio - 0.10) # Regola il peso (es. 0.05) in base all'aggressività voluta
+
+        return base_reward - concentration_penalty - inaction_penalty - cash_penalty + sell_bonus
     # ── step ──────────────────────────────────────────────────────────────
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
@@ -382,7 +388,7 @@ class TradingEnv:
 
         reward = self._compute_reward(prev_value, new_value, action, sell_profit_mask)
         
-        # ── THERMODYNAMIC REWARD SHAPING ──────────────────────────────────
+        # ── THERMODYNAMIC REWARD SHAPING (con FIDUCIA) ─────────────────────
         if self._has_thermo:
             # Uso lo step della decisione (ovvero self._step - 1)
             thm = self._thermo_np[self._step - 1]
@@ -391,14 +397,31 @@ class TradingEnv:
             def _get(name, default=0.0):
                 return float(thm[col.index(name)]) if name in col else default
 
-            t_stress = _get("Thm_Stress")
-            t_eff    = _get("Thm_Efficiency")
-            t_regime = _get("Thm_Regime")
+            t_stress    = _get("Thm_Stress")
+            t_eff       = _get("Thm_Efficiency")
+            t_regime    = _get("Thm_Regime")
+            
+            # ── NUOVO: Recupera i trust scores ───────────────────────────
+            trust_stress = _get("Trust_Thm_Stress", default=0.5)
+            trust_global = _get("Trust_Global",     default=0.5)
+            
+            # Soglia adattiva: se trust < 0.6 (random), nessun reward shaping
+            def _scaled_threshold(base_thresh, trust, direction=1):
+                """Soglia adattiva: richiede fiducia > 0.6 per attivare il bonus.
+                Se trust basso, la soglia sale (nessun reward).
+                Se trust alto, la soglia scende (reward più facile).
+                """
+                if trust < 0.6:
+                    return base_thresh * 2.0  # soglia irraggiungibile
+                return base_thresh / (trust + 1e-8)  # soglia scalata
             
             # Se ha effettuato una vendita valida
             if sell_mask.any():
-                if t_stress > self.stress_sell_threshold:
-                    reward += self.thermo_bonus_sell
+                effective_sell_thresh = _scaled_threshold(
+                    self.stress_sell_threshold, trust_stress
+                )
+                if t_stress > effective_sell_thresh:
+                    reward += self.thermo_bonus_sell * trust_stress
             
             # Se ha effettuato un acquisto valido
             try:
@@ -407,14 +430,19 @@ class TradingEnv:
                 valid_buy_any = False
                 
             if valid_buy_any:
-                if t_stress < self.stress_buy_threshold:
-                    reward += self.thermo_bonus_buy
+                effective_buy_thresh = _scaled_threshold(
+                    abs(self.stress_buy_threshold), trust_stress
+                )
+                if t_stress < -effective_buy_thresh:
+                    reward += self.thermo_bonus_buy * trust_stress
+                    
                 if t_eff > self.efficiency_penalty_thresh:
-                    reward -= self.thermo_penalty_buy
+                    reward -= self.thermo_penalty_buy * trust_stress  # penalità scalata
 
                 # Penalità aggiuntiva in fase 3 (COMPRESSIONE)
                 if t_regime >= 3.0:
-                    reward -= self.thermo_penalty_buy * 0.5
+                    trust_regime = _get("Trust_Thm_Regime", default=0.5)
+                    reward -= self.thermo_penalty_buy * 0.5 * trust_regime  # scalata per fiducia
 
         next_state = self._get_state() if not done else np.zeros(self.state_dim, np.float32)
 
