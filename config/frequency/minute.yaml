@@ -1,6 +1,6 @@
 # config/frequency/minute.yaml
 # Parametri INTRADAY ottimizzati per trading minuto
-interval: "1m"
+interval: "2m"
 label: "minute"
 bars_per_day: 390
 bars_per_year: 98280    # 390 barre/giorno × 252 giorni di trading

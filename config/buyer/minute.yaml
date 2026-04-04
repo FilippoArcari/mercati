@@ -2,54 +2,44 @@
 # Loaded ONLY when frequency=minute (via _apply_frequency_defaults in main.py)
 # Overrides config/buyer/default.yaml with intraday-specific aggressive parameters
 
-# Core settings (inherited from default)
+# config/buyer/intraday_override.yaml
 agent: ddpg
 initial_capital:  100.0
 transaction_cost: 0.001
 
-buffer_capacity: 100000
+buffer_capacity: 250000        # Aumentato per maggiore memoria storica
 log_every:       1
 
 # Training
-n_episodes:     100           # ← Aumentato da 300 per intraday (più data, più pattern)
-batch_size:     128           # ← Aumentato da 64 (stabilità con più sequenze)
-warmup:         2000          # ← Aumentato da 5000 (più esplorazione iniziale)
-es_patience:    60            # ← Aumentato da 40 (intraday patterns emergono tardi)
+n_episodes:     500           # Lascia fare all'early stopping se converge prima
+batch_size:     256           # Sfrutta la GPU e stabilizza il gradiente
+warmup:         5000          # Fagli accumulare un buon buffer casuale prima di addestrare
+es_patience:    50            
+es_metric:       sharpe
 
-# Reward shaping - ULTRA-AGGRESSIVE per intraday
-lambda_concentration: 0.1     # ← Aumentato da 0.8 (forza massima diversificazione)
-lambda_inaction:      0.05   # ← Aumentato da 0.3 (penalizza hold ancora più forte)
-action_threshold:     0.005   # ← Ridotto da 0.01 (sensibilità massima a SELL)
+# Reward shaping - Coerente con la volontà di essere aggressivi
+lambda_concentration: 0.6     # Penalità alta per forzare diversificazione
+lambda_inaction:      0.2     # Penalità moderata/alta per evitare l'immobilità
+action_threshold:     0.005   # Molto sensibile
 
-# DDPG - tuned per minute bar dynamics
+# DDPG Tuning per Colab GPU
 ddpg:
   actor_hidden:  [512, 256, 128]
   critic_hidden: [512, 256, 128]
-  lr_actor:      0.0004        # ← Aumentato ulteriormente per rapid convergence
-  lr_critic:     0.0008        # ← Aumentato ulteriormente
-  gamma:         0.98          # ← Ridotto (valuta rewards più vicini al presente)
-  tau:           0.01          # ← Aumentato da 0.005 (aggiornamento target network più veloce)
-  update_every:  5             # ← Ridotto da 10 (aggiornamenti più frequenti)
-  noise_sigma:   0.08          # ← Ridotto da 0.1 (esplorazione controllata)
-  noise_decay:   0.98          # ← Più aggressivo (esplora poi converge rapidamente)
-  noise_floor:   0.01          # ← Molto più basso per azioni finali precise
+  lr_actor:      0.0001        # Ridotto per stabilità policy
+  lr_critic:     0.0003        # Ridotto per stabilità Q-value
+  gamma:         0.98          # Ottimo per orizzonti intraday (max_holding 60)
+  tau:           0.005         # Stabilità della rete target
+  update_every:  5             # Con batch da 256, aggiornare ogni 5 step è bilanciato
+  noise_sigma:   0.15          # Più esplorazione iniziale
+  noise_decay:   0.995         # Decadimento più morbido
+  noise_floor:   0.02          # Non azzerarlo mai del tutto
 
-# Callbacks e checkpoint
-checkpoint_freq: 50           # ← Salva checkpoint ogni 50 ep (recupero veloce)
-eval_episodes:   20           # ← Valutazione su più episodi
-target_sharpe:   1.5          # ← Target ambizioso per intraday
-
-lambda_thermo: 0.15              # peso del reward termodinamico
-stress_sell_threshold: 1.0       # Z > 1.0 → bonus vendita
-stress_buy_threshold: -0.5       # Z < -0.5 → bonus acquisto
-efficiency_penalty_thresh: 1.5   # efficiency > 1.5 → penalità acquisto
+# Thermo Parameters (mantenuti intatti)
+lambda_thermo: 0.15              
+stress_sell_threshold: 1.0       
+stress_buy_threshold: -0.5       
+efficiency_penalty_thresh: 1.5   
 thermo_bonus_sell: 0.002
 thermo_bonus_buy: 0.001
 thermo_penalty_buy: 0.003
-
-intraday_thermo:
-  pressure_window: 5
-  entropy_window: 10
-  stress_window: 20
-  efficiency_window: 10
-  levy_alpha: 1.7                   # esponente Lévy (calibra con i tuoi dati)
