@@ -334,7 +334,188 @@ def init_vdw_calibration(
             print(f"[VdW Init] ERRORE nella calibrazione: {e} — usando default")
         return {}
 
+
+# ─── Entropy difference ────────────────────────────────────────────────────────
+
+def calculate_entropy_difference(df: pd.DataFrame, window: int = 20) -> tuple[pd.Series, pd.Series]:
+    """
+    Calcola la differenza tra l'entropia empirica dei rendimenti (Lévy-like)
+    e l'entropia teorica di un gas ideale (Sackur-Tetrode).
+    """
+    # ── Gestione MultiIndex columns da yfinance (multi-ticker) ───────────────
+    close_raw  = df["Close"]
+    volume_raw = df["Volume"]
+
+    # Se yfinance ha restituito un DataFrame multi-ticker, aggrega per media/somma
+    if isinstance(close_raw, pd.DataFrame):
+        close_raw = close_raw.mean(axis=1)
+    if isinstance(volume_raw, pd.DataFrame):
+        volume_raw = volume_raw.sum(axis=1)
+
+    returns    = close_raw.pct_change()
+    volatility = returns.rolling(window).std()
+    volume     = np.log1p(volume_raw.rolling(window).mean())
+
+    levy_entropy = pd.Series(index=df.index, dtype=float)
+    st_entropy   = pd.Series(index=df.index, dtype=float)
+
+    for i in range(window, len(df)):
+        sample = returns.iloc[i - window:i].dropna()
+        if len(sample) > 0:
+            prob_dist, _ = np.histogram(sample, bins=15, density=True)
+            prob_dist    = prob_dist[prob_dist > 0]
+            levy_entropy.iloc[i] = entropy(prob_dist)
+
+        # .item() converte da scalare-pandas a float puro → compatibile con np.isfinite
+        V = float(volume.iloc[i])
+        U = float(volatility.iloc[i]) ** 2 if np.isfinite(float(volatility.iloc[i])) else np.nan
+
+        if np.isfinite(V) and np.isfinite(U) and V > 0 and U > 0:
+            st_entropy.iloc[i] = np.log(V) + 1.5 * np.log(U) + 2.5
+
+    def safe_zscore(s: pd.Series) -> pd.Series:
+        mu    = s.mean()
+        sigma = s.std()
+        if not np.isfinite(sigma) or sigma < 1e-8:
+            return pd.Series(0.0, index=s.index)
+        return (s - mu) / sigma
+
+    levy_entropy_norm  = safe_zscore(levy_entropy).replace([np.inf , -np.inf],np.nan).ffill().bfill().fillna(0.0)
+    sackur_tetrode_entropy_norm   = safe_zscore(st_entropy).replace([np.inf , -np.inf],np.nan).ffill().bfill().fillna(0.0)
+    
+    return levy_entropy_norm, sackur_tetrode_entropy_norm
+
+def calculate_maxwell_boltzmann_indicators(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    """
+    Calcola gli indicatori basati sulla distribuzione di Maxwell-Boltzmann.
+    Analizza la 'velocità' delle azioni e l'energia cinetica del mercato.
+    """
+    results = pd.DataFrame(index=df.index)
+    
+    # 1. Definizione di Velocità (v) e Massa (m)
+    # Usiamo il log-return per la velocità e il volume per la massa
+    returns = np.log(df["Close"] / df["Close"].shift(1))
+    velocity = returns.abs()
+    
+    # Massa normalizzata (Volume) per evitare ordini di grandezza estremi
+    volume_norm = df["Volume"].rolling(window).mean()
+    massa = (volume_norm / volume_norm.expanding().mean()).fillna(1.0)
+
+    # 2. Temperatura del Sistema (T)
+    # In fisica T è proporzionale alla varianza delle velocità
+    temperature = returns.rolling(window).var()
+
+    # 3. Velocità Teorica di Maxwell-Boltzmann (V_rms)
+    # v_rms = sqrt(3 * k * T / m). Assumiamo k (costante di Boltzmann) = 1
+    # Rappresenta la velocità 'attesa' per un sistema in equilibrio
+    v_rms = np.sqrt(3 * temperature / massa)
+    
+    # 4. Energia Cinetica (K = 1/2 * m * v^2)
+    # Rappresenta la forza reale del movimento attuale
+    kinetic_energy = 0.5 * massa * (velocity ** 2)
+
+    # 5. MB_Divergence (Velocità Reale / Velocità Teorica)
+    # Se > 1: Il mercato si muove più velocemente di quanto la 'temperatura' (volatilità) suggerisca
+    # Se < 1: Il mercato è 'pigro' o congestionato (attrito elevato)
+    mb_ratio = (velocity / v_rms).replace([np.inf, -np.inf], np.nan)
+
+    # Inserimento nel DataFrame
+    results["MB_Temperature"] = temperature
+    results["MB_Kinetic_Energy"] = kinetic_energy
+    results["MB_Theoretical_V_rms"] = v_rms
+    results["MB_Velocity_Ratio"] = mb_ratio
+    
+    # Sanificazione finale
+    results = results.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0)
+    
+    return results
+
+def calculate_advanced_econophysics_indicators(df: pd.DataFrame, mb_indicators: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    """
+    Trasforma gli indicatori di Maxwell-Boltzmann in segnali di trading 
+    calcolando il 'Lavoro Utile' e la 'Pressione Sociale'.
+    """
+    adv = pd.DataFrame(index=df.index)
+    
+    # 1. RENDIMENTO DEL LAVORO (Efficiency)
+    # Quanta variazione di prezzo otteniamo per ogni unità di energia cinetica spesa?
+    # Se l'energia è alta ma il prezzo non si muove, l'efficienza cala (attrito).
+    price_delta = df["Close"].diff().abs()
+    adv["Thermo_Efficiency"] = (price_delta / mb_indicators["MB_Kinetic_Energy"].replace(0, np.nan))
+    
+    # 2. ENTROPIA DI VELOCITÀ
+    # Invece della velocità media, guardiamo quanto è ordinata la distribuzione delle velocità
+    adv["Velocity_Order"] = mb_indicators["MB_Velocity_Ratio"].rolling(window).std()
+    
+    # 3. SEGNALE DI 'BOILING POINT' (Punto di Ebollizione)
+    # Quando la temperatura sale sopra la media storica, il sistema è instabile.
+    temp_mu = mb_indicators["MB_Temperature"].rolling(window*5).mean()
+    temp_std = mb_indicators["MB_Temperature"].rolling(window*5).std()
+    adv["Market_Boiling_Z"] = (mb_indicators["MB_Temperature"] - temp_mu) / temp_std
+
+    return adv.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0)
+
+
+def calculate_intraday_thermodynamics(df: pd.DataFrame, window: int = 14) -> pd.DataFrame:
+    """
+    Indicatori specifici per l'intraday (1m, 5m, 15m).
+    Si concentra sulla Viscosità e la Potenza per identificare esaurimenti del trend.
+    """
+    intra = pd.DataFrame(index=df.index)
+    
+    # Calcolo dei rendimenti e volumi logaritmici
+    returns = np.log(df["Close"] / df["Close"].shift(1))
+    log_vol = np.log1p(df["Volume"])
+    
+    # 1. VISCOSITÀ DEL MERCATO (Market Viscosity)
+    # Misura la resistenza del prezzo al volume.
+    # Viscosità alta = il volume non produce movimento (mercato 'denso').
+    # Viscosità bassa = il prezzo scivola via con poco volume (mercato 'fluido').
+    vol_momentum = log_vol.rolling(window).mean()
+    price_volatility = returns.rolling(window).std()
+    intra["Market_Viscosity"] = (vol_momentum / price_volatility.replace(0, np.nan))
+    
+    # 2. POTENZA CINETICA ISTANTANEA (Kinetic Power)
+    # P = Lavoro / Tempo. Poiché il tempo tra le barre è costante, 
+    # usiamo la variazione di energia cinetica (m * v^2)
+    velocity_sq = returns**2
+    kinetic_power = (log_vol * velocity_sq).diff()
+    intra["Kinetic_Power_Flux"] = kinetic_power.rolling(window).mean()
+    
+    # 3. TURBOLENZA (Reynolds Number Analogy)
+    # Rapporto tra forze d'inerzia (momentum) e forze viscose (resistenza).
+    # Valori estremi indicano il passaggio da regime laminare (trend) a turbolento (caos).
+    momentum = returns.abs().rolling(window).sum()
+    intra["Market_Reynolds_Number"] = momentum / intra["Market_Viscosity"].replace(0, np.nan)
+    
+    return intra.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0)
+
+def calculate_joule_thomson_inversion(df: pd.DataFrame, mb_indicators: pd.DataFrame, window: int = 20) -> pd.Series:
+    """
+    Calcola l'indice di Joule-Thomson.
+    (dT/dP) approssimato: variazione di temperatura su variazione di volume.
+    Utile per trovare zone dove l'espansione raffredda o riscalda il mercato.
+    """
+    temperature = mb_indicators["MB_Temperature"]
+    volume = df["Volume"].rolling(window).mean()
+    
+    dT = temperature.diff(window)
+    dV = volume.pct_change(window)
+    
+    jtii = dT / (dV + 1e-8)
+    jtii = jtii.rolling(window).mean().replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0)
+    
+    # Scale to typical Z-score like boundaries
+    mean = jtii.mean()
+    std = jtii.std()
+    
+    if std > 1e-8:
+        jtii = (jtii - mean) / std
+        
+    return jtii
+
 # ─── Entry point principale ───────────────────────────────────────────────────
+
 
 def compute_thermodynamic_features(
     df_raw:           pd.DataFrame,
@@ -420,6 +601,26 @@ def compute_thermodynamic_features(
             thermo = pd.concat([thermo, psi_df], axis=1)
     else:
         print("[Thermo] rates_col non disponibile → Energy_Divergence e Ψ non calcolati")
+
+    # ── Integrazione Indicatori Avanzati (Maxwell-Boltzmann, Econophysics, Entropie) ──
+    try:
+        dummy_df = pd.DataFrame({
+            "Close": portfolio_close,
+            "Volume": portfolio_volume
+        })
+        levy_ent, st_ent = calculate_entropy_difference(dummy_df, window=window)
+        thermo["Levy_Entropy_Norm"] = levy_ent
+        thermo["Sackur_Tetrode_Entropy_Norm"] = st_ent
+        
+        mb_ind = calculate_maxwell_boltzmann_indicators(dummy_df, window=window)
+        adv_ind = calculate_advanced_econophysics_indicators(dummy_df, mb_ind, window=window)
+        intra_ind = calculate_intraday_thermodynamics(dummy_df, window=window)
+        jt_ind = calculate_joule_thomson_inversion(dummy_df, mb_ind, window=window)
+        
+        thermo = pd.concat([thermo, mb_ind, adv_ind, intra_ind], axis=1)
+        thermo["Joule_Thomson_Inversion"] = jt_ind
+    except Exception as e:
+        print(f"[Thermo] ERRORE durante il calcolo degli indicatori avanzati: {e}")
 
     thermo = thermo.ffill().bfill()
     print(f"[Thermo] {thermo.shape[1]} feature termodinamiche calcolate: "
@@ -514,6 +715,9 @@ class QuantumThermodynamicProcessor:
         
         # Standardizza
         x_std = self.scaler.fit_transform(feature_matrix)
+        
+        # Aggiungi minuscolo rumore per prevenire divisioni per zero in corrcoef se ci sono colonne a varianza 0
+        x_std += np.random.normal(0, 1e-8, x_std.shape)
         
         # Matrice di Correlazione
         corr = np.corrcoef(x_std, rowvar=False)

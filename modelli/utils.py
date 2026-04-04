@@ -11,12 +11,17 @@ from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from fredapi import Fred
 import seaborn as sns
 
+from scipy.stats import entropy
+
 from modelli.thermodynamics import (
     compute_thermodynamic_features,
     calculate_pressure_and_work,
     init_vdw_calibration,
+    calculate_entropy_difference,
+    calculate_maxwell_boltzmann_indicators,
+    calculate_advanced_econophysics_indicators,
+    calculate_intraday_thermodynamics,
 )
-from scipy.stats import entropy
 
 
 _INTRADAY_LIMITS = {
@@ -121,7 +126,11 @@ def add_divergence_and_efficiency_features(
 
         valid = pressure.notna() & rates.notna()
         if valid.sum() > thermo_max_lag + 10:
-            corrs    = [pressure[valid].corr(rates[valid].shift(i)) for i in range(thermo_max_lag + 1)]
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                corrs    = [pressure[valid].corr(rates[valid].shift(i)) for i in range(thermo_max_lag + 1)]
+            
             best_lag = int(np.nanargmax(np.abs(corrs)))
             best_rho = corrs[best_lag]
             print(f"[ThermoPatch] Lag monetario ottimale: {best_lag}gg | ρ={best_rho:.3f}")
@@ -297,59 +306,19 @@ def load_data(
     ]
 
     if add_thermodynamics:
-        if not is_intraday:
-            rates_col = next(
-                (c for c in _RATES_CANDIDATES if c in data.columns), None
-            )
-
-            vdw_calibration = None
-            try:
-                vdw_calibration = init_vdw_calibration(
-                    df_raw=data,
-                    ticker_cols=price_cols,
-                    verbose=True,
-                )
-            except Exception as e:
-                print(
-                    f"[load_data] AVVERTENZA: Calibrazione VdW fallita ({e}) "
-                    "— uso fallback ai parametri heuristici"
-                )
-
-            thermo_df = compute_thermodynamic_features(
-                df_raw=data,
-                ticker_cols=price_cols,
-                rates_col=rates_col,
-                window=thermo_window,
-                max_lag=thermo_max_lag,
-                vdw_calibration=vdw_calibration,
-            )
-
-            # Aggiungi Energy_Divergence_Z, Energy_Efficiency, Energy_Monetary_Lag
-            thermo_df = add_divergence_and_efficiency_features(
-                data=data,
-                thermo_df=thermo_df,
-                price_cols=price_cols,
-                rates_col=rates_col,
-                thermo_max_lag=thermo_max_lag,
-            )
-        else:
-            if volume_cols:
-                port_close  = data[price_cols].mean(axis=1)
-                port_volume = data[volume_cols].sum(axis=1)
-            else:
-                port_close  = data[price_cols].mean(axis=1)
-                port_volume = (port_close.diff().abs() * 1e6).fillna(1e6)
-
-            eff_window = min(thermo_window, max(5, len(data) // 20))
-            thermo_df  = calculate_pressure_and_work(
-                close=port_close, volume=port_volume, window=eff_window
-            )
-
+        from modelli.thermo_state_builder import ThermoStateBuilder, CANONICAL_COLS
+        builder   = ThermoStateBuilder(interval=interval)
+        thermo_df = builder.build(data, tickers)
+        
+        # Estrai le colonne canoniche se presenti, o tutte se non lo sono
+        can_cols = [c for c in CANONICAL_COLS if c in thermo_df.columns]
+        canonical = thermo_df[can_cols]
+        
         # Sanifica le feature termodinamiche PRIMA del concat
-        thermo_df = _sanitize(thermo_df, "thermo_df")
+        canonical = _sanitize(canonical, "thermo_df")
 
-        data = pd.concat([data, thermo_df], axis=1)
-        print(f"[load_data] Feature termodinamiche aggiunte: {list(thermo_df.columns)}")
+        data = pd.concat([data, canonical], axis=1).ffill().bfill()
+        print(f"[load_data] Feature termodinamiche base aggiunte al DCNN: {list(can_cols)}")
 
     # Rimuovi i volumi grezzi: già codificati nelle feature termodinamiche
     if volume_cols:
@@ -481,17 +450,50 @@ def make_stats(cfg):
         if n not in tickers:
             tickers.append(n)
 
-    df_raw            = yf.download(tickers, start=cfg.data.start_date, end=cfg.data.end_date)
+    df_raw            = yf.download(tickers, start="2000-01-01", end="2025-01-01")
     portfolio_tickers = [t for t in list(cfg.data.tickers) if t not in needed]
 
-    entropy_diff = calculate_entropy_difference(df_raw)
-
+    levy_entropy_norm, sackur_tetrode_entropy_norm = calculate_entropy_difference(df_raw)
+    
     df_port = pd.DataFrame({
         "Close":  df_raw["Close"][portfolio_tickers].mean(axis=1),
         "Volume": df_raw["Volume"][portfolio_tickers].sum(axis=1),
         "SP500":  df_raw["Close"]["^GSPC"],
         "Rates":  df_raw["Close"]["^TNX"],
     }).dropna()
+    
+    # Allinea le entropie con df_port e normalizza
+    entropy_data = pd.DataFrame({
+        "SP500": df_port["SP500"],
+        "Levy_Entropy": levy_entropy_norm,
+        "Sackur_Tetrode_Entropy": sackur_tetrode_entropy_norm,
+    }).dropna()
+    
+    scaler_entropy = MinMaxScaler()
+    entropy_scaled = pd.DataFrame(
+        scaler_entropy.fit_transform(entropy_data.values),
+        columns=entropy_data.columns,
+        index=entropy_data.index,
+    )
+    
+    # Plot: S&P 500 e i due tipi di entropia
+    plt.figure(figsize=(14, 6))
+    plt.plot(entropy_scaled.index, entropy_scaled["SP500"], 
+             label="S&P 500 (Normalizzato)", color="#2c3e50", linewidth=2)
+    plt.plot(entropy_scaled.index, entropy_scaled["Levy_Entropy"], 
+             label="Entropia Lévy (Returns Empirici)", color="#e74c3c", linewidth=1.5, alpha=0.8)
+    plt.plot(entropy_scaled.index, entropy_scaled["Sackur_Tetrode_Entropy"], 
+             label="Entropia Sackur-Tetrode (Gas Ideale)", color="#3498db", linewidth=1.5, alpha=0.8)
+    plt.title("S&P 500 e Tipi di Entropia (Normalizzati)", fontsize=14, fontweight="bold")
+    plt.xlabel("Data")
+    plt.ylabel("Valore Normalizzato")
+    plt.grid(True, alpha=0.2)
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.paths.results_dir, "entropy_difference_raw.png"), dpi=150)
+    plt.close()
+
+    
 
     p, w = calculate_market_thermodynamics(df_port, len(portfolio_tickers))
     df_port["Pressure"] = p
@@ -499,7 +501,10 @@ def make_stats(cfg):
 
     # Trova il lag ottimale tra Pressione e Tassi
     max_lag  = 90
-    corrs    = [df_port["Pressure"].corr(df_port["Rates"].shift(i)) for i in range(max_lag)]
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        corrs    = [df_port["Pressure"].corr(df_port["Rates"].shift(i)) for i in range(max_lag)]
     best_lag = int(np.nanargmax(np.abs(corrs)))
 
     df_port["Expected_Pressure"] = df_port["Rates"].shift(best_lag)
@@ -565,60 +570,294 @@ def make_stats(cfg):
     plt.savefig(os.path.join(cfg.paths.results_dir, "correlation_matrix.png"))
     plt.close()
 
+    # ── Plot Divergenza tra le due entropie ────────────────────────────────────
+    entropy_divergence = entropy_data["Levy_Entropy"] - entropy_data["Sackur_Tetrode_Entropy"]
     plt.figure(figsize=(16, 6))
     plt.plot(
-        entropy_diff.index, entropy_diff,
-        label="Divergenza Energetica (Levy - Sackur-Tetrode)", color="darkorange",
+        entropy_divergence.index, entropy_divergence,
+        label="Divergenza Energetica (Lévy - Sackur-Tetrode)", color="darkorange", linewidth=2
     )
     plt.axhline(0, color="black", linestyle="--", alpha=0.5)
     plt.title("Divergenza Energetica tra Rendimenti Empirici e Gas Ideale", fontsize=14)
+    plt.xlabel("Data")
+    plt.ylabel("Divergenza di Entropia")
     plt.legend()
     plt.grid(True, alpha=0.1)
     plt.tight_layout()
-    plt.savefig(os.path.join(cfg.paths.results_dir, "entropy_divergence.png"))
+    plt.savefig(os.path.join(cfg.paths.results_dir, "entropy_divergence.png"), dpi=150)
     plt.close()
+
+    # ── Indicatori di Maxwell-Boltzmann ────────────────────────────────────────
+    mb_indicators = calculate_maxwell_boltzmann_indicators(df_port, window=20)
+    advance_indicator = calculate_advanced_econophysics_indicators(df_port, mb_indicators, window=20)
+
+    
+    # Normalizza gli indicatori MB e S&P 500 per il plot
+    mb_plot_data = pd.DataFrame({
+        "SP500": df_port["SP500"],
+        "MB_Temperature": mb_indicators["MB_Temperature"],
+        "MB_Kinetic_Energy": mb_indicators["MB_Kinetic_Energy"],
+        "MB_Velocity_Ratio": mb_indicators["MB_Velocity_Ratio"],
+    }).dropna()
+    
+    scaler_mb = MinMaxScaler()
+    mb_scaled = pd.DataFrame(
+        scaler_mb.fit_transform(mb_plot_data.values),
+        columns=mb_plot_data.columns,
+        index=mb_plot_data.index,
+    )
+    
+    # Plot 1: Indicatori MB nel tempo
+    fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
+    
+    # Temperatura su asse sinistro, S&P 500 su asse destro
+    ax = axes[0]
+    ax.plot(mb_scaled.index, mb_scaled["MB_Temperature"], 
+            color="#27ae60", linewidth=2, label="MB Temperature")
+    ax.set_ylabel("MB Temperature (Norm.)", fontweight="bold")
+    ax.grid(True, alpha=0.2)
+    ax2 = ax.twinx()
+    ax2.plot(mb_scaled.index, mb_scaled["SP500"], 
+             color="#2c3e50", linewidth=1.5, alpha=0.6, label="S&P 500")
+    ax2.set_ylabel("S&P 500 (Norm.)", fontweight="bold")
+    ax.legend(loc="upper left")
+    ax2.legend(loc="upper right")
+    
+    # Energia cinetica su asse sinistro, S&P 500 su asse destro
+    ax = axes[1]
+    ax.plot(mb_scaled.index, mb_scaled["MB_Kinetic_Energy"], 
+            color="#e74c3c", linewidth=2, label="MB Kinetic Energy")
+    ax.set_ylabel("MB Kinetic Energy (Norm.)", fontweight="bold")
+    ax.grid(True, alpha=0.2)
+    ax2 = ax.twinx()
+    ax2.plot(mb_scaled.index, mb_scaled["SP500"], 
+             color="#2c3e50", linewidth=1.5, alpha=0.6, label="S&P 500")
+    ax2.set_ylabel("S&P 500 (Norm.)", fontweight="bold")
+    ax.legend(loc="upper left")
+    ax2.legend(loc="upper right")
+    
+    # Velocity Ratio su asse sinistro, S&P 500 su asse destro
+    ax = axes[2]
+    ax.plot(mb_scaled.index, mb_scaled["MB_Velocity_Ratio"], 
+            color="#f39c12", linewidth=2, label="MB Velocity Ratio")
+    ax.axhline(1, color="black", linestyle="--", alpha=0.5, label="Equilibrio (y=1)")
+    ax.set_ylabel("MB Velocity Ratio (Norm.)", fontweight="bold")
+    ax.set_xlabel("Data")
+    ax.grid(True, alpha=0.2)
+    ax2 = ax.twinx()
+    ax2.plot(mb_scaled.index, mb_scaled["SP500"], 
+             color="#2c3e50", linewidth=1.5, alpha=0.6, label="S&P 500")
+    ax2.set_ylabel("S&P 500 (Norm.)", fontweight="bold")
+    ax.legend(loc="upper left")
+    ax2.legend(loc="upper right")
+    
+    fig.suptitle("Indicatori di Maxwell-Boltzmann e S&P 500", 
+                 fontsize=16, fontweight="bold", y=0.995)
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.paths.results_dir, "maxwell_boltzmann_indicators.png"), dpi=150)
+    plt.close()
+    
+    # Plot 2: Correlazione tra MB indicators e S&P 500
+    mb_corr = mb_plot_data.corr()
+    plt.figure(figsize=(10, 6))
+    sns.heatmap(mb_corr, annot=True, cmap="coolwarm", center=0, fmt=".3f", 
+                linewidths=1, cbar_kws={"label": "Correlazione"})
+    plt.title("Correlazione tra Indicatori Maxwell-Boltzmann e S&P 500", 
+              fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.paths.results_dir, "maxwell_boltzmann_correlation.png"), dpi=150)
+    plt.close()
+
+    # ── Indicatori Avanzati di Econofisica ─────────────────────────────────────
+    # Normalizza gli indicatori avanzati e S&P 500 per il plot
+    adv_plot_data = pd.DataFrame({
+        "SP500": df_port["SP500"],
+        "Thermo_Efficiency": advance_indicator["Thermo_Efficiency"],
+        "Velocity_Order": advance_indicator["Velocity_Order"],
+        "Market_Boiling_Z": advance_indicator["Market_Boiling_Z"],
+    }).dropna()
+    
+    scaler_adv = MinMaxScaler()
+    adv_scaled = pd.DataFrame(
+        scaler_adv.fit_transform(adv_plot_data.values),
+        columns=adv_plot_data.columns,
+        index=adv_plot_data.index,
+    )
+    
+    # Plot 1: Indicatori Avanzati nel tempo
+    fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
+    
+    # Efficienza Termica su asse sinistro, S&P 500 su asse destro
+    ax = axes[0]
+    ax.plot(adv_scaled.index, adv_scaled["Thermo_Efficiency"], 
+            color="#9b59b6", linewidth=2, label="Thermo Efficiency")
+    ax.set_ylabel("Thermo Efficiency (Norm.)", fontweight="bold")
+    ax.grid(True, alpha=0.2)
+    ax2 = ax.twinx()
+    ax2.plot(adv_scaled.index, adv_scaled["SP500"], 
+             color="#2c3e50", linewidth=1.5, alpha=0.6, label="S&P 500")
+    ax2.set_ylabel("S&P 500 (Norm.)", fontweight="bold")
+    ax.legend(loc="upper left")
+    ax2.legend(loc="upper right")
+    
+    # Ordine di Velocità su asse sinistro, S&P 500 su asse destro
+    ax = axes[1]
+    ax.plot(adv_scaled.index, adv_scaled["Velocity_Order"], 
+            color="#16a085", linewidth=2, label="Velocity Order")
+    ax.set_ylabel("Velocity Order (Norm.)", fontweight="bold")
+    ax.grid(True, alpha=0.2)
+    ax2 = ax.twinx()
+    ax2.plot(adv_scaled.index, adv_scaled["SP500"], 
+             color="#2c3e50", linewidth=1.5, alpha=0.6, label="S&P 500")
+    ax2.set_ylabel("S&P 500 (Norm.)", fontweight="bold")
+    ax.legend(loc="upper left")
+    ax2.legend(loc="upper right")
+    
+    # Market Boiling Z su asse sinistro, S&P 500 su asse destro
+    ax = axes[2]
+    ax.plot(adv_scaled.index, adv_scaled["Market_Boiling_Z"], 
+            color="#e67e22", linewidth=2, label="Market Boiling Z")
+    ax.axhline(0, color="black", linestyle="--", alpha=0.5, label="Neutralità (y=0)")
+    ax.fill_between(adv_scaled.index, adv_scaled["Market_Boiling_Z"], 0, 
+                    where=(adv_scaled["Market_Boiling_Z"] >= 0), 
+                    color="#e74c3c", alpha=0.2, label="Stress Termico")
+    ax.fill_between(adv_scaled.index, adv_scaled["Market_Boiling_Z"], 0, 
+                    where=(adv_scaled["Market_Boiling_Z"] < 0), 
+                    color="#3498db", alpha=0.2, label="Stabilità")
+    ax.set_ylabel("Market Boiling Z (Norm.)", fontweight="bold")
+    ax.set_xlabel("Data")
+    ax.grid(True, alpha=0.2)
+    ax2 = ax.twinx()
+    ax2.plot(adv_scaled.index, adv_scaled["SP500"], 
+             color="#2c3e50", linewidth=1.5, alpha=0.6, label="S&P 500")
+    ax2.set_ylabel("S&P 500 (Norm.)", fontweight="bold")
+    ax.legend(loc="upper left")
+    ax2.legend(loc="upper right")
+    
+    fig.suptitle("Indicatori Avanzati di Econofisica e S&P 500", 
+                 fontsize=16, fontweight="bold", y=0.995)
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.paths.results_dir, "advanced_econophysics_indicators.png"), dpi=150)
+    plt.close()
+    
+    # Plot 2: Correlazione tra indicatori avanzati e S&P 500
+    adv_corr = adv_plot_data.corr()
+    plt.figure(figsize=(10, 6))
+    sns.heatmap(adv_corr, annot=True, cmap="coolwarm", center=0, fmt=".3f", 
+                linewidths=1, cbar_kws={"label": "Correlazione"})
+    plt.title("Correlazione tra Indicatori Avanzati di Econofisica e S&P 500", 
+              fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(os.path.join(cfg.paths.results_dir, "advanced_econophysics_correlation.png"), dpi=150)
+    plt.close()
+
+    # ── Indicatori Intraday (ultimi 30 giorni di dati per visibilità temporale) ───────
+    try:
+        intraday_end = datetime.datetime.now()
+        intraday_start = intraday_end - datetime.timedelta(days=30)
+        
+        df_intraday = yf.download(
+            "^GSPC",
+            start=intraday_start,
+            end=intraday_end,
+            interval="5m",
+            progress=False
+        )
+        
+        if not df_intraday.empty and len(df_intraday) > 20:
+            # Prepara il DataFrame con Close e Volume
+            df_intraday_prepared = pd.DataFrame({
+                "Close": df_intraday["Close"],
+                "Volume": df_intraday["Volume"],
+            }).dropna()
+            
+            # Calcola indicatori intraday
+            intraday_indicators = calculate_intraday_thermodynamics(df_intraday_prepared, window=14)
+            
+            # Normalizza gli indicatori intraday e prezzo per il plot
+            intra_plot_data = pd.DataFrame({
+                "Close": df_intraday_prepared["Close"],
+                "Market_Viscosity": intraday_indicators["Market_Viscosity"],
+                "Kinetic_Power_Flux": intraday_indicators["Kinetic_Power_Flux"],
+                "Market_Reynolds_Number": intraday_indicators["Market_Reynolds_Number"],
+            }).dropna()
+            
+            scaler_intra = MinMaxScaler()
+            intra_scaled = pd.DataFrame(
+                scaler_intra.fit_transform(intra_plot_data.values),
+                columns=intra_plot_data.columns,
+                index=intra_plot_data.index,
+            )
+            
+            # Plot 1: Indicatori Intraday nel tempo
+            fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
+            
+            # Market Viscosity su asse sinistro, Close su asse destro
+            ax = axes[0]
+            ax.plot(intra_scaled.index, intra_scaled["Market_Viscosity"], 
+                    color="#3498db", linewidth=2, label="Market Viscosity")
+            ax.set_ylabel("Market Viscosity (Norm.)", fontweight="bold")
+            ax.grid(True, alpha=0.2)
+            ax2 = ax.twinx()
+            ax2.plot(intra_scaled.index, intra_scaled["Close"], 
+                     color="#2c3e50", linewidth=1.5, alpha=0.6, label="S&P 500 Close")
+            ax2.set_ylabel("S&P 500 Close (Norm.)", fontweight="bold")
+            ax.legend(loc="upper left")
+            ax2.legend(loc="upper right")
+            
+            # Kinetic Power Flux su asse sinistro, Close su asse destro
+            ax = axes[1]
+            ax.plot(intra_scaled.index, intra_scaled["Kinetic_Power_Flux"], 
+                    color="#e74c3c", linewidth=2, label="Kinetic Power Flux")
+            ax.set_ylabel("Kinetic Power Flux (Norm.)", fontweight="bold")
+            ax.grid(True, alpha=0.2)
+            ax2 = ax.twinx()
+            ax2.plot(intra_scaled.index, intra_scaled["Close"], 
+                     color="#2c3e50", linewidth=1.5, alpha=0.6, label="S&P 500 Close")
+            ax2.set_ylabel("S&P 500 Close (Norm.)", fontweight="bold")
+            ax.legend(loc="upper left")
+            ax2.legend(loc="upper right")
+            
+            # Reynolds Number su asse sinistro, Close su asse destro
+            ax = axes[2]
+            ax.plot(intra_scaled.index, intra_scaled["Market_Reynolds_Number"], 
+                    color="#f39c12", linewidth=2, label="Reynolds Number")
+            ax.set_ylabel("Reynolds Number (Norm.)", fontweight="bold")
+            ax.set_xlabel("Data/Ora")
+            ax.grid(True, alpha=0.2)
+            ax2 = ax.twinx()
+            ax2.plot(intra_scaled.index, intra_scaled["Close"], 
+                     color="#2c3e50", linewidth=1.5, alpha=0.6, label="S&P 500 Close")
+            ax2.set_ylabel("S&P 500 Close (Norm.)", fontweight="bold")
+            ax.legend(loc="upper left")
+            ax2.legend(loc="upper right")
+            
+            fig.suptitle("Indicatori Intraday (5m) - Ultimi 30 Giorni", 
+                         fontsize=16, fontweight="bold", y=0.995)
+            plt.tight_layout()
+            plt.savefig(os.path.join(cfg.paths.results_dir, "intraday_thermodynamics_indicators.png"), dpi=150)
+            plt.close()
+            
+            # Plot 2: Correlazione tra indicatori intraday e prezzo
+            intra_corr = intra_plot_data.corr()
+            plt.figure(figsize=(10, 6))
+            sns.heatmap(intra_corr, annot=True, cmap="coolwarm", center=0, fmt=".3f", 
+                        linewidths=1, cbar_kws={"label": "Correlazione"})
+            plt.title("Correlazione tra Indicatori Intraday (5m) e S&P 500 Close", 
+                      fontsize=14, fontweight="bold")
+            plt.tight_layout()
+            plt.savefig(os.path.join(cfg.paths.results_dir, "intraday_thermodynamics_correlation.png"), dpi=150)
+            plt.close()
+            
+            print(f"[Stats] Plot intraday generati con {len(intra_plot_data)} barre (5m)")
+        else:
+            print("[Stats] AVVERTENZA: Dati intraday insufficienti per generare plot")
+    
+    except Exception as e:
+        print(f"[Stats] AVVERTENZA: Calcolo indicatori intraday fallito ({e})")
 
     print(f"[Stats] Analisi completata. Grafici salvati in {cfg.paths.results_dir}")
     return df_port
 
 
-# ─── Entropy difference ────────────────────────────────────────────────────────
 
-def calculate_entropy_difference(df: pd.DataFrame, window: int = 20) -> pd.Series:
-    """
-    Calcola la differenza tra l'entropia empirica dei rendimenti (Lévy-like)
-    e l'entropia teorica di un gas ideale (Sackur-Tetrode).
-    """
-    returns    = df["Close"].pct_change()
-    volatility = returns.rolling(window).std()
-    volume     = np.log1p(df["Volume"].rolling(window).mean())
-
-    levy_entropy = pd.Series(index=df.index, dtype=float)
-    st_entropy   = pd.Series(index=df.index, dtype=float)
-
-    for i in range(window, len(df)):
-        # Entropia di Lévy (empirica tramite Shannon)
-        sample = returns.iloc[i - window:i].dropna()
-        if len(sample) > 0:
-            prob_dist, _ = np.histogram(sample, bins=15, density=True)
-            prob_dist    = prob_dist[prob_dist > 0]
-            levy_entropy.iloc[i] = entropy(prob_dist)
-
-        # Entropia di Sackur-Tetrode (gas ideale)
-        V = volume.iloc[i]
-        U = volatility.iloc[i] ** 2
-        if np.isfinite(V) and np.isfinite(U) and V > 0 and U > 0:
-            st_entropy.iloc[i] = np.log(V) + 1.5 * np.log(U) + 2.5
-
-    def safe_zscore(s: pd.Series) -> pd.Series:
-        """Z-score con protezione da std = 0 o NaN."""
-        mu    = s.mean()
-        sigma = s.std()
-        if not np.isfinite(sigma) or sigma < 1e-8:
-            return pd.Series(0.0, index=s.index)
-        return (s - mu) / sigma
-
-    s1   = safe_zscore(levy_entropy)
-    s2   = safe_zscore(st_entropy)
-    diff = (s1 - s2).replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0.0)
-    return diff

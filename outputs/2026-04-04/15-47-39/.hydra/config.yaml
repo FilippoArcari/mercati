@@ -1,0 +1,166 @@
+data:
+  tickers:
+  - AAPL
+  - MSFT
+  - AMZN
+  - GOOGL
+  - META
+  - NVDA
+  - T
+  - VSLA
+  - JPM
+  - MA
+  - UNH
+  - JNJ
+  - LDO.MI
+  - ENI.MI
+  - ENEL.MI
+  - ISP.MI
+  - RACE.MI
+  - ^GSPC
+  - ^IXIC
+  - FTSEMIB.MI
+  - SPY
+  - QQQ
+  - IVV
+  - EEM
+  - EFA
+  - XLF
+  - VNQ
+  - GC=F
+  - CL=F
+  - SI=F
+  - NG=F
+  - HG=F
+  - GLD
+  - SLV
+  - USO
+  - EURUSD=X
+  - USDJPY=X
+  - TLT
+  - BND
+  - IEF
+  - XLE
+  - BTC-USD
+  - ETH-USD
+  - XOM
+  - CVX
+  - WMT
+  - NFLX
+  - BA
+  - KO
+  - PFE
+  - SHOP
+  inflation_series:
+  - CPILFESL
+  - T10YIE
+  - MICH
+  - FEDFUNDS
+  - GS10
+  - T10Y2Y
+  - VIXCLS
+  - STLFSI4
+  - BAMLH0A0HYM2
+  - CP0000EZ19M086NEST
+  - CP0000ITM086NEST
+  - IR3TIB01EZM156N
+  start_date: '2018-01-01'
+  end_date: '2026-12-31'
+  cache_path: ./data.csv
+  fred_api_key: ${oc.env:FRED_API_KEY}
+  split_date: '2023-01-01'
+model:
+  name: cnn
+  dimensions:
+  - 64
+  - 32
+  - 16
+  dilations:
+  - 1
+  - 2
+  - 4
+  kernel_size: 3
+  activation: leaky_relu
+  prediction_steps: 3
+training:
+  epochs: 1000
+  learning_rate: 0.002
+  batch_size: 128
+  optimizer: adam
+  weight_decay: 5.0e-05
+  scheduler:
+    enabled: false
+    type: cosine
+    warmup_steps: 50
+  early_stopping:
+    enabled: true
+    patience: 20
+    min_delta: 1.0e-05
+  mre:
+    enabled: true
+    update_mode: simultaneous
+    lambda_entropy: 0.02
+    lambda_moment: 0.05
+    epochs_phase1: 10
+prediction:
+  window_size: 15
+  stride: 3
+buyer:
+  agent: ddpg
+  initial_capital: 100.0
+  transaction_cost: 0.001
+  buffer_capacity: 100000
+  log_every: 1
+  n_episodes: 100
+  batch_size: 128
+  warmup: 2000
+  es_patience: 60
+  lambda_concentration: 0.1
+  lambda_inaction: 0.05
+  action_threshold: 0.005
+  ddpg:
+    actor_hidden:
+    - 512
+    - 256
+    - 128
+    critic_hidden:
+    - 512
+    - 256
+    - 128
+    lr_actor: 0.0004
+    lr_critic: 0.0008
+    gamma: 0.98
+    tau: 0.01
+    update_every: 5
+    noise_sigma: 0.08
+    noise_decay: 0.98
+    noise_floor: 0.01
+  checkpoint_freq: 50
+  eval_episodes: 20
+  target_sharpe: 1.5
+  lambda_thermo: 0.15
+  stress_sell_threshold: 1.0
+  stress_buy_threshold: -0.5
+  efficiency_penalty_thresh: 1.5
+  thermo_bonus_sell: 0.002
+  thermo_bonus_buy: 0.001
+  thermo_penalty_buy: 0.003
+  intraday_thermo:
+    pressure_window: 5
+    entropy_window: 10
+    stress_window: 20
+    efficiency_window: 10
+    levy_alpha: 1.7
+paths:
+  output_dir: ${hydra:runtime.output_dir}
+  results_dir: ./results
+  checkpoint_dir: ./checkpoints
+frequency:
+  interval: 1m
+  label: minute
+  bars_per_day: 390
+  bars_per_year: 98280
+  cache_path: ./data_minute.csv
+  max_history_days: 7
+  split_ratio: 0.8
+step: trade

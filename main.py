@@ -258,7 +258,7 @@ def my_app(cfg: DictConfig) -> None:
 
     # ── TRADE ──────────────────────────────────────────────────────────────────
     elif cfg.step == "trade":
-        device = get_device()
+       
         run_trade(
             cfg=cfg,
             df=df,
@@ -270,7 +270,6 @@ def my_app(cfg: DictConfig) -> None:
             Y_test=Y_test,
             train_df=train_df,
             test_df=test_df,
-            device=device,
         )
 
     else:

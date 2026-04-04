@@ -36,18 +36,25 @@ class TradingEnv:
 
     def __init__(
         self,
-        prices_real:          pd.DataFrame,
-        prices_pred:          pd.DataFrame,
-        tickers:              list[str],
-        initial_capital:      float = 10_000.0,
-        transaction_cost:     float = 0.001,
-        psi_df:               Optional[pd.DataFrame] = None,
+        prices_real:      pd.DataFrame,
+        prices_pred:      pd.DataFrame,
+        tickers:          list[str],
+        psi_df:           Optional[pd.DataFrame] = None,
+        thermo_df:        Optional[pd.DataFrame] = None,
+        initial_capital:  float = 100.0,
+        transaction_cost: float = 0.001,
+        log_trades:       bool  = False,
+        action_threshold: float = 0.01,
+        max_position_pct: float = 0.20,
+        max_holding_steps: int  = 60,
+        thermo_bonus_sell: float = 0.002,
+        thermo_bonus_buy:  float = 0.001,
+        thermo_penalty_buy: float = 0.002,
+        stress_sell_threshold: float = 1.0,
+        stress_buy_threshold:  float = -0.5,
+        efficiency_penalty_thresh: float = 1.5,
         lambda_concentration: float = 0.1,
-        lambda_inaction:      float = 0.05,
-        action_threshold:     float = 0.05,
-        max_position_pct:     float = 0.10,
-        max_holding_steps:    int   = 100,
-        log_trades:           bool  = True,
+        lambda_inaction:      float = 0.1,
     ) -> None:
         self.prices_real      = prices_real
         self.prices_pred      = prices_pred
@@ -62,6 +69,14 @@ class TradingEnv:
         self.action_threshold     = action_threshold
         self.max_position_pct     = max_position_pct
         self.max_holding_steps    = max_holding_steps
+        
+        # Thermo shaping rules
+        self.thermo_bonus_sell         = thermo_bonus_sell
+        self.thermo_bonus_buy          = thermo_bonus_buy
+        self.thermo_penalty_buy        = thermo_penalty_buy
+        self.stress_sell_threshold     = stress_sell_threshold
+        self.stress_buy_threshold      = stress_buy_threshold
+        self.efficiency_penalty_thresh = efficiency_penalty_thresh
 
         self.num_features = len(self.all_columns)
         self.num_tickers  = len(tickers)
@@ -78,11 +93,27 @@ class TradingEnv:
                 self._psi = psi_aligned[psi_cols].values.astype(np.float32)
                 print(f"[TradingEnv] Ψ attivo per {len(psi_cols)}/{self.num_tickers} ticker")
 
+        # ── Aggregated Thermo ─────────────────────────────────────────────
+        self._thermo_np: "Optional[np.ndarray]" = None
+        self._thermo_col_names: list[str] = []
+        self._has_thermo = False
+
+        if thermo_df is not None and not thermo_df.empty:
+            th = thermo_df.reindex(prices_real.index).ffill().bfill().fillna(0)
+            thm_cols = [c for c in th.columns if c.startswith("Thm_")]
+            if thm_cols:
+                self._thermo_np        = th[thm_cols].values.astype(np.float32)
+                self._thermo_col_names = thm_cols
+                self._has_thermo       = True
+                print(f"[TradingEnv] Thermo state: {len(thm_cols)} colonne → {thm_cols}")
+
         has_psi = self._psi is not None
+        n_thm   = len(self._thermo_col_names) if self._has_thermo else 0
         self.state_dim  = (
             2 * self.num_features
             + self.num_tickers + 2
             + (self.num_tickers if has_psi else 0)
+            + n_thm
         )
         self.action_dim = self.num_tickers
 
@@ -132,6 +163,9 @@ class TradingEnv:
 
         if self._psi is not None:
             parts.append(self._psi[self._step])
+            
+        if self._has_thermo:
+            parts.append(self._thermo_np[self._step])
 
         return np.concatenate(parts).astype(np.float32)
 
@@ -209,6 +243,17 @@ class TradingEnv:
             sell_profit_mask[sell_mask] = realized_pnl > 0
 
             if self.log_trades:
+                if self._has_thermo:
+                    thm = self._thermo_np[self._step]
+                    col = self._thermo_col_names
+                    def _get(name, default=0.0):
+                        return float(thm[col.index(name)]) if name in col else default
+                    t_stress_val = round(_get("Thm_Stress"), 4)
+                    t_eff_val    = round(_get("Thm_Efficiency"), 4)
+                else:
+                    t_stress_val = 0.0
+                    t_eff_val    = 0.0
+            
                 sell_indices = np.where(sell_mask)[0]
                 for k, i in enumerate(sell_indices):
                     self._trade_log.append({
@@ -225,6 +270,8 @@ class TradingEnv:
                         "realized_pnl": round(float(realized_pnl[k]), 2),
                         "holdings_after": round(float(self._holdings[i]), 6),
                         "cash_after":   round(float(self._cash), 2),
+                        "thermo_stress": t_stress_val,
+                        "thermo_efficiency": t_eff_val,
                     })
 
         # ── ACQUISTI vettorizzati ─────────────────────────────────────────
@@ -269,6 +316,17 @@ class TradingEnv:
                 self._holdings[valid_mask] += shares_buy
 
                 if self.log_trades:
+                    if self._has_thermo:
+                        thm = self._thermo_np[self._step]
+                        col = self._thermo_col_names
+                        def _get(name, default=0.0):
+                            return float(thm[col.index(name)]) if name in col else default
+                        t_stress_val = round(_get("Thm_Stress"), 4)
+                        t_eff_val    = round(_get("Thm_Efficiency"), 4)
+                    else:
+                        t_stress_val = 0.0
+                        t_eff_val    = 0.0
+
                     for k, i in enumerate(valid_indices):
                         self._trade_log.append({
                             "date":         date,
@@ -284,6 +342,8 @@ class TradingEnv:
                             "realized_pnl": 0.0,
                             "holdings_after": round(float(self._holdings[i]), 6),
                             "cash_after":   round(float(self._cash), 2),
+                            "thermo_stress": t_stress_val,
+                            "thermo_efficiency": t_eff_val,
                         })
 
         # ── FORCED SELL posizioni stantie ─────────────────────────────────
@@ -320,7 +380,42 @@ class TradingEnv:
                 snap[f"{t}_unrealized_pnl"] = round(float(unrealized[i]), 2)
             self._value_per_ticker.append(snap)
 
-        reward     = self._compute_reward(prev_value, new_value, action, sell_profit_mask)
+        reward = self._compute_reward(prev_value, new_value, action, sell_profit_mask)
+        
+        # ── THERMODYNAMIC REWARD SHAPING ──────────────────────────────────
+        if self._has_thermo:
+            # Uso lo step della decisione (ovvero self._step - 1)
+            thm = self._thermo_np[self._step - 1]
+            col = self._thermo_col_names
+
+            def _get(name, default=0.0):
+                return float(thm[col.index(name)]) if name in col else default
+
+            t_stress = _get("Thm_Stress")
+            t_eff    = _get("Thm_Efficiency")
+            t_regime = _get("Thm_Regime")
+            
+            # Se ha effettuato una vendita valida
+            if sell_mask.any():
+                if t_stress > self.stress_sell_threshold:
+                    reward += self.thermo_bonus_sell
+            
+            # Se ha effettuato un acquisto valido
+            try:
+                valid_buy_any = valid_mask.any()
+            except NameError:
+                valid_buy_any = False
+                
+            if valid_buy_any:
+                if t_stress < self.stress_buy_threshold:
+                    reward += self.thermo_bonus_buy
+                if t_eff > self.efficiency_penalty_thresh:
+                    reward -= self.thermo_penalty_buy
+
+                # Penalità aggiuntiva in fase 3 (COMPRESSIONE)
+                if t_regime >= 3.0:
+                    reward -= self.thermo_penalty_buy * 0.5
+
         next_state = self._get_state() if not done else np.zeros(self.state_dim, np.float32)
 
         return next_state, float(reward), done, {

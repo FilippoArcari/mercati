@@ -221,7 +221,7 @@ def estimate_lambda_impact(
     # Regressione: log|r| = log(λ) + γ × log(Q/Q̄)
     # → stima di log(λ) = mean(log|r|) - γ × mean(log(Q/Q̄))
     log_lambda = np.mean(log_r) - gamma * np.mean(log_q)
-    lambda_est = np.exp(log_lambda)
+    lambda_est = float(np.exp(log_lambda)) if not np.isnan(log_lambda) else LAMBDA_UNIVERSAL
 
     return float(np.clip(lambda_est, 0.5, 10.0))
 
@@ -303,8 +303,13 @@ def calibrate_single(
 
     # ── 4. Momentum strength (autocorrelazione lag-1) ─────────────────────────
     if len(returns) > 10:
-        ac = np.corrcoef(returns[:-1], returns[1:])[0, 1]
-        momentum_strength = float(max(0.0, ac))   # clamp: herding solo positivo
+        std1 = np.std(returns[:-1])
+        std2 = np.std(returns[1:])
+        if std1 > 1e-8 and std2 > 1e-8:
+            ac = np.corrcoef(returns[:-1], returns[1:])[0, 1]
+            momentum_strength = float(max(0.0, np.nan_to_num(ac)))
+        else:
+            momentum_strength = 0.0
     else:
         momentum_strength = 0.0
         warns.append("Serie troppo corta per stimare l'autocorrelazione")
@@ -457,13 +462,17 @@ def vdw_pressure(
     b  = vdw_params.b
     nb = n * b
 
-    if V <= nb:
+    if V <= nb + 1e-6:
         # Violazione del vincolo fisico: volume sotto il minimo strutturale
         # Restituisce pressione molto alta (segnale di stress estremo)
-        return float("inf")
+        return 1e6  # Cap to large finite value instead of infinity to prevent NaNs down the line
 
     # Equazione di Van der Waals risolta per P
-    P = (n * R * temperature) / (V - nb) - a * (n ** 2) / (V ** 2)
+    P = (n * R * temperature) / (V - nb) - a * (n ** 2) / (V ** 2 + 1e-8)
+
+    # Sanity check sull'output
+    if np.isnan(P) or np.isinf(P):
+        return 0.0
 
     return float(P)
 

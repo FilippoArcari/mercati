@@ -18,7 +18,7 @@ from modelli.trading_env import TradingEnv
 from modelli.obs_normalizer import ObsNormalizer, train_ddpg_normalized
 from modelli.intraday_thermo import compute_intraday_thermo_features, detect_market_regime
 
-
+BATCH_SIZE = 256
 # ─── naming checkpoint ────────────────────────────────────────────────────────
 
 def _ckpt(cfg, name: str) -> str:
@@ -28,22 +28,49 @@ def _ckpt(cfg, name: str) -> str:
     tag = f"_{freq}_w{ws}" if stem == "pred" else f"_{freq}"
     return os.path.join(cfg.paths.checkpoint_dir, f"{stem}{tag}{ext}")
 
+def _predict_batched(predictor, X: torch.Tensor, batch_size: int = 256) -> np.ndarray:
+    """Inferenza a batch per evitare OOM con dataset grandi."""
+    results = []
+    device = next(predictor.parameters()).device   # ← ricava il device dal modello
+    predictor.eval()
+    with torch.no_grad():
+        for i in range(0, len(X), batch_size):
+            print(f"batch{i}")
+            batch = X[i : i + batch_size].to(device)  # ← sposta il batch sul device corretto
+            out   = predictor(batch)
+            if out.dim() == 3:
+                out = out[:, 0, :]
+            results.append(out.cpu().numpy())
+    return np.concatenate(results, axis=0)
 
 # ─── helpers privati ──────────────────────────────────────────────────────────
 
 def _load_predictor(cfg, num_features, checkpoint):
-    predictor = Pred(
-        num_features=num_features,
-        window_size=cfg.prediction.window_size,
-        dimension=list(cfg.model.dimensions),
-        dilations=list(cfg.model.dilations),
-        kernel_size=cfg.model.kernel_size,
-        activation=cfg.model.activation,
+    saved_cfg = checkpoint.get("config", {})
+    pred_steps = (
+        saved_cfg.get("model", {}).get("prediction_steps")
+        or cfg.model.prediction_steps
     )
+    saved_features = checkpoint.get("num_features", num_features)
+
+    predictor = Pred(
+        num_features     = saved_features,
+        window_size      = cfg.prediction.window_size,
+        dimension        = list(cfg.model.dimensions),
+        dilations        = list(cfg.model.dilations),
+        kernel_size      = cfg.model.kernel_size,
+        activation       = cfg.model.activation,
+        prediction_steps = pred_steps,
+        max_grad_norm    = getattr(cfg.training, "max_grad_norm", 1.0),
+    )
+
     predictor.load_state_dict(checkpoint["model_state_dict"])
     predictor.eval()
-    return predictor
 
+    # ← MANCAVA QUESTO
+    from modelli.utils import get_device
+    predictor = predictor.to(get_device())
+    return predictor
 
 def _build_price_dfs(pred_scaled, real_targets, scaler, dates, all_columns):
     real = scaler.inverse_transform(
@@ -351,49 +378,6 @@ def _analyze_thermo_trades(trade_log: pd.DataFrame, results_dir: str, freq: str)
     print(f"  → CSV salvato: thermo_analysis_{freq}.csv")
 
 
-# ─── calcolo feature termodinamiche ──────────────────────────────────────────
-
-def _compute_thermo(cfg, tickers, raw_train_df: pd.DataFrame, raw_test_df: pd.DataFrame):
-    """
-    Calcola le feature termodinamiche intraday per train e test.
-
-    IMPORTANTE: riceve i DataFrame *raw* (con le colonne *_Volume per-ticker)
-    — NON i DataFrame processati da load_data che le hanno già droppate.
-
-    Ritorna (None, None) in modalità daily (nessun overhead).
-    """
-    is_intraday = getattr(cfg.frequency, "interval", "1d") != "1d"
-    if not is_intraday:
-        return None, None
-
-    # Accesso corretto alla config: cfg.buyer.intraday_thermo
-    thermo_cfg = getattr(cfg.buyer, "intraday_thermo", {})
-    params = {
-        "pressure_window":   getattr(thermo_cfg, "pressure_window",   5),
-        "entropy_window":    getattr(thermo_cfg, "entropy_window",    10),
-        "stress_window":     getattr(thermo_cfg, "stress_window",     20),
-        "efficiency_window": getattr(thermo_cfg, "efficiency_window", 10),
-        "levy_alpha":        getattr(thermo_cfg, "levy_alpha",        1.7),
-    }
-
-    # Log colonne volume disponibili nel raw df (utile per debug)
-    vol_cols_found = [c for c in raw_train_df.columns if "volume" in c.lower()]
-    print(f"[Trade] Calcolo feature termodinamiche intraday...")
-    print(f"[Trade] Colonne volume disponibili nel raw df: {vol_cols_found}")
-
-    thermo_train = compute_intraday_thermo_features(raw_train_df, tickers, params=params)
-    thermo_test  = compute_intraday_thermo_features(raw_test_df,  tickers, params=params)
-
-    regime_names  = {0: "NEUTRO", 1: "RALLY_REALE", 2: "RALLY_ESAUSTO",
-                     3: "COMPRESSIONE", 4: "RIMBALZO"}
-    regime_counts = detect_market_regime(thermo_train).value_counts().sort_index()
-    print("[Trade] Distribuzione regimi (train set):")
-    for r, count in regime_counts.items():
-        pct = 100 * count / len(thermo_train)
-        print(f"    {regime_names.get(r, r):20s}: {count:5d} bar ({pct:.1f}%)")
-
-    return thermo_train, thermo_test
-
 
 # ─── entry point ─────────────────────────────────────────────────────────────
 
@@ -425,9 +409,14 @@ def run_trade(
           f"Checkpoint predittore: {os.path.basename(pred_path)}")
 
     # ── 2. Predizioni denormalizzate ──────────────────────────────────────────
-    with torch.no_grad():
-        train_pred_scaled = predictor(X_train).numpy()
-        test_pred_scaled  = predictor(X_test).numpy()
+    print("[Trade] Inferenza train set...")
+    train_pred_scaled = _predict_batched(predictor, X_train, batch_size=BATCH_SIZE)
+    print(f"[Trade] Train pred shape: {train_pred_scaled.shape}")
+
+    print("[Trade] Inferenza test set...")
+    test_pred_scaled  = _predict_batched(predictor, X_test,  batch_size=BATCH_SIZE)
+    print(f"[Trade] Test pred shape: {test_pred_scaled.shape}")
+
 
     all_columns     = list(df.columns)
     n_windows_train = len(Y_train)
@@ -461,8 +450,11 @@ def run_trade(
         raw_train_df, raw_test_df = _split_raw(df_raw, train_df.index, test_df.index)
     else:
         raw_train_df, raw_test_df = train_df, test_df
-
-    thermo_train, thermo_test = _compute_thermo(cfg, tickers, raw_train_df, raw_test_df)
+    
+    from modelli.thermo_state_builder import ThermoStateBuilder
+    builder = ThermoStateBuilder(interval=cfg.frequency.interval)
+    thermo_train = builder.build(raw_train_df, tickers)
+    thermo_test  = builder.build(raw_test_df, tickers)
 
     # ── 4. Ambienti ───────────────────────────────────────────────────────────
     buyer_cfg = cfg.buyer
@@ -480,10 +472,17 @@ def run_trade(
         initial_capital=buyer_cfg.initial_capital,
         transaction_cost=buyer_cfg.transaction_cost,
         psi_df=psi_train,
+        thermo_df=thermo_train,
         lambda_concentration=lc,
         lambda_inaction=li,
         action_threshold=at,
         log_trades=False,
+        thermo_bonus_sell=getattr(buyer_cfg, "thermo_bonus_sell", 0.0),
+        thermo_bonus_buy=getattr(buyer_cfg, "thermo_bonus_buy", 0.0),
+        thermo_penalty_buy=getattr(buyer_cfg, "thermo_penalty_buy", 0.0),
+        stress_sell_threshold=sst,
+        stress_buy_threshold=sbt,
+        efficiency_penalty_thresh=ept,
     )
     env_test = TradingEnv(
         prices_real=prices_real_test, prices_pred=prices_pred_test,
@@ -491,10 +490,18 @@ def run_trade(
         initial_capital=buyer_cfg.initial_capital,
         transaction_cost=buyer_cfg.transaction_cost,
         psi_df=psi_test,
+        thermo_df=thermo_test,
         lambda_concentration=0.0,
         lambda_inaction=0.0,
         action_threshold=at,
         log_trades=True,
+        # During test, shaping rewards are calculated but mostly we care about logs
+        thermo_bonus_sell=getattr(buyer_cfg, "thermo_bonus_sell", 0.0),
+        thermo_bonus_buy=getattr(buyer_cfg, "thermo_bonus_buy", 0.0),
+        thermo_penalty_buy=getattr(buyer_cfg, "thermo_penalty_buy", 0.0),
+        stress_sell_threshold=sst,
+        stress_buy_threshold=sbt,
+        efficiency_penalty_thresh=ept,
     )
 
     # ── 5. Agente DDPG ────────────────────────────────────────────────────────
