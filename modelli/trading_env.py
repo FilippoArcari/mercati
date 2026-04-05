@@ -116,6 +116,8 @@ class TradingEnv:
             if thm_cols:
                 self._thermo_np        = th[thm_cols].values.astype(np.float32)
                 self._thermo_col_names = thm_cols
+                # Dict per O(1) lookup invece di O(n) list.index() ad ogni step
+                self._thermo_col_idx: dict[str, int] = {c: i for i, c in enumerate(thm_cols)}
                 self._has_thermo       = True
                 print(f"[TradingEnv] Thermo state: {len(thm_cols)} colonne → {thm_cols}")
 
@@ -152,6 +154,11 @@ class TradingEnv:
         self._trade_log:         list[dict]  = []
         self._value_per_ticker:  list[dict]  = []
 
+        # Cache per-step: evita di ricalcolare prezzi e portfolio value più volte per step
+        self._cached_step:   int        = -1
+        self._cached_prices: np.ndarray = np.empty(self.num_tickers, dtype=np.float64)
+        self._cached_pv:     float      = self.initial_capital
+
     def reset(self) -> np.ndarray:
         self._reset_internals()
         return self._get_state()
@@ -184,9 +191,14 @@ class TradingEnv:
     # ── helpers ───────────────────────────────────────────────────────────
 
     def _current_prices(self) -> np.ndarray:
-        return self._prices_real_np[self._step][self._ticker_idx].astype(np.float64)
+        # Cache: se siamo ancora nello stesso step, riusa i prezzi già estratti
+        if self._cached_step != self._step:
+            self._cached_prices = self._prices_real_np[self._step][self._ticker_idx].astype(np.float64)
+            self._cached_step   = self._step
+        return self._cached_prices
 
     def _portfolio_value(self) -> float:
+        # Ricalcola solo se i prezzi sono aggiornati (stesso step = stesso risultato)
         return float(self._cash + np.dot(self._holdings, self._current_prices()))
 
     # ── reward ────────────────────────────────────────────────────────────
@@ -347,9 +359,9 @@ class TradingEnv:
                 )
 
                 valid_indices = np.where(valid_mask)[0]
-                for k, i in enumerate(valid_indices):
-                    if self._entry_step[i] < 0:
-                        self._entry_step[i] = self._step
+                # Vettorizzato: aggiorna entry_step solo per i ticker senza posizione aperta
+                new_entries = valid_mask & (self._entry_step < 0)
+                self._entry_step[new_entries] = self._step
 
                 self._cash                -= float(b.sum())
                 self._holdings[valid_mask] += shares_buy
@@ -449,10 +461,12 @@ class TradingEnv:
     # ── thermo helper ─────────────────────────────────────────────────────
 
     def _thermo_scalar(self, name: str, default: float = 0.0) -> float:
-        """Legge un valore dal vettore thermo corrente in modo sicuro."""
-        if not self._has_thermo or name not in self._thermo_col_names:
+        """Legge un valore dal vettore thermo corrente — O(1) con dict lookup."""
+        if not self._has_thermo:
             return default
-        idx = self._thermo_col_names.index(name)
+        idx = self._thermo_col_idx.get(name, -1)
+        if idx < 0:
+            return default
         return round(float(self._thermo_np[self._step - 1][idx]), 4)
 
     # ── output DataFrame ─────────────────────────────────────────────────
