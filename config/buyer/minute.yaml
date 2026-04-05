@@ -39,6 +39,12 @@ inaction_threshold:   0.05    # [Fix #6] Soglia per inaction check — più alta
 # [Fix #3] Bonus esplicito per ogni vendita profittevole (era 0.0002 hardcodato)
 sell_profit_bonus: 0.002
 
+# Penalità per perdite eccessive oltre una soglia
+# lambda_loss: coefficiente di penalità per perdite > loss_threshold
+# loss_threshold: soglia di perdita (es: -0.5 = -50%), sotto cui viene applicata la penalità
+lambda_loss:    0.5       # Penalità per perdite eccessive
+loss_threshold: -0.5      # Soglia di perdita (-50%)
+
 # ── Gestione posizioni ────────────────────────────────────────────────────────
 max_position_pct:           0.20    # Max 20% del portafoglio per singolo asset
 max_holding_steps:          120     # Forced sell dopo 120 barre (≈4h a 2min)

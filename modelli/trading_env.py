@@ -61,6 +61,8 @@ class TradingEnv:
         trust_max:         float = 0.80,         # [Fix #4] trust sopra cui peso=1
         lambda_concentration: float = 0.1,
         lambda_inaction:      float = 0.1,
+        lambda_loss:       float = 0.5,          # Penalità per perdite eccessive
+        loss_threshold:    float = -0.5,         # Soglia di perdita (-50%)
     ) -> None:
         self.prices_real      = prices_real
         self.prices_pred      = prices_pred
@@ -72,6 +74,8 @@ class TradingEnv:
 
         self.lambda_concentration     = lambda_concentration
         self.lambda_inaction          = lambda_inaction
+        self.lambda_loss              = lambda_loss              # Penalità per perdite
+        self.loss_threshold           = loss_threshold           # Soglia di perdita
         self.action_threshold         = action_threshold
         self.inaction_threshold       = inaction_threshold      # [Fix #6]
         self.max_position_pct         = max_position_pct
@@ -243,11 +247,19 @@ class TradingEnv:
         scarce_cash   = max(0.0, 0.05 - cash_ratio)   # zero riserve = no possibilità di comprare
         cash_penalty  = 0.03 * (excess_cash + scarce_cash)
 
+        # Loss penalty: penalizza maggiormente quando le perdite superano la soglia
+        current_return = (new_value - self.initial_capital) / (self.initial_capital + 1e-8)
+        if current_return < self.loss_threshold:
+            loss_penalty = self.lambda_loss * abs(current_return - self.loss_threshold)
+        else:
+            loss_penalty = 0.0
+
         return (
             base_reward
             - concentration_penalty
             - inaction_penalty
             - cash_penalty
+            - loss_penalty
             + sell_bonus
         )
 

@@ -16,6 +16,8 @@ es_metric:       sharpe        # "sharpe" | "portfolio" | "reward"
 lambda_concentration: 0.8      # ← Aumentato da 0.1 (penalizza concentration)
 lambda_inaction:      0.3      # ← Aumentato da 0.05 (penalizza HOLD eccessivo)
 action_threshold:     0.01     # ← Ridotto da 0.05 (più sensibile alle azioni)
+lambda_loss:          0.5      # Penalità per perdite eccessive
+loss_threshold:       -0.5     # Soglia di perdita (-50%)
 
 # ── DDPG INTRADAY ────────────────────────────────────────────────────────────
 ddpg:

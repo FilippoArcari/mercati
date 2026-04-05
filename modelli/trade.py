@@ -460,6 +460,8 @@ def run_trade(
     buyer_cfg = cfg.buyer
     lc  = getattr(buyer_cfg, "lambda_concentration",    0.1)
     li  = getattr(buyer_cfg, "lambda_inaction",         0.05)
+    ll  = getattr(buyer_cfg, "lambda_loss",             0.5)
+    lt_loss = getattr(buyer_cfg, "loss_threshold",     -0.5)
     at  = getattr(buyer_cfg, "action_threshold",        0.05)
     lt  = getattr(buyer_cfg, "lambda_thermo",           0.15)
     sst = getattr(buyer_cfg, "stress_sell_threshold",   1.0)
@@ -475,6 +477,8 @@ def run_trade(
         thermo_df=thermo_train,
         lambda_concentration=lc,
         lambda_inaction=li,
+        lambda_loss=ll,
+        loss_threshold=lt_loss,
         action_threshold=at,
         log_trades=False,
         thermo_bonus_sell=getattr(buyer_cfg, "thermo_bonus_sell", 0.0),
@@ -493,6 +497,8 @@ def run_trade(
         thermo_df=thermo_test,
         lambda_concentration=0.0,
         lambda_inaction=0.0,
+        lambda_loss=0.0,
+        loss_threshold=lt_loss,
         action_threshold=at,
         log_trades=True,
         # During test, shaping rewards are calculated but mostly we care about logs
