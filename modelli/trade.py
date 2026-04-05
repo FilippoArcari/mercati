@@ -35,7 +35,7 @@ def _predict_batched(predictor, X: torch.Tensor, batch_size: int = 256) -> np.nd
     predictor.eval()
     with torch.no_grad():
         for i in range(0, len(X), batch_size):
-            print(f"batch{i}")
+            
             batch = X[i : i + batch_size].to(device)  # ← sposta il batch sul device corretto
             out   = predictor(batch)
             if out.dim() == 3:

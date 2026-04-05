@@ -188,6 +188,14 @@ class DDPGAgent:
         self._hard_update(self.actor_target,  self.actor)
         self._hard_update(self.critic_target, self.critic)
 
+        # ── Multi-GPU: DataParallel su actor e critic se >1 GPU disponibile ──
+        # I target network restano su singola GPU (usati solo per inferenza in update())
+        _n_gpus = torch.cuda.device_count()
+        if _n_gpus > 1:
+            print(f"[DDPG] Multi-GPU attivo: {_n_gpus} GPU con DataParallel su actor e critic")
+            self.actor  = nn.DataParallel(self.actor)
+            self.critic = nn.DataParallel(self.critic)
+
         self.opt_actor  = torch.optim.Adam(self.actor.parameters(),  lr=lr_actor)
         self.opt_critic = torch.optim.Adam(self.critic.parameters(), lr=lr_critic,
                                            weight_decay=1e-4)
@@ -197,10 +205,12 @@ class DDPGAgent:
 
     def act(self, state, explore=True):
         s = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-        self.actor.eval()
+        # Con DataParallel, accedi al modulo sottostante per .eval()/.train()
+        _actor_inner = self.actor.module if isinstance(self.actor, nn.DataParallel) else self.actor
+        _actor_inner.eval()
         with torch.no_grad():
             action = self.actor(s).squeeze(0).cpu().numpy()
-        self.actor.train()
+        _actor_inner.train()
         if explore:
             action = action + self.noise.sample()
         return np.clip(action, -1.0, 1.0)
@@ -241,7 +251,9 @@ class DDPGAgent:
         return {"critic_loss": critic_loss.item(), "actor_loss": actor_loss.item()}
 
     def     _soft_update(self, target, source):
-        for t_p, s_p in zip(target.parameters(), source.parameters()):
+        # Unwrap DataParallel se necessario per accedere ai parametri
+        _src = source.module if isinstance(source, nn.DataParallel) else source
+        for t_p, s_p in zip(target.parameters(), _src.parameters()):
             t_p.data.copy_(self.tau * s_p.data + (1.0 - self.tau) * t_p.data)
 
     @staticmethod
@@ -255,14 +267,17 @@ class DDPGAgent:
         self.noise.reset()
 
     def _state(self) -> dict:
+        # Unwrap DataParallel prima di salvare i state_dict
+        _actor  = self.actor.module  if isinstance(self.actor,  nn.DataParallel) else self.actor
+        _critic = self.critic.module if isinstance(self.critic, nn.DataParallel) else self.critic
         return {
             "state_dim":     self.state_dim,
             "action_dim":    self.action_dim,
             "actor_hidden":  self.actor_hidden,
             "critic_hidden": self.critic_hidden,
-            "actor":         self.actor.state_dict(),
+            "actor":         _actor.state_dict(),
             "actor_target":  self.actor_target.state_dict(),
-            "critic":        self.critic.state_dict(),
+            "critic":        _critic.state_dict(),
             "critic_target": self.critic_target.state_dict(),
         }
 
@@ -292,9 +307,12 @@ class DDPGAgent:
             )
             return False
 
-        self.actor.load_state_dict(ckpt["actor"])
+        # Unwrap DataParallel prima di caricare i pesi
+        _actor  = self.actor.module  if isinstance(self.actor,  nn.DataParallel) else self.actor
+        _critic = self.critic.module if isinstance(self.critic, nn.DataParallel) else self.critic
+        _actor.load_state_dict(ckpt["actor"])
         self.actor_target.load_state_dict(ckpt["actor_target"])
-        self.critic.load_state_dict(ckpt["critic"])
+        _critic.load_state_dict(ckpt["critic"])
         self.critic_target.load_state_dict(ckpt["critic_target"])
         print(f"[DDPG] Checkpoint caricato correttamente: {path}")
         return True

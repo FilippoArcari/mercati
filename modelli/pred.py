@@ -309,6 +309,18 @@ class Pred(nn.Module):
         self.train()
         device = next(self.parameters()).device
 
+        # ── Multi-GPU: avvolge il modello con DataParallel se disponibili >1 GPU ──
+        # DataParallel divide il batch tra le GPU disponibili automaticamente.
+        # Nota: usa `self` (non il wrapper) per optimizer e state_dict.
+        n_gpus = torch.cuda.device_count()
+        if n_gpus > 1:
+            model = torch.nn.DataParallel(self)
+            if not getattr(self, "_multigpu_logged", False):
+                print(f"[{label}] Multi-GPU attivo: {n_gpus} GPU con DataParallel")
+                self._multigpu_logged = True
+        else:
+            model = self
+
         if prior_mean    is not None: prior_mean    = prior_mean.to(device)
         if prior_std     is not None: prior_std     = prior_std.to(device)
         if moment_target is not None: moment_target = moment_target.to(device)
@@ -319,9 +331,11 @@ class Pred(nn.Module):
             nan_batches  = 0
 
             for bx, by in train_loader:
-                bx, by = bx.to(device), by.to(device)
+                # pin_memory=True nel DataLoader rende questo trasferimento asincrono
+                bx = bx.to(device, non_blocking=True)
+                by = by.to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
-                pred = self(bx)
+                pred = model(bx)
                 loss, info = criterion(
                     pred, by, prior_mean, prior_std, moment_target, data_weight
                 )

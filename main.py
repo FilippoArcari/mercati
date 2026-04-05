@@ -173,11 +173,25 @@ def my_app(cfg: DictConfig) -> None:
     # ── TRAIN ──────────────────────────────────────────────────────────────────
     if cfg.step == "train":
         device = get_device()
+
+        # ── DataLoader ottimizzato per ridurre il collo di bottiglia CPU ──────
+        # num_workers: worker paralleli per il pre-fetching dei batch
+        # pin_memory:  trasferimento CPU→GPU asincrono (non_blocking=True nei .to())
+        # persistent_workers: evita di ricreare i worker a ogni epoca
+        # prefetch_factor: quanti batch ogni worker prepara in anticipo
+        _nw = min(4, os.cpu_count() or 1)
         train_loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(X_train, Y_train),
             batch_size=cfg.training.batch_size,
             shuffle=True,
+            num_workers=_nw,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=(_nw > 0),
+            prefetch_factor=2 if _nw > 0 else None,
         )
+        _gpu_count = torch.cuda.device_count()
+        print(f"[DataLoader] num_workers={_nw}, pin_memory={torch.cuda.is_available()}")
+        print(f"[GPU] Dispositivi disponibili: {_gpu_count}")
         predictor     = build_predictor(cfg, num_features).to(device)
         moment_target = compute_moment_target(train_df, tickers, cfg)
         if moment_target is not None:
@@ -195,9 +209,11 @@ def my_app(cfg: DictConfig) -> None:
 
         pred_path = checkpoint_name(cfg, "pred.pth")
         os.makedirs(cfg.paths.checkpoint_dir, exist_ok=True)
+        # Se il modello è avvolto in DataParallel, salva il modello sottostante
+        _model_to_save = predictor.module if isinstance(predictor, torch.nn.DataParallel) else predictor
         torch.save(
             {
-                "model_state_dict": predictor.state_dict(),
+                "model_state_dict": _model_to_save.state_dict(),
                 "scaler":           scaler,
                 "num_features":     num_features,
                 "frequency":        freq,

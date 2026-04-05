@@ -1,45 +1,87 @@
-# ── BUYER INTRADAY OVERRIDE ───────────────────────────────────────────────────
-# Loaded ONLY when frequency=minute (via _apply_frequency_defaults in main.py)
-# Overrides config/buyer/default.yaml with intraday-specific aggressive parameters
-
 # config/buyer/intraday_override.yaml
+# ── BUYER INTRADAY OVERRIDE ───────────────────────────────────────────────────
+# Caricato SOLO quando frequency=minute (via _apply_frequency_defaults in main.py)
+# Sovrascrive config/buyer/default.yaml con parametri specifici per intraday.
+#
+# Fix applicati rispetto alla versione precedente:
+#   [Fix #1] cash_penalty simmetrica — nessun incentivo a stare 100% investiti
+#   [Fix #2] forced_sell_cooldown_steps: 20 — impedisce rebuy immediato post-espulsione
+#   [Fix #3] sell_profit_bonus esplicito (era 0.0002 hardcodato nel codice)
+#   [Fix #4] trust_min/trust_max per peso continuo thermo (no più kill-switch a 0.6)
+#   [Fix #5] bars_per_year passato all'env per Sharpe corretto su dati 2-min
+#   [Fix #6] inaction_threshold separato — più alto per evitare bypass con micro-segnali
+
 agent: ddpg
 initial_capital:  100.0
 transaction_cost: 0.001
 
-buffer_capacity: 250000        # Aumentato per maggiore memoria storica
+buffer_capacity: 250000
 log_every:       1
 
-# Training
-n_episodes:     500           # Lascia fare all'early stopping se converge prima
-batch_size:     256           # Sfrutta la GPU e stabilizza il gradiente
-warmup:         5000          # Fagli accumulare un buon buffer casuale prima di addestrare
-es_patience:    50            
-es_metric:       sharpe
+# ── Training ──────────────────────────────────────────────────────────────────
+n_episodes:  500
+batch_size:  256
+warmup:      5000
+es_patience: 50
+es_metric:   sharpe
 
-# Reward shaping - Coerente con la volontà di essere aggressivi
-lambda_concentration: 0.6     # Penalità alta per forzare diversificazione
-lambda_inaction:      0.2     # Penalità moderata/alta per evitare l'immobilità
-action_threshold:     0.005   # Molto sensibile
+# ── Reward shaping ────────────────────────────────────────────────────────────
+lambda_concentration: 0.6     # Alta: forza diversificazione
+lambda_inaction:      0.2     # Moderata: penalizza posizioni congelate
+action_threshold:     0.005   # Soglia minima per considerare un'azione valida
+inaction_threshold:   0.05    # [Fix #6] Soglia per inaction check — più alta di action_threshold
+                               #          evita che micro-segnali (0.006) bypassino la penalità
 
-# DDPG Tuning per Colab GPU
+# [Fix #1] Cash target: 5%–40% libero (penalità simmetrica — vedi trading_env.py)
+# Il parametro non è nel YAML perché i bound sono hardcodati nella funzione di reward.
+# Per cambiarli modifica _compute_reward() in trading_env.py.
+
+# [Fix #3] Bonus esplicito per ogni vendita profittevole (era 0.0002 hardcodato)
+sell_profit_bonus: 0.002
+
+# ── Gestione posizioni ────────────────────────────────────────────────────────
+max_position_pct:           0.20    # Max 20% del portafoglio per singolo asset
+max_holding_steps:          120     # Forced sell dopo 120 barre (≈4h a 2min)
+                                    # Alzato da 60: evita vendite forzate troppo frequenti
+forced_sell_cooldown_steps: 20      # [Fix #2] Step in cui non si può ribuyare dopo forced sell
+                                    # Impedisce il loop forced_sell → rebuy immediato
+
+# ── Sharpe corretto per intraday ─────────────────────────────────────────────
+# [Fix #5] bars_per_year deve corrispondere alla frequenza attiva.
+# Per 2-min: 390 barre/giorno × 252 giorni = 98280
+# Questo valore viene letto da frequency.bars_per_year nel config principale
+# e passato a TradingEnv(bars_per_year=...) nell'istanziazione dell'ambiente.
+# NON modificare qui senza aggiornare anche frequency.bars_per_year nel config root.
+bars_per_year: 98280
+
+# ── DDPG ─────────────────────────────────────────────────────────────────────
 ddpg:
   actor_hidden:  [512, 256, 128]
   critic_hidden: [512, 256, 128]
-  lr_actor:      0.0001        # Ridotto per stabilità policy
-  lr_critic:     0.0003        # Ridotto per stabilità Q-value
-  gamma:         0.98          # Ottimo per orizzonti intraday (max_holding 60)
-  tau:           0.005         # Stabilità della rete target
-  update_every:  5             # Con batch da 256, aggiornare ogni 5 step è bilanciato
-  noise_sigma:   0.15          # Più esplorazione iniziale
-  noise_decay:   0.995         # Decadimento più morbido
-  noise_floor:   0.02          # Non azzerarlo mai del tutto
+  lr_actor:      0.0001
+  lr_critic:     0.0003
+  gamma:         0.98          # Buono per orizzonti intraday con max_holding=120
+  tau:           0.005
+  update_every:  5
+  noise_sigma:   0.15
+  noise_decay:   0.995
+  noise_floor:   0.02
 
-# Thermo Parameters (mantenuti intatti)
-lambda_thermo: 0.15              
-stress_sell_threshold: 1.0       
-stress_buy_threshold: -0.5       
-efficiency_penalty_thresh: 1.5   
-thermo_bonus_sell: 0.002
-thermo_bonus_buy: 0.001
-thermo_penalty_buy: 0.003
+# ── Thermo shaping ────────────────────────────────────────────────────────────
+lambda_thermo:              0.15
+stress_sell_threshold:      1.0
+stress_buy_threshold:      -0.5
+efficiency_penalty_thresh:  1.5
+thermo_bonus_sell:          0.002
+thermo_bonus_buy:           0.001
+thermo_penalty_buy:         0.003
+
+# [Fix #4] Trust continuo: peso = clip((trust - trust_min) / (trust_max - trust_min), 0, 1)
+# Con trust_min=0.40 e trust_max=0.80:
+#   trust=0.40 → peso 0.0  (thermo inattivo)
+#   trust=0.47 → peso 0.18 (leggero effetto anche con trust medio dei log)
+#   trust=0.60 → peso 0.50 (effetto dimezzato)
+#   trust=0.80 → peso 1.0  (effetto pieno)
+# Prima: soglia binaria a 0.6 → con trust=0.477 il thermo era completamente spento
+trust_min: 0.40
+trust_max: 0.80
