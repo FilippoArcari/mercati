@@ -34,7 +34,9 @@ class OUNoise:
         self.state = self.state + dx
         return self.state.astype(np.float32)
 
-    def decay(self, factor=0.995, floor=0.05):
+    def decay(self, factor: float = 0.995, floor: float = 0.02):
+        # floor default allineato al config (noise_floor: 0.02)
+        # era 0.05 → causava rumore residuo maggiore del necessario a fine training
         self.sigma = max(self.sigma * factor, floor)
 
 
@@ -77,10 +79,10 @@ class Actor(nn.Module):
             layers += [
                 nn.Linear(in_dim, h),
                 nn.LayerNorm(h),
-                nn.LeakyReLU(0.2) # LeakyReLU aiuta a prevenire neuroni morti in reti profonde
+                nn.LeakyReLU(0.2),
             ]
             in_dim = h
-        
+
         # Output layer: Tanh per mappare azioni in [-1, 1]
         layers += [nn.Linear(in_dim, action_dim), nn.Tanh()]
 
@@ -90,10 +92,9 @@ class Actor(nn.Module):
     def _init_weights(self):
         for m in self.net:
             if isinstance(m, nn.Linear):
-                # Orthogonal init per stabilità in reti profonde
                 nn.init.orthogonal_(m.weight, gain=1.0)
                 nn.init.zeros_(m.bias)
-        # Gain basso per l'ultimo layer per favorire esplorazione iniziale
+        # Gain basso sull'ultimo layer per favorire l'esplorazione iniziale
         nn.init.orthogonal_(self.net[-2].weight, gain=0.01)
 
     def forward(self, state):
@@ -108,7 +109,7 @@ class Critic(nn.Module):
         if hidden is None:
             hidden = [256, 256]
 
-        # Primo layer processa solo lo stato (standard DDPG architecture)
+        # Primo layer processa solo lo stato (architettura DDPG standard)
         self.state_in = nn.Sequential(
             nn.Linear(state_dim, hidden[0]),
             nn.LayerNorm(hidden[0]),
@@ -118,8 +119,6 @@ class Critic(nn.Module):
         # Layer intermedi processano (output_state_in + action)
         layers = []
         in_dim = hidden[0] + action_dim
-        
-        # Se ci sono altri layer oltre al primo
         for h in hidden[1:]:
             layers += [
                 nn.Linear(in_dim, h),
@@ -127,10 +126,9 @@ class Critic(nn.Module):
                 nn.LeakyReLU(0.2)
             ]
             in_dim = h
-            
+
         self.mid_layers = nn.Sequential(*layers)
         self.out = nn.Linear(in_dim, 1)
-        
         self._init_weights()
 
     def _init_weights(self):
@@ -165,11 +163,9 @@ class DDPGAgent:
         noise_sigma=0.2,
         device: torch.device = None,
     ):
-        # Setup device
         self.device = device or get_device()
 
-        # Setup hidden layers dinamico
-        self.actor_hidden = actor_hidden or [256, 256]
+        self.actor_hidden  = actor_hidden  or [256, 256]
         self.critic_hidden = critic_hidden or [256, 256]
 
         self.state_dim    = state_dim
@@ -189,9 +185,8 @@ class DDPGAgent:
         self._hard_update(self.critic_target, self.critic)
 
         # Nota: DataParallel NON viene usato per DDPG.
-        # Con batch_size tipici (64-256) il costo di sincronizzazione tra GPU
-        # supera il beneficio. Il DDPG è CPU-bound (env.step sequenziale),
-        # non GPU-bound: DataParallel aggraverebbe il problema.
+        # Il DDPG è CPU-bound (env.step sequenziale), non GPU-bound:
+        # il costo di sincronizzazione tra GPU supera il beneficio.
 
         self.opt_actor  = torch.optim.Adam(self.actor.parameters(),  lr=lr_actor)
         self.opt_critic = torch.optim.Adam(self.critic.parameters(), lr=lr_critic,
@@ -245,7 +240,7 @@ class DDPGAgent:
 
         return {"critic_loss": critic_loss.item(), "actor_loss": actor_loss.item()}
 
-    def     _soft_update(self, target, source):
+    def _soft_update(self, target, source):
         for t_p, s_p in zip(target.parameters(), source.parameters()):
             t_p.data.copy_(self.tau * s_p.data + (1.0 - self.tau) * t_p.data)
 
@@ -253,7 +248,8 @@ class DDPGAgent:
     def _hard_update(target, source):
         target.load_state_dict(source.state_dict())
 
-    def decay_noise(self, factor=0.995, floor=0.05):
+    def decay_noise(self, factor=0.995, floor=0.02):
+        # floor default allineato al config (noise_floor: 0.02)
         self.noise.decay(factor, floor)
 
     def reset_noise(self):
@@ -279,14 +275,13 @@ class DDPGAgent:
               f"(arch: {self.actor_hidden})")
 
     def load(self, path: str) -> bool:
-        ckpt = torch.load(path, weights_only=False) # Necessario per caricare le liste hidden
+        ckpt = torch.load(path, weights_only=False)
 
         saved_state_dim  = ckpt.get("state_dim")
         saved_action_dim = ckpt.get("action_dim")
         saved_actor_h    = ckpt.get("actor_hidden")
 
-        # Verifica compatibilità architettura
-        if (saved_state_dim != self.state_dim or 
+        if (saved_state_dim != self.state_dim or
             saved_action_dim != self.action_dim or
             saved_actor_h != self.actor_hidden):
             print(
@@ -314,7 +309,7 @@ def train_ddpg(
     warmup:       int   = 1000,
     log_every:    int   = 10,
     noise_decay:  float = 0.995,
-    noise_floor:  float = 0.05,
+    noise_floor:  float = 0.02,   # allineato al config (era 0.05 come default)
     es_patience:  int   = 20,
     es_metric:    str   = "sharpe",
     best_path:    Optional[str] = None,

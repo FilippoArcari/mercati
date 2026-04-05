@@ -1,34 +1,55 @@
-# 📊 Struttura Completa del Progetto Mercati
+# 📊 Struttura Progetto Mercati
 
-**Data**: 26 Marzo 2026  
-**Tipo**: Framework di Algorithmic Trading con Deep Learning + Termodinamica Quantistica  
+**Data**: 5 Aprile 2026  
+**Tipo**: Framework di Algorithmic Trading con Deep Learning + Termodinamica  
 **Linguaggio**: Python 3.x + PyTorch  
+**Ambiente**: Python 3.11+ | PyTorch 2.x | Hydra | yfinance
 
 ---
 
 ## 📑 Indice
 
-1. [Panoramica Generale](#panoramica-generale)
+1. [Quick Reference](#quick-reference)
 2. [Struttura Directory](#struttura-directory)
-3. [Pipeline di Esecuzione](#pipeline-di-esecuzione)
-4. [Moduli Core](#moduli-core)
-5. [Configurazione](#configurazione)
-6. [Output e Risultati](#output-e-risultati)
+3. [Entry Points](#entry-points)
+4. [Moduli Principali](#moduli-principali)
+5. [Sistema di Configurazione](#sistema-di-configurazione)
+6. [Flusso di Esecuzione](#flusso-di-esecuzione)
 
 ---
 
-## 🎯 Panoramica Generale
+## 🚀 Quick Reference
 
-Questo progetto implementa un **framework di trading algoritmico ibrido** che combina:
+| Comando | Effetto |
+|---------|---------|
+| `python main.py step=train frequency=daily` | Addestra predictor CNN giornaliero |
+| `python main.py step=train frequency=minute` | Addestra predictor CNN intraday |
+| `python main.py step=trade frequency=daily` | Trading DDPG giornaliero |
+| `python main.py step=trade frequency=minute` | Trading DDPG intraday |
+| `python main.py step=test frequency=daily` | Testa predictor e salva grafici |
 
-- **Predizione con CNN Dilata**: Rete neurale convoluzionale 1D con dilatazioni per prevedere i prezzi
-- **Feature Termodinamiche**: Integrazione di pressione di mercato, entropia, e resilienza ai tassi
-- **Trading Agent DDPG**: Deep Deterministic Policy Gradient per decidere le allocazioni
-- **Van der Waals Calibration**: Modello fisico per quantificare la pressione di mercato
+**File Importanti:**
+- **main.py** → Entry point (Hydra orchestrazione)
+- **config/config.yaml** → Configazione master
+- **modelli/pred.py** → Rete CNN predictor
+- **modelli/ddpg.py** → Trading agent DDPG
+- **modelli/trading_env.py** → Ambiente Gym per trading
+- **modelli/utils.py** → Data loading + preprocessing
 
-Il sistema supporta **due regimi di trading**:
-- **Daily**: Swing trading su timeframe giornaliero
-- **Minute**: Intraday trading su timeframe 1-minuto
+---
+
+## 🎯 Overview
+
+Sistema di **trading algoritmico ibrido** che combina:
+
+- **CNN Predictor**: Rete 1D con dilatazioni per previsioni prezzi
+- **Feature Termodinamiche**: Pressione mercato, entropia, resilienza
+- **Trading Agent (DDPG)**: Determinismo policy gradient per allocazione portfolio
+- **Van der Waals Model**: Calibrazione fisica pressione mercato
+
+**Supporta due regimi:**
+- **Daily (1d)**: Swing trading giornaliero
+- **Minute (1m)**: Intraday trading 1-minuto
 
 ---
 
@@ -36,217 +57,351 @@ Il sistema supporta **due regimi di trading**:
 
 ```
 mercati/
-├── main.py                              # Entry point principale (orchestrazione pipeline)
-├── pyproject.toml                       # Configurazione dependency (uv, poetry)
-├── config/                              # Parametri YAML (Hydra)
-│   ├── config.yaml                      # Config master
-│   ├── buyer/                           # Parametri agente di trading
-│   │   ├── default.yaml                 # Daily trading params
-│   │   └── minute.yaml                  # Intraday trading params
-│   ├── data/                            # Data loading params
-│   │   └── default.yaml
-│   ├── frequency/                       # Frequenza temporale
-│   │   ├── daily.yaml
-│   │   └── minute.yaml
-│   ├── model/                           # Architettura rete neurale
-│   │   └── cnn.yaml
-│   ├── paths/                           # Directory output
-│   │   └── default.yaml
-│   ├── prediction/                      # Parametri predittore
-│   │   ├── default.yaml
-│   │   └── minute.yaml
-│   └── training/                        # Parametri training
-│       ├── default.yaml
-│       └── minute.yaml
 │
-├── modelli/                             # Core logic (importato in main.py)
-│   ├── __init__.py
-│   ├── pred.py                          # ⭐ Modello predictor + MrE Loss
-│   ├── trade.py                         # ⭐ Orchestr. trading agent DDPG
-│   ├── ddpg.py                          # ⭐ Implementazione DDPG agent
-│   ├── dqn.py                           # Agente DQN alternativo (experimental)
-│   ├── trading_env.py                   # ⭐ Ambiente Gym per DDPG
-│   ├── obs_normalizer.py                # ⭐ Normalizzatore osservazioni online
-│   ├── thermodynamics.py                # ⭐ Feature termodinamiche + Ψ
-│   ├── calibrate_vdw.py                 # Van der Waals calibration (Gabaix 2003)
-│   ├── evaluate_pred.py                 # Metriche valutazione predittore
-│   ├── utils.py                         # ⭐ Data loading, preprocessing
-│   └── __pycache__/
+├── 📌 ROOT FILES
+│   ├── main.py                          # Entry point principale (Hydra)
+│   ├── pyproject.toml                   # Poetry/UV dependencies
+│   ├── requirements.txt                 # Per pip install
+│   ├── README.md                        # Guida generale
+│   ├── credentials.json                 # Google Drive auth
+│   ├── token.json                       # Token riutilizzabili
+│   │
+│   ├── DATA
+│   ├── data_minute.csv                  # Cache dati intraday
+│   └── DOCS
+│       ├── PROJECT_STRUCTURE.md         # Questo file
+│       ├── CONFIG_ORCHESTRATION.md      # Hydra config
+│       ├── CONFIG_RESPONSIBILITY_MAP.md # Mapping config→moduli
+│       ├── TRAINING_CONFIG_COMPARISON.md # Differenze daily vs minute
+│       ├── VDW_INTEGRATION_GUIDE.md     # Van der Waals
+│       └── INTEGRATION_SUMMARY.md       # Integrazione componenti
 │
-├── checkpoints/                         # Modelli salvati
-│   ├── pred_1d_w30.pth                  # Predictor daily (window=30)
-│   ├── pred_1m_w10.pth                  # Predictor minute (window=10)
-│   ├── ddpg_1d.pth                      # DDPG agent daily
-│   ├── ddpg_1m.pth                      # DDPG agent minute
-│   ├── ddpg_best_1d.pth                 # Best DDPG daily (ES checkpoint)
-│   ├── ddpg_best_1m.pth                 # Best DDPG minute
-│   ├── normalizer_1d.npz                # Stats normalizer daily
-│   └── normalizer_1m.npz                # Stats normalizer minute
+├── 🛠️ CONFIGURATION (Hydra)
+│   └── config/
+│       ├── config.yaml                  # Master config
+│       ├── buyer/                       # Parametri trading agent
+│       │   ├── default.yaml             # Daily defaults
+│       │   └── minute.yaml              # Minute settings
+│       ├── data/
+│       │   └── default.yaml             # Data loading params
+│       ├── frequency/
+│       │   ├── daily.yaml               # Frequenza giornaliera
+│       │   └── minute.yaml              # Frequenza intraday
+│       ├── model/
+│       │   └── cnn.yaml                 # Architettura CNN
+│       ├── paths/
+│       │   └── default.yaml             # Output directories
+│       ├── prediction/
+│       │   ├── default.yaml             # Predictor params
+│       │   └── minute.yaml              # Minute predictor
+│       └── training/
+│           ├── default.yaml             # Training defaults
+│           └── minute.yaml              # Minute training settings
 │
-├── results/                             # Output trading
-│   ├── trade_log.csv                    # Tutte le transazioni
-│   ├── portfolio_daily.csv              # Valore portafoglio per step
-│   ├── summary_per_ticker.csv           # Statistiche per ticker
-│   └── value_per_ticker.csv             # Valore holding per ticker
+├── 🧠 MODELLI (Core Logic)
+│   └── modelli/
+│       ├── __init__.py
+│       ├── pred.py                      # ⭐ CNN Predictor + MrE Loss
+│       ├── trade.py                     # ⭐ Orchestrazione trading
+│       ├── ddpg.py                      # ⭐ DDPG agent implementation
+│       ├── trading_env.py               # ⭐ Gym environment per DDPG
+│       ├── obs_normalizer.py            # ⭐ Online observation normalizer
+│       ├── thermodynamics.py            # ⭐ Termodinamica + feature state
+│       ├── calibrate_vdw.py             # Van der Waals calibration
+│       ├── evaluate_pred.py             # Validazione predictor
+│       ├── utils.py                     # ⭐ Data loading + preprocessing
+│       ├── signal_trust.py              # Trust scores per segnali
+│       ├── intraday_thermo.py           # Thermo specifiche intraday
+│       ├── thermo_state_builder.py      # Builder stato termodinamico
+│       ├── dqn.py                       # DQN alternativo (experimental)
+│       └── __pycache__/
 │
-├── outputs/                             # Run history (timestamped)
-│   ├── 2026-03-17/
-│   │   ├── 11-22-51/
-│   │   └── ...
-│   └── 2026-03-25/
+├── 💾 CHECKPOINTS
+│   └── checkpoints/
+│       ├── pred_1d_w30.pth              # Predictor daily (window=30)
+│       ├── pred_2m_w15.pth              # Predictor 2m (window=15)
+│       ├── pred_1d_w30.pth              # Predictor 1m (window=10)
+│       ├── ddpg.pth                     # DDPG base
+│       ├── ddpg_1d.pth                  # DDPG agent daily
+│       ├── ddpg_best.pth                # DDPG best daily
+│       ├── ddpg_best_1d.pth             # Best daily (alternate)
+│       └── normalizer_1d.npz            # Observer stats daily
 │
-├── data_daily.csv                       # Cache dati daily
-├── data_minute.csv                      # Cache dati minute (1m)
+├── 📈 RISULTATI
+│   ├── results/                         # Output trading finali
+│   │   ├── trade_log.csv               # Tutte le transazioni
+│   │   ├── portfolio_daily.csv         # Portfolio value per step
+│   │   ├── summary_per_ticker.csv      # Stats per ticker
+│   │   └── value_per_ticker.csv        # Valore holdings
+│   │
+│   └── outputs/                         # History timestamped runs
+│       ├── 2026-03-17/
+│       ├── 2026-03-20/
+│       ├── 2026-03-21/
+│       ├── 2026-04-01/
+│       └── 2026-04-05/
+│           └── [HH-MM-SS]/
+│               ├── config.yaml          # Config run specifico
+│               ├── trades.csv          # Trades questo run
+│               └── metrics.json        # Metriche performance
 │
-└── Docs/
-    ├── README.md                        # Descrizione generale
-    ├── TRAINING_CONFIG_COMPARISON.md    # Daily vs Minute
-    ├── VDW_INTEGRATION_GUIDE.md         # Van der Waals
-    ├── CONFIG_ORCHESTRATION.md          # Sistema config
-    └── CONFIG_RESPONSIBILITY_MAP.md     # Chi usa quale param
-
+└── 📦 DEPENDENCIES
+    └── __pycache__/
 ```
 
 ---
 
-## ▶️ Pipeline di Esecuzione
+## 🚀 Entry Points
+
+### **main.py** — Orchestrator Principale
+
+```python
+python main.py [ARGS]
+```
+
+**Argomenti CLI Comuni:**
+
+```bash
+# Training
+python main.py step=train frequency=daily
+python main.py step=train frequency=minute
+
+# Trading
+python main.py step=trade frequency=daily config.buyer.portfolio_value=100000
+
+# Testing
+python main.py step=test frequency=daily
+```
+
+**Hydra resolves:**
+- Legge config YAML gerarchico
+- Auto-applica frequency overrides (daily → usa training=default, minute → training=minute)
+- Salva output in `outputs/{TODAY}/{HH-MM-SS}/`
+
+---
+
+## ▶️ Flusso di Esecuzione
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  main.py (Entry Point)                                      │
-│  - Legge config YAML via Hydra                              │
-│  - Esegue step: train | test | trade                        │
-└─────────────────────────────────────────────────────────────┘
-                            │
-                ┌───────────┼───────────┐
-                ▼           ▼           ▼
-            ┌────────┐ ┌────────┐ ┌───────────┐
-            │ TRAIN  │ │ TEST   │ │  TRADE    │
-            └────────┘ └────────┘ └───────────┘
-                │           │           │
-                ▼           ▼           ▼
-         [Predictor    [Eval CNN]  [Trading Agent]
-          Training]                  DDPG
+┌──────────────────────────────────────────┐
+│         main.py Entry Point              │
+│  (Hydra Configuration + Orchestration)   │
+└──────────────────────────────────────────┘
+              │
+              ├─ Leggi config YAML
+              ├─ Load data (utils.load_data)
+              ├─ Split train/test
+              └─ Applica thermodynamic features
+                   │
+        ┌──────────┼──────────┐
+        ▼          ▼          ▼
+    ┌────────┐ ┌────────┐ ┌──────────┐
+    │ TRAIN  │ │ TEST   │ │  TRADE   │
+    └────────┘ └────────┘ └──────────┘
+        │          │          │
+        ▼          ▼          ▼
+    [Pred.fit] [Eval]   [DDPG Loop]
+    MrE Loss          AdaptiveEnv
+                      ObsNormalizer
+```
 
+**Fase 1: DATA LOADING** (utils.py)
+- `load_data()` → Carica yfinance + FRED
+- Normalizzazione MinMax → scaler salvato
+- Calcolo feature termodinamiche (pressione, entropia)
+- Windowing → (X, Y) per CNN
 
-Step 1: DATA LOADING (utils.py)
-   └─ load_data() → normalizzato MinMax, con feature termodinamiche
-   
-Step 2: WINDOWING (utils.py)
-   └─ make_windows() → (X, Y) per CNN
-   
-Step 3a: TRAINING [step=train]
-   ├─ build_predictor() → Pred network
-   ├─ Pred.fit() → MrE Loss (entropica + momento)
-   └─ Checkpoints salvati
-   
-Step 3b: TESTING [step=test]
-   ├─ Carica checkpoints
-   ├─ Predizioni su train + test
-   └─ Grafici via evaluate_predictions()
-   
-Step 3c: TRADING [step=trade]
-   ├─ TradingEnv() → ambiente Gym
-   ├─ DDPGAgent() → policy learning
-   ├─ ObsNormalizer() → normalizzazione stati
-   ├─ train_ddpg_normalized() → training loop
-   └─ Trades + Portfolio value salvati
+**Fase 2a: TRAINING** (step=train)
+- Costruisce Predictor CNN
+- Fitness con MrE Loss (entropy + momentum)
+- Early stopping su validation loss
+- Salva checkpoint predictor
+
+**Fase 2b: TESTING** (step=test)
+- Carica checkpoint predictor
+- Predictions su train/test sets
+- Genera grafici (evaluate_pred.py)
+
+**Fase 2c: TRADING** (step=trade)
+- Crea TradingEnv (Gym environment)
+- Istanzia DDPG agent
+- Online observation normalization
+- Training loop → salva best weights
+- Output: trade logs + portfolio metrics
+
+### 1. **main.py**
+
+**Orchestrator con Hydra** - Entry point del sistema.
+
+| Funzione | Scopo |
+|----------|-------|
+| `my_app(cfg)` | Main function (Hydra decorated) - orchestrazione completa pipeline |
+| `_apply_frequency_defaults()` | Auto-applica config overrides basati su frequenza |
+| `checkpoint_name(cfg, name)` | Costruisce path checkpoint con frequency + window_size |
+| `compute_moment_target(train_df, cfg)` | Calcola target momenti per MrE Loss |
+| `build_predictor(cfg, num_features)` | Factory per istanziare CNN predictor |
+| `split_dataframe(df, cfg)` | Split train/test (percentuale o data) |
+
+---
+
+### 2. **modelli/utils.py**
+
+**Data Loading** - Caricamento e preprocessing dati.
+
+| Funzione | Scopo |
+|----------|-------|
+| `load_data(tickers, start_date, end_date, ...)` | Carica yfinance + FRED, applica thermo features |
+| `make_windows(X, Y, window_size, stride)` | Crea windows (X_t, Y_t) per CNN |
+| `prepare_trading_env_data(train_df, cfg)` | Organizza dati per TradingEnv |
+| `split_train_test(df, test_ratio, method)` | Split dataset |
+
+---
+
+### 3. **modelli/pred.py**
+
+**CNN Predictor** - Rete neurale per previsioni prezzi.
+
+| Classe/Metodo | Scopo |
+|---|---|
+| `Pred` | Classe CNN predictor |
+| `Pred.fit()` | Training con MrE Loss o MSE |
+| `Pred.predict()` | Inferenza |
+| `MrE_Loss` | Custom loss: entropia + momentum |
+| `Pred.save/load()` | Persist checkpoint |
+
+---
+
+### 4. **modelli/trading_env.py**
+
+**Gym Environment** - Interfaccia RL per trading.
+
+| Classe | Scopo |
+|---|---|
+| `TradingEnv` | Gymnasium environment (compliance API) |
+| `reset()` | Inizializza environment |
+| `step(action)` | Esegue azione trading, ritorna (obs, reward, done, info) |
+| `_compute_reward()` | Calcula reward da portfolio P&L |
+| `_apply_action()` | Applica allocazione alle posizioni |
+
+---
+
+### 5. **modelli/ddpg.py**
+
+**Deep Deterministic Policy Gradient** - Trading agent.
+
+| Classe | Scopo |
+|---|---|
+| `DDPGAgent` | DDPG implementation |
+| `Actor` | Policy network (μ) |
+| `Critic` | Q-network |
+| `update()` | Bellman update |
+| `select_action()` | Sample azione con rumore |
+
+---
+
+### 6. **modelli/obs_normalizer.py**
+
+**Observation Normalizer** - Normalizzazione online stati DDPG.
+
+| Classe | Scopo |
+|---|---|
+| `OnlineNormalizer` | Running normalization (mean, std) |
+| `update(obs)` | Aggiorna stats incrementalmente |
+| `normalize(obs)` | Applica normalizzazione |
+| `save/load()` | Persist normalizer stats |
+
+---
+
+### 7. **modelli/thermodynamics.py**
+
+**Termodinamica Quantistica** - Feature termodinamiche mercato.
+
+| Funzione | Scopo |
+|---|---|
+| `compute_market_pressure()` | Pressione mercato da volatilità |
+| `compute_entropy()` | Entropia distribuzione returns |
+| `compute_resilience()` | Resilienza ai tassi (cross-correlation FRED) |
+| `build_thermo_state()` | Combina features: pressure + entropy + resilience |
+
+---
+
+### 8. **modelli/trade.py**
+
+**Trade Orchestrator** - Coordinamento training DDPG + execution.
+
+| Funzione | Scopo |
+|---|---|
+| `run_trade(cfg)` | Main trading loop - training + testing |
+| `train_ddpg_normalized()` | DDPG training con online normalization |
+| `test_ddpg()` | Backtesting DDPG agent |
+| `execute_trades()` | Applica azioni al portafoglio |
+
+---
+
+### 9. **modelli/evaluate_pred.py**
+
+**Valutazione Predictor** - Metriche e grafici.
+
+| Funzione | Scopo |
+|---|---|
+| `evaluate_predictions()` | Calcola MAE, RMSE, MAPE |
+| `plot_predictions()` | Grafici pred vs actual |
+| `compute_directional_accuracy()` | Accuratezza direzione previsioni |
+
+---
+
+### 10. **modelli/calibrate_vdw.py**
+
+**Van der Waals Calibration** - Modello fisico pressione mercato.
+
+| Funzione | Scopo |
+|---|---|
+| `calibrate_vdw()` | Fit Van der Waals ai dati | 
+| `compute_market_pressure_vdw()` | Calcola pressione da gas ideale + correzioni |
+
+---
+
+## 🎛️ Sistema di Configurazione
+
+**Hydra Configuration Hierarchy:**
+
+```yaml
+config/
+├── config.yaml              # Master: frequency, step, data, paths
+├── buyer/*.yaml             # Parametri agente (daily/minute)
+├── data/*.yaml              # Data loading (tickers, dates, cache)
+├── frequency/*.yaml         # Frequenza (daily/minute)
+├── model/*.yaml             # CNN architecture (dimensions, dilations)
+├── paths/*.yaml             # Output directories
+├── prediction/*.yaml        # Predictor settings (activation, loss)
+└── training/*.yaml          # Training params (epochs, lr, batch_size)
+```
+
+**Principali Parametri:**
+
+| Parametro | Effetto | Default |
+|-----------|---------|---------|
+| `frequency` | daily o minute | daily |
+| `step` | train/test/trade | train |
+| `data.tickers` | Ticker da scaricare | ["BTC", "ETH"] |
+| `model.window_size` | Finestra CNN per predictor | 30 (daily), 10 (minute) |
+| `training.epochs` | Epoche training | 100 |
+| `buyer.portfolio_value` | Capitale iniziale | 100000 |
+| `training.mre.enabled` | Usa MrE Loss vs MSE | false |
+
+**Frequency Auto-Override:**
+
+```bash
+python main.py frequency=minute
+# Automatically applica:
+#   - training=minute
+#   - prediction=minute
+#   - buyer=minute
 ```
 
 ---
 
-## 🔧 Moduli Core
-
-### 1️⃣ **main.py** — Entry Point & Orchestrazione
-
-**Funzioni Pubbliche:**
-
-#### `_apply_frequency_defaults()`
-- **Cosa fa**: Auto-configura gli override di CLI in base alla frequenza specificata
-- **Input**: Sistema argv (CLI arguments)
-- **Output**: Modifica sys.argv aggiungendo training=, prediction=, buyer= automaticamente
-- **Dettagli**: Se passi `frequency=minute`, aggiunge automaticamente `training=minute prediction=minute buyer=minute`
-- **Uso tipico**: Chiamato sempre all'avvio, prima di Hydra
-
-#### `checkpoint_name(cfg, name: str) -> str`
-- **Cosa fa**: Costruisce il path di un checkpoint includendo frequenza e window_size
-- **Input**: 
-  - `cfg`: Config Hydra
-  - `name`: Nome base (es. "pred.pth", "ddpg_best.pth")
-- **Output**: Path completo (es. "checkpoints/pred_1m_w10.pth")
-- **Dettagli**: 
-  - Predictor: `pred_1d_w30.pth` (con window_size)
-  - Agenti: `ddpg_1m.pth` (solo frequenza)
-- **Uso**: Ogni volta che salvi/carichi checkpoint
-
-#### `compute_moment_target(train_df, tickers, cfg) -> torch.Tensor`
-- **Cosa fa**: Calcola il target dei momenti per MrE Loss
-- **Input**:
-  - `train_df`: DataFrame dei dati di training
-  - `tickers`: Lista ticker
-  - `cfg`: Configurazione (rilegge MrE settings)
-- **Output**: Tensor float32 di shape (num_features,)
-- **Dettagli**: 
-  - Se config ha `training.mre.moment_target` manuale → lo usa
-  - Altrimenti calcola come media empirica del train_df
-- **Uso**: Solo con MrE Loss abilitato
-
-#### `build_predictor(cfg, num_features: int) -> Pred`
-- **Cosa fa**: Factory function che istanzia la rete CNN predictor
-- **Input**:
-  - `cfg`: Hydra config
-  - `num_features`: Dimensione input (prezzi + features termodinamiche)
-- **Output**: Istanza `Pred` pronta al training
-- **Dettagli**: Legge da config: num_features, window_size, dimensions, dilations, kernel_size, activation
-- **Uso**: In step=train e step=test
-
-#### `split_dataframe(df: pd.DataFrame, cfg) -> tuple[pd.DataFrame, pd.DataFrame]`
-- **Cosa fa**: Splotta dataset in train/test per percentuale o data
-- **Input**:
-  - `df`: DataFrame completo
-  - `cfg`: Config (frequency.split_ratio o data.split_date)
-- **Output**: (train_df, test_df)
-- **Dettagli**: 
-  - Intraday (minute): Split per percentuale (default 80/20)
-  - Daily: Split per data esatta
-- **Validates**: Entrambi i set ≥ window_size + 1
-- **Uso**: Sempre dopo load_data()
-
-#### `my_app(cfg: DictConfig) -> None`
-- **Cosa fa**: Funzione main decorata con @hydra.main
-- **Input**: Config DictConfig da Hydra
-- **Output**: Nessuno (side effects: fichier salvati)
-- **Flusso**:
-  1. Load config + stampa
-  2. Load dati via utils.load_data()
-  3. Split train/test
-  4. Crea windows (X, Y)
-  5. Se step=="train": Addestra Pred, salva checkpoint
-  6. Se step=="test": Carica pred, predici, valuta con evaluate_predictions()
-  7. Se step=="trade": Chiama run_trade()
-- **Uso**: `uv run main.py step=train frequency=daily` (main entry point)
-
----
-
-### 2️⃣ **modelli/utils.py** — Data Loading & Preprocessing
-
-**Funzioni Pubbliche:**
-
-#### `load_data(tickers, start_date, end_date, fred_api_key, inflation_series, interval="1d", cache_path="./data.csv", max_history_days=None, add_thermodynamics=True, thermo_window=20, thermo_max_lag=90) -> tuple[pd.DataFrame, MinMaxScaler]`
-
-**Cosa fa**: Carica dati da yfinance + FRED, calcola feature termodinamiche, normalizza MinMax
-
-**Input**:
-- `tickers`: Lista ticker (es. ["AAPL", "MSFT"])
-- `start_date`, `end_date`: datetime.datetime
-- `fred_api_key`: API key FRED (per tassi)
-- `inflation_series`: Lista serie FRED (es. ["GS10", "T10YIE"])
-- `interval`: "1d", "1m", etc (da yfinance)
-- `cache_path`: Dove cacheare i dati
-- `max_history_days`: Limite storico per intraday (auto-impostato per "1m": 7 giorni)
-- `add_thermodynamics`: Se aggiungere feature termodinamiche
-- `thermo_window`: Finestra rolling per entropia (default 20)
-- `thermo_max_lag`: Lag massimo cross-correlazione tassi (default 90)
+## 📚 Documentazione Correlata
 
 **Output**: 
 - DataFrame normalizzato (float32, MinMax [0,1])

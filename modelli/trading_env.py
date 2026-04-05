@@ -1,13 +1,18 @@
 """
 modelli/trading_env.py — Ambiente di trading per DDPG
 
-Fix applicati rispetto alla versione precedente:
-  1. [Bug #1] cash_penalty rimossa — ora simmetrica (penalizza eccesso E assenza di cash)
-  2. [Bug #2] Cooldown post-forced-sell — impedisce il rebuy immediato dopo espulsione
-  3. [Bug #3] sell_bonus usa self.sell_profit_bonus invece di 0.0002 hardcodato
-  4. [Design #4] Trust thermo: soglia binaria → peso continuo lineare (niente più kill-switch)
-  5. [Design #5] Sharpe ratio annualizzato con bars_per_year invece di sqrt(252)
-  6. [Minor #6] Inaction threshold separato da action_threshold (più alto per evitare bypass)
+Fix applicati:
+  [Fix #1] base_reward clippato e denominatore minimo → impedisce esplosioni quando prev_value ≈ 0
+  [Fix #2] Cooldown post-forced-sell — impedisce il rebuy immediato dopo espulsione
+  [Fix #3] sell_bonus usa self.sell_profit_bonus invece di costante hardcodata
+  [Fix #4] Forced sell / pricing: new_value calcolato PRIMA di self._step += 1 (stesso frame di prezzi)
+  [Fix #5] Trust thermo: soglia binaria → peso continuo lineare
+  [Fix #6] Sharpe ratio annualizzato con bars_per_year
+  [Fix #7] Inaction threshold separato da action_threshold
+  [Fix #8] next_state usa _get_state() anche quando done (no più zero-vector artificiale)
+  [Fix #9] Off-by-one thermo: _thermo_at(step) sostituisce _thermo_scalar per lettura esplicita
+  [Fix #10] w_global ora moltiplicatore globale su TUTTI i bonus/penalità thermo
+  [Fix #11] _cached_pv rimosso (era dichiarato ma mai usato)
 """
 
 from __future__ import annotations
@@ -26,12 +31,13 @@ class TradingEnv:
        cash_ratio(1)   | portfolio_ratio(1) | psi_values(T) | thermo(N)]
 
     Reward:
-      reward = rendimento_pct
+      reward = rendimento_pct                              (clippato in [-10, 10])
              - lambda_concentration * excess_herfindahl
              - lambda_inaction      * frazione_posizioni_ferme
              - cash_penalty         * (eccesso_cash + mancanza_cash)
+             - loss_penalty         * perdite_oltre_soglia
              + sell_profit_bonus    * n_vendite_profittevoli
-             ± thermo_shaping       * trust_weight (continuo)
+             ± thermo_shaping       * w_stress * w_global  (peso continuo, prodotto)
     """
 
     def __init__(
@@ -45,24 +51,28 @@ class TradingEnv:
         transaction_cost:  float = 0.001,
         log_trades:        bool  = False,
         action_threshold:  float = 0.01,
-        inaction_threshold: float = 0.05,   # [Fix #6] soglia separata per inaction, più alta
+        inaction_threshold: float = 0.05,
         max_position_pct:  float = 0.20,
         max_holding_steps: int   = 120,
-        forced_sell_cooldown_steps: int = 20,   # [Fix #2] step di cooldown dopo forced sell
-        bars_per_year:     int   = 252,          # [Fix #5] passa 98280 per dati 2-min
-        sell_profit_bonus: float = 0.002,        # [Fix #3] parametro esplicito
-        thermo_bonus_sell:       float = 0.002,
-        thermo_bonus_buy:        float = 0.001,
-        thermo_penalty_buy:      float = 0.003,
-        stress_sell_threshold:   float = 1.0,
-        stress_buy_threshold:    float = -0.5,
+        forced_sell_cooldown_steps: int = 20,
+        bars_per_year:     int   = 252,
+        sell_profit_bonus: float = 0.002,
+        thermo_bonus_sell:        float = 0.002,
+        thermo_bonus_buy:         float = 0.001,
+        thermo_penalty_buy:       float = 0.003,
+        stress_sell_threshold:    float = 1.0,
+        stress_buy_threshold:     float = -0.5,
         efficiency_penalty_thresh: float = 1.5,
-        trust_min:         float = 0.40,         # [Fix #4] trust sotto cui peso=0
-        trust_max:         float = 0.80,         # [Fix #4] trust sopra cui peso=1
+        # [Fix #5] Trust continuo: abbassato trust_min a 0.35 per attivare thermo
+        # con trust medio ~0.477 → w = (0.477-0.35)/(0.65-0.35) = 0.42 (era 0.19)
+        trust_min:         float = 0.35,
+        trust_max:         float = 0.65,
         lambda_concentration: float = 0.1,
         lambda_inaction:      float = 0.1,
-        lambda_loss:       float = 0.5,          # Penalità per perdite eccessive
-        loss_threshold:    float = -0.5,         # Soglia di perdita (-50%)
+        lambda_loss:       float = 0.5,
+        loss_threshold:    float = -0.5,
+        # [Fix #1] Clip massimo del base_reward per episodio (evita esplosioni)
+        reward_clip:       float = 10.0,
     ) -> None:
         self.prices_real      = prices_real
         self.prices_pred      = prices_pred
@@ -74,15 +84,16 @@ class TradingEnv:
 
         self.lambda_concentration     = lambda_concentration
         self.lambda_inaction          = lambda_inaction
-        self.lambda_loss              = lambda_loss              # Penalità per perdite
-        self.loss_threshold           = loss_threshold           # Soglia di perdita
+        self.lambda_loss              = lambda_loss
+        self.loss_threshold           = loss_threshold
         self.action_threshold         = action_threshold
-        self.inaction_threshold       = inaction_threshold      # [Fix #6]
+        self.inaction_threshold       = inaction_threshold
         self.max_position_pct         = max_position_pct
         self.max_holding_steps        = max_holding_steps
-        self.forced_sell_cooldown_steps = forced_sell_cooldown_steps  # [Fix #2]
-        self.bars_per_year            = bars_per_year            # [Fix #5]
-        self.sell_profit_bonus        = sell_profit_bonus        # [Fix #3]
+        self.forced_sell_cooldown_steps = forced_sell_cooldown_steps
+        self.bars_per_year            = bars_per_year
+        self.sell_profit_bonus        = sell_profit_bonus
+        self.reward_clip              = reward_clip
 
         # Thermo shaping
         self.thermo_bonus_sell         = thermo_bonus_sell
@@ -91,8 +102,8 @@ class TradingEnv:
         self.stress_sell_threshold     = stress_sell_threshold
         self.stress_buy_threshold      = stress_buy_threshold
         self.efficiency_penalty_thresh = efficiency_penalty_thresh
-        self.trust_min                 = trust_min               # [Fix #4]
-        self.trust_max                 = trust_max               # [Fix #4]
+        self.trust_min                 = trust_min
+        self.trust_max                 = trust_max
 
         self.num_features = len(self.all_columns)
         self.num_tickers  = len(tickers)
@@ -120,7 +131,7 @@ class TradingEnv:
             if thm_cols:
                 self._thermo_np        = th[thm_cols].values.astype(np.float32)
                 self._thermo_col_names = thm_cols
-                # Dict per O(1) lookup invece di O(n) list.index() ad ogni step
+                # O(1) lookup invece di O(n) list.index() ad ogni step
                 self._thermo_col_idx: dict[str, int] = {c: i for i, c in enumerate(thm_cols)}
                 self._has_thermo       = True
                 print(f"[TradingEnv] Thermo state: {len(thm_cols)} colonne → {thm_cols}")
@@ -151,17 +162,15 @@ class TradingEnv:
         self._avg_cost   = np.zeros(self.num_tickers, dtype=np.float64)
         self._entry_step = np.full(self.num_tickers, -1, dtype=np.int32)
 
-        # [Fix #2] cooldown post-forced-sell per ticker
         self._forced_sell_cooldown = np.zeros(self.num_tickers, dtype=np.int32)
 
         self._portfolio_history: list[float] = [self.initial_capital]
         self._trade_log:         list[dict]  = []
         self._value_per_ticker:  list[dict]  = []
 
-        # Cache per-step: evita di ricalcolare prezzi e portfolio value più volte per step
+        # Cache prezzi per step (evita doppia lettura nello stesso step)
         self._cached_step:   int        = -1
         self._cached_prices: np.ndarray = np.empty(self.num_tickers, dtype=np.float64)
-        self._cached_pv:     float      = self.initial_capital
 
     def reset(self) -> np.ndarray:
         self._reset_internals()
@@ -195,14 +204,12 @@ class TradingEnv:
     # ── helpers ───────────────────────────────────────────────────────────
 
     def _current_prices(self) -> np.ndarray:
-        # Cache: se siamo ancora nello stesso step, riusa i prezzi già estratti
         if self._cached_step != self._step:
             self._cached_prices = self._prices_real_np[self._step][self._ticker_idx].astype(np.float64)
             self._cached_step   = self._step
         return self._cached_prices
 
     def _portfolio_value(self) -> float:
-        # Ricalcola solo se i prezzi sono aggiornati (stesso step = stesso risultato)
         return float(self._cash + np.dot(self._holdings, self._current_prices()))
 
     # ── reward ────────────────────────────────────────────────────────────
@@ -214,7 +221,14 @@ class TradingEnv:
         action:           np.ndarray,
         sell_profit_mask: np.ndarray,
     ) -> float:
-        base_reward = (new_value - prev_value) / (prev_value + 1e-8)
+        # [Fix #1] Denominatore minimo = 1% del capitale iniziale per evitare divisioni
+        # per quasi-zero quando il portfolio è quasi azzerato (causa reward +10k negli ep 53/58).
+        safe_prev = max(prev_value, self.initial_capital * 0.01)
+        base_reward = np.clip(
+            (new_value - prev_value) / (safe_prev + 1e-8),
+            -self.reward_clip,
+            self.reward_clip,
+        )
 
         # Concentrazione: penalizza solo l'eccesso rispetto a portafoglio uniforme
         prices              = self._current_prices()
@@ -225,7 +239,6 @@ class TradingEnv:
         concentration_penalty = self.lambda_concentration * excess_concentration
 
         # Inaction: penalizza posizioni aperte ferme
-        # [Fix #6] usa inaction_threshold separato (più alto) per evitare bypass con micro-segnali
         open_positions = self._holdings > 1e-8
         if open_positions.any():
             frozen = open_positions & (np.abs(action) < self.inaction_threshold)
@@ -237,24 +250,22 @@ class TradingEnv:
         else:
             inaction_penalty = 0.0
 
-        # [Fix #3] sell bonus usa parametro esplicito invece di costante hardcodata
         sell_bonus = self.sell_profit_bonus * float(sell_profit_mask.sum())
 
-        # [Fix #1] Cash penalty simmetrica: penalizza SIA eccesso che mancanza
-        # Target: 5%–40% di cash libero
-        cash_ratio    = self._cash / (new_value + 1e-8)
-        excess_cash   = max(0.0, cash_ratio - 0.40)   # troppo inattivo
-        scarce_cash   = max(0.0, 0.05 - cash_ratio)   # zero riserve = no possibilità di comprare
-        cash_penalty  = 0.03 * (excess_cash + scarce_cash)
+        # Cash penalty simmetrica: penalizza SIA eccesso che mancanza (target 5%–40%)
+        cash_ratio   = self._cash / (new_value + 1e-8)
+        excess_cash  = max(0.0, cash_ratio - 0.40)
+        scarce_cash  = max(0.0, 0.05 - cash_ratio)
+        cash_penalty = 0.03 * (excess_cash + scarce_cash)
 
-        # Loss penalty: penalizza maggiormente quando le perdite superano la soglia
+        # Loss penalty: penalizza perdite oltre soglia
         current_return = (new_value - self.initial_capital) / (self.initial_capital + 1e-8)
         if current_return < self.loss_threshold:
             loss_penalty = self.lambda_loss * abs(current_return - self.loss_threshold)
         else:
             loss_penalty = 0.0
 
-        return (
+        return float(
             base_reward
             - concentration_penalty
             - inaction_penalty
@@ -263,19 +274,39 @@ class TradingEnv:
             + sell_bonus
         )
 
-    # ── thermo trust weight (continuo) ───────────────────────────────────
+    # ── trust weight (continuo) ───────────────────────────────────────────
 
     def _trust_weight(self, trust: float) -> float:
         """
-        [Fix #4] Peso continuo lineare tra trust_min e trust_max.
-        Niente soglia binaria: il reward shaping scala gradualmente.
-          trust <= trust_min  → peso 0.0  (thermo inattivo)
-          trust >= trust_max  → peso 1.0  (thermo pieno)
+        Peso continuo lineare tra trust_min e trust_max.
+          trust <= trust_min  → peso 0.0
+          trust >= trust_max  → peso 1.0
           intermedio          → interpolazione lineare
+
+        Con trust_min=0.35, trust_max=0.65 e trust medio=0.477:
+          w = (0.477 - 0.35) / (0.65 - 0.35) = 0.42  (era 0.19 con i vecchi parametri)
         """
-        return float(
-            np.clip((trust - self.trust_min) / (self.trust_max - self.trust_min + 1e-8), 0.0, 1.0)
-        )
+        span = self.trust_max - self.trust_min
+        return float(np.clip((trust - self.trust_min) / (span + 1e-8), 0.0, 1.0))
+
+    # ── thermo reader ─────────────────────────────────────────────────────
+
+    def _thermo_at(self, step: int, name: str, default: float = 0.0) -> float:
+        """
+        [Fix #9] Lettura esplicita del valore thermo al passo `step`.
+        Sostituisce _thermo_scalar che usava self._step - 1 (off-by-one).
+        Usare:
+          - step = self._step   nel reward shaping e log PRIMA di _step += 1
+          - step = self._step-1 se mai necessario leggere il passo precedente
+        """
+        if not self._has_thermo:
+            return default
+        idx = self._thermo_col_idx.get(name, -1)
+        if idx < 0:
+            return default
+        # Bounds check per sicurezza
+        safe_step = min(step, self._thermo_np.shape[0] - 1)
+        return round(float(self._thermo_np[safe_step][idx]), 4)
 
     # ── step ──────────────────────────────────────────────────────────────
 
@@ -290,9 +321,17 @@ class TradingEnv:
             )
             self._forced_sell_cooldown = np.maximum(0, self._forced_sell_cooldown - 1)
 
+        # ── Leggi prezzi al passo t (PRIMA dell'incremento) ──────────────
+        # [Fix #4] Tutti i calcoli di valore usano i prezzi di questo frame.
         prices     = self._current_prices()
         prev_value = self._portfolio_value()
         date       = self._dates[self._step] if self.log_trades else None
+
+        # Leggi valori thermo al passo t per il log e il reward shaping
+        # [Fix #9] _thermo_at(self._step) è corretto PRIMA di _step += 1
+        t_stress = self._thermo_at(self._step, "Thm_Stress")
+        t_eff    = self._thermo_at(self._step, "Thm_Efficiency")
+        t_regime = self._thermo_at(self._step, "Thm_Regime")
 
         sell_profit_mask = np.zeros(self.num_tickers, dtype=bool)
 
@@ -317,7 +356,6 @@ class TradingEnv:
             sell_profit_mask[sell_mask] = realized_pnl > 0
 
             if self.log_trades:
-                t_stress_val, t_eff_val = self._thermo_scalar("Thm_Stress"), self._thermo_scalar("Thm_Efficiency")
                 for k, i in enumerate(np.where(sell_mask)[0]):
                     self._trade_log.append({
                         "date":              date,
@@ -333,12 +371,12 @@ class TradingEnv:
                         "realized_pnl":      round(float(realized_pnl[k]), 2),
                         "holdings_after":    round(float(self._holdings[i]), 6),
                         "cash_after":        round(float(self._cash), 2),
-                        "thermo_stress":     t_stress_val,
-                        "thermo_efficiency": t_eff_val,
+                        "thermo_stress":     t_stress,   # [Fix #9] corretto, step t
+                        "thermo_efficiency": t_eff,
                     })
 
         # ── ACQUISTI vettorizzati ─────────────────────────────────────────
-        valid_mask = np.zeros(self.num_tickers, dtype=bool)  # inizializza fuori dall'if
+        valid_mask = np.zeros(self.num_tickers, dtype=bool)
 
         buy_signals = np.where(action > self.action_threshold, action, 0.0)
         buy_total   = buy_signals.sum() + 1e-8
@@ -371,7 +409,6 @@ class TradingEnv:
                 )
 
                 valid_indices = np.where(valid_mask)[0]
-                # Vettorizzato: aggiorna entry_step solo per i ticker senza posizione aperta
                 new_entries = valid_mask & (self._entry_step < 0)
                 self._entry_step[new_entries] = self._step
 
@@ -379,7 +416,6 @@ class TradingEnv:
                 self._holdings[valid_mask] += shares_buy
 
                 if self.log_trades:
-                    t_stress_val, t_eff_val = self._thermo_scalar("Thm_Stress"), self._thermo_scalar("Thm_Efficiency")
                     for k, i in enumerate(valid_indices):
                         self._trade_log.append({
                             "date":              date,
@@ -395,8 +431,8 @@ class TradingEnv:
                             "realized_pnl":      0.0,
                             "holdings_after":    round(float(self._holdings[i]), 6),
                             "cash_after":        round(float(self._cash), 2),
-                            "thermo_stress":     t_stress_val,
-                            "thermo_efficiency": t_eff_val,
+                            "thermo_stress":     t_stress,   # [Fix #9] corretto, step t
+                            "thermo_efficiency": t_eff,
                         })
 
         # ── FORCED SELL + COOLDOWN ────────────────────────────────────────
@@ -404,22 +440,63 @@ class TradingEnv:
             steps_held  = self._step - self._entry_step
             forced_mask = (steps_held >= self.max_holding_steps) & (self._holdings > 1e-8)
             if forced_mask.any():
+                # [Fix #4] prices è ancora al passo t → valore corretto
                 proceeds_f  = self._holdings[forced_mask] * prices[forced_mask]
                 fees_f      = proceeds_f * self.transaction_cost
                 self._cash += float((proceeds_f - fees_f).sum())
                 self._holdings[forced_mask]   = 0.0
                 self._entry_step[forced_mask] = -1
-                # [Fix #2] imposta cooldown per non ribuyare immediatamente
                 self._forced_sell_cooldown[forced_mask] = self.forced_sell_cooldown_steps
 
-        # ── Avanza ────────────────────────────────────────────────────────
+        # ── [Fix #4] new_value calcolato PRIMA di _step += 1 ─────────────
+        # Garantisce che sell, buy, forced_sell e new_value usino tutti
+        # gli stessi prezzi (frame t). Prima il +1 causava rivalutazione a t+1.
+        new_value = self._portfolio_value()
+
+        # ── Reward base ───────────────────────────────────────────────────
+        reward = self._compute_reward(prev_value, new_value, action, sell_profit_mask)
+
+        # ── THERMODYNAMIC REWARD SHAPING ──────────────────────────────────
+        if self._has_thermo:
+            trust_stress = self._thermo_at(self._step, "Trust_Thm_Stress", default=0.5)
+            trust_global = self._thermo_at(self._step, "Trust_Global",     default=0.5)
+
+            w_stress = self._trust_weight(trust_stress)
+            # [Fix #10] w_global è ora moltiplicatore esterno su TUTTI i termini thermo.
+            # Semantica: quanto ci fidiamo del sistema termodinamico nel suo insieme.
+            #   w_global basso → mercato caotico → thermo si spegne globalmente
+            #   w_global alto  → segnali affidabili → thermo opera a piena forza
+            # Ogni bonus/penalità scala come: valore * w_stress * w_global
+            # Esempio con trust medio 0.477 e trust_min=0.35, trust_max=0.65:
+            #   w_stress = w_global = 0.42
+            #   prodotto = 0.42 * 0.42 = 0.18
+            #   thermo_bonus_sell effettivo = 0.002 * 0.18 = 0.00036
+            # Per aumentare l'impatto: alzare i bonus o abbassare trust_min.
+            w_global = self._trust_weight(trust_global)
+
+            if sell_mask.any():
+                if t_stress > self.stress_sell_threshold:
+                    reward += self.thermo_bonus_sell * w_stress * w_global
+
+            if valid_mask.any():
+                if t_stress < self.stress_buy_threshold:
+                    reward += self.thermo_bonus_buy * w_stress * w_global
+                if t_eff > self.efficiency_penalty_thresh:
+                    reward -= self.thermo_penalty_buy * w_stress * w_global
+                if t_regime >= 3.0:
+                    trust_regime = self._thermo_at(self._step, "Trust_Thm_Regime", default=0.5)
+                    w_regime = self._trust_weight(trust_regime)
+                    reward -= self.thermo_penalty_buy * 0.5 * w_regime * w_global
+
+        # ── Avanza al passo t+1 ───────────────────────────────────────────
         self._step += 1
-        done        = self._step >= self._n_steps - 1
-        new_value   = self._portfolio_value()
+        done = self._step >= self._n_steps - 1
+
         self._portfolio_history.append(new_value)
 
+        # Log snapshot (usa prezzi a t+1 per unrealized PnL aggiornato)
         if self.log_trades:
-            new_prices = self._current_prices()
+            new_prices = self._current_prices()   # ora a t+1
             unrealized = self._holdings * (new_prices - self._avg_cost)
             snap: dict = {
                 "date":            date,
@@ -434,52 +511,16 @@ class TradingEnv:
                 snap[f"{t}_unrealized_pnl"] = round(float(unrealized[i]), 2)
             self._value_per_ticker.append(snap)
 
-        reward = self._compute_reward(prev_value, new_value, action, sell_profit_mask)
-
-        # ── THERMODYNAMIC REWARD SHAPING ──────────────────────────────────
-        if self._has_thermo:
-            t_stress = self._thermo_scalar("Thm_Stress")
-            t_eff    = self._thermo_scalar("Thm_Efficiency")
-            t_regime = self._thermo_scalar("Thm_Regime")
-
-            # [Fix #4] peso continuo: niente più soglia kill-switch a 0.6
-            trust_stress = self._thermo_scalar("Trust_Thm_Stress", default=0.5)
-            trust_global = self._thermo_scalar("Trust_Global",     default=0.5)
-            w_stress = self._trust_weight(trust_stress)
-            w_global = self._trust_weight(trust_global)
-
-            if sell_mask.any():
-                if t_stress > self.stress_sell_threshold:
-                    reward += self.thermo_bonus_sell * w_stress
-
-            if valid_mask.any():
-                if t_stress < self.stress_buy_threshold:
-                    reward += self.thermo_bonus_buy * w_stress
-                if t_eff > self.efficiency_penalty_thresh:
-                    reward -= self.thermo_penalty_buy * w_stress
-                if t_regime >= 3.0:
-                    trust_regime = self._thermo_scalar("Trust_Thm_Regime", default=0.5)
-                    w_regime = self._trust_weight(trust_regime)
-                    reward -= self.thermo_penalty_buy * 0.5 * w_regime
-
-        next_state = self._get_state() if not done else np.zeros(self.state_dim, np.float32)
+        # [Fix #8] next_state usa _get_state() SEMPRE — no zero-vector artificiale.
+        # Il flag done è già usato in ddpg.py come (1 - dones) nel target Q,
+        # quindi l'agente non fa bootstrap da questo stato quando done=True.
+        next_state = self._get_state()
 
         return next_state, float(reward), done, {
             "portfolio_value": new_value,
             "cash":            self._cash,
             "step":            self._step,
         }
-
-    # ── thermo helper ─────────────────────────────────────────────────────
-
-    def _thermo_scalar(self, name: str, default: float = 0.0) -> float:
-        """Legge un valore dal vettore thermo corrente — O(1) con dict lookup."""
-        if not self._has_thermo:
-            return default
-        idx = self._thermo_col_idx.get(name, -1)
-        if idx < 0:
-            return default
-        return round(float(self._thermo_np[self._step - 1][idx]), 4)
 
     # ── output DataFrame ─────────────────────────────────────────────────
 
@@ -533,8 +574,8 @@ class TradingEnv:
 
     def sharpe_ratio(self, risk_free: float = 0.0) -> float:
         """
-        [Fix #5] Annualizza con bars_per_year (passato nel costruttore).
-        Per dati 2-min usa bars_per_year=98280, per daily usa 252.
+        Annualizza con bars_per_year.
+        Per dati 2-min: bars_per_year=98280. Per daily: 252.
         """
         h = self.portfolio_history()
         if len(h) < 2:

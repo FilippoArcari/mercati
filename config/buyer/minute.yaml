@@ -4,12 +4,19 @@
 # Sovrascrive config/buyer/default.yaml con parametri specifici per intraday.
 #
 # Fix applicati rispetto alla versione precedente:
-#   [Fix #1] cash_penalty simmetrica — nessun incentivo a stare 100% investiti
+#   [Fix #1] reward_clip: 10.0 — impedisce esplosioni reward quando prev_value ≈ 0
+#            (causa degli ep 53/58 con portfolio da $48M/$64M)
 #   [Fix #2] forced_sell_cooldown_steps: 20 — impedisce rebuy immediato post-espulsione
-#   [Fix #3] sell_profit_bonus esplicito (era 0.0002 hardcodato nel codice)
-#   [Fix #4] trust_min/trust_max per peso continuo thermo (no più kill-switch a 0.6)
-#   [Fix #5] bars_per_year passato all'env per Sharpe corretto su dati 2-min
-#   [Fix #6] inaction_threshold separato — più alto per evitare bypass con micro-segnali
+#   [Fix #3] sell_profit_bonus esplicito
+#   [Fix #4] new_value calcolato prima di _step += 1 (stesso frame di prezzi)
+#   [Fix #5] trust_min: 0.35 / trust_max: 0.65 — thermo finalmente attivo con trust medio 0.477
+#            Con i vecchi valori (0.40/0.80) → w ≈ 0.19 (thermo quasi spento)
+#            Con i nuovi valori (0.35/0.65) → w ≈ 0.42 (thermo a ~40% della forza massima)
+#   [Fix #6] bars_per_year passato all'env per Sharpe corretto su dati 2-min
+#   [Fix #7] inaction_threshold separato — più alto per evitare bypass con micro-segnali
+#   [Fix #8] next_state reale anche quando done (no zero-vector artificiale nel buffer)
+#   [Fix #9] Off-by-one thermo risolto via _thermo_at(step) — log e reward ora allineati
+#   [Fix #10] w_global ora moltiplicatore esterno su tutti i bonus/penalità thermo
 
 agent: ddpg
 initial_capital:  100.0
@@ -26,38 +33,30 @@ es_patience: 50
 es_metric:   sharpe
 
 # ── Reward shaping ────────────────────────────────────────────────────────────
-lambda_concentration: 0.6     # Alta: forza diversificazione
-lambda_inaction:      0.2     # Moderata: penalizza posizioni congelate
-action_threshold:     0.005   # Soglia minima per considerare un'azione valida
-inaction_threshold:   0.05    # [Fix #6] Soglia per inaction check — più alta di action_threshold
-                               #          evita che micro-segnali (0.006) bypassino la penalità
+lambda_concentration: 0.6
+lambda_inaction:      0.2
+action_threshold:     0.005
+inaction_threshold:   0.05   # [Fix #7] più alto di action_threshold per evitare bypass
 
-# [Fix #1] Cash target: 5%–40% libero (penalità simmetrica — vedi trading_env.py)
-# Il parametro non è nel YAML perché i bound sono hardcodati nella funzione di reward.
-# Per cambiarli modifica _compute_reward() in trading_env.py.
+# [Fix #1] Clip del base_reward per prevenire esplosioni numeriche.
+# Se prev_value ≈ 0 (portfolio azzerato), senza clip il reward può diventare +10k.
+# Il clip a ±10 è conservativo: il rendimento reale per step è nell'ordine di ±0.1%.
+reward_clip: 10.0
 
-# [Fix #3] Bonus esplicito per ogni vendita profittevole (era 0.0002 hardcodato)
+# [Fix #3] Bonus per ogni vendita profittevole
 sell_profit_bonus: 0.002
 
-# Penalità per perdite eccessive oltre una soglia
-# lambda_loss: coefficiente di penalità per perdite > loss_threshold
-# loss_threshold: soglia di perdita (es: -0.5 = -50%), sotto cui viene applicata la penalità
-lambda_loss:    0.5       # Penalità per perdite eccessive
-loss_threshold: -0.5      # Soglia di perdita (-50%)
+# Penalità per perdite eccessive
+lambda_loss:    0.5
+loss_threshold: -0.5
 
 # ── Gestione posizioni ────────────────────────────────────────────────────────
-max_position_pct:           0.20    # Max 20% del portafoglio per singolo asset
-max_holding_steps:          120     # Forced sell dopo 120 barre (≈4h a 2min)
-                                    # Alzato da 60: evita vendite forzate troppo frequenti
-forced_sell_cooldown_steps: 20      # [Fix #2] Step in cui non si può ribuyare dopo forced sell
-                                    # Impedisce il loop forced_sell → rebuy immediato
+max_position_pct:           0.20
+max_holding_steps:          120
+forced_sell_cooldown_steps: 20   # [Fix #2] cooldown post-forced-sell
 
 # ── Sharpe corretto per intraday ─────────────────────────────────────────────
-# [Fix #5] bars_per_year deve corrispondere alla frequenza attiva.
-# Per 2-min: 390 barre/giorno × 252 giorni = 98280
-# Questo valore viene letto da frequency.bars_per_year nel config principale
-# e passato a TradingEnv(bars_per_year=...) nell'istanziazione dell'ambiente.
-# NON modificare qui senza aggiornare anche frequency.bars_per_year nel config root.
+# [Fix #6] Per 2-min: 390 barre/giorno × 252 giorni = 98280
 bars_per_year: 98280
 
 # ── DDPG ─────────────────────────────────────────────────────────────────────
@@ -66,7 +65,7 @@ ddpg:
   critic_hidden: [512, 256, 128]
   lr_actor:      0.0001
   lr_critic:     0.0003
-  gamma:         0.98          # Buono per orizzonti intraday con max_holding=120
+  gamma:         0.98
   tau:           0.005
   update_every:  5
   noise_sigma:   0.15
@@ -74,20 +73,30 @@ ddpg:
   noise_floor:   0.02
 
 # ── Thermo shaping ────────────────────────────────────────────────────────────
-lambda_thermo:              0.15
-stress_sell_threshold:      1.0
-stress_buy_threshold:      -0.5
-efficiency_penalty_thresh:  1.5
-thermo_bonus_sell:          0.002
-thermo_bonus_buy:           0.001
-thermo_penalty_buy:         0.003
+lambda_thermo:             0.15
+stress_sell_threshold:     1.0
+stress_buy_threshold:     -0.5
+efficiency_penalty_thresh: 1.5
+thermo_bonus_sell:         0.002
+thermo_bonus_buy:          0.001
+thermo_penalty_buy:        0.003
 
-# [Fix #4] Trust continuo: peso = clip((trust - trust_min) / (trust_max - trust_min), 0, 1)
-# Con trust_min=0.40 e trust_max=0.80:
-#   trust=0.40 → peso 0.0  (thermo inattivo)
-#   trust=0.47 → peso 0.18 (leggero effetto anche con trust medio dei log)
-#   trust=0.60 → peso 0.50 (effetto dimezzato)
-#   trust=0.80 → peso 1.0  (effetto pieno)
-# Prima: soglia binaria a 0.6 → con trust=0.477 il thermo era completamente spento
-trust_min: 0.40
-trust_max: 0.80
+# [Fix #5] Trust continuo ridisegnato.
+#
+# PROBLEMA PRECEDENTE: trust_min=0.40, trust_max=0.80
+#   Con trust medio osservato = 0.477:
+#   w = (0.477 - 0.40) / (0.80 - 0.40) = 0.077 / 0.40 = 0.19
+#   Bonus effettivo = 0.002 * 0.19 = 0.00038 → trascurabile
+#
+# SOLUZIONE: abbassare trust_min e ridurre il range
+#   Con trust_min=0.35, trust_max=0.65:
+#   w = (0.477 - 0.35) / (0.65 - 0.35) = 0.127 / 0.30 = 0.42
+#   Bonus effettivo = 0.002 * 0.42 = 0.00084 → ~2x più impattante
+#
+# [Fix #10] w_global: con trust medio 0.477 → w_global = 0.42
+#   Prodotto w_stress * w_global = 0.42 * 0.42 = 0.18
+#   Thermo opera al 18% della forza massima — se vuoi più impatto,
+#   aumenta i bonus (thermo_bonus_sell, thermo_bonus_buy) invece di
+#   modificare trust_min/trust_max, per mantenere la calibrazione del rischio.
+trust_min: 0.35
+trust_max: 0.65
