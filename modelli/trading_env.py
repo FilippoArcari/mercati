@@ -73,6 +73,12 @@ class TradingEnv:
         loss_threshold:    float = -0.5,
         # [Fix #1] Clip massimo del base_reward per episodio (evita esplosioni)
         reward_clip:       float = 10.0,
+        # [Fix #12] Hard cap sul valore assoluto del portafoglio.
+        # Se il portafoglio supera questo valore, tutte le posizioni vengono
+        # liquidate forzatamente. Previene i valori tipo $2.6B nei log che
+        # derivano da prezzi near-zero o instabilità numerica nei shares_buy.
+        # Default: 500x il capitale iniziale (es. $100 → cap a $50.000).
+        hard_portfolio_multiplier: float = 500.0,
     ) -> None:
         self.prices_real      = prices_real
         self.prices_pred      = prices_pred
@@ -94,6 +100,7 @@ class TradingEnv:
         self.bars_per_year            = bars_per_year
         self.sell_profit_bonus        = sell_profit_bonus
         self.reward_clip              = reward_clip
+        self.hard_portfolio_cap      = initial_capital * hard_portfolio_multiplier
 
         # Thermo shaping
         self.thermo_bonus_sell         = thermo_bonus_sell
@@ -394,46 +401,58 @@ class TradingEnv:
             if valid_mask.any():
                 b          = budgets[valid_mask]
                 p          = prices[valid_mask]
-                fees_buy   = b * self.transaction_cost
-                net_b      = b - fees_buy
-                shares_buy = net_b / (p + 1e-8)
+                # [Fix #12b] Filtra prezzi near-zero (< $0.01) che causano
+                # shares_buy astronomici (shares = budget / price ≈ budget / 0.000001)
+                min_price_mask = p >= 0.01
+                if not min_price_mask.all():
+                    real_valid = np.where(valid_mask)[0]
+                    blocked    = real_valid[~min_price_mask]
+                    valid_mask[blocked] = False
+                    b = budgets[valid_mask]
+                    p = prices[valid_mask]
+                if not valid_mask.any():
+                    pass
+                else:
+                    fees_buy   = b * self.transaction_cost
+                    net_b      = b - fees_buy
+                    shares_buy = net_b / (p + 1e-8)
 
-                h_old = self._holdings[valid_mask]
-                c_old = self._avg_cost[valid_mask]
-                h_new = h_old + shares_buy
+                    h_old = self._holdings[valid_mask]
+                    c_old = self._avg_cost[valid_mask]
+                    h_new = h_old + shares_buy
 
-                self._avg_cost[valid_mask] = np.where(
-                    h_new > 1e-8,
-                    (h_old * c_old + shares_buy * p) / h_new,
-                    c_old,
-                )
+                    self._avg_cost[valid_mask] = np.where(
+                        h_new > 1e-8,
+                        (h_old * c_old + shares_buy * p) / h_new,
+                        c_old,
+                    )
 
-                valid_indices = np.where(valid_mask)[0]
-                new_entries = valid_mask & (self._entry_step < 0)
-                self._entry_step[new_entries] = self._step
+                    valid_indices = np.where(valid_mask)[0]
+                    new_entries = valid_mask & (self._entry_step < 0)
+                    self._entry_step[new_entries] = self._step
 
-                self._cash                -= float(b.sum())
-                self._holdings[valid_mask] += shares_buy
+                    self._cash                -= float(b.sum())
+                    self._holdings[valid_mask] += shares_buy
 
-                if self.log_trades:
-                    for k, i in enumerate(valid_indices):
-                        self._trade_log.append({
-                            "date":              date,
-                            "ticker":            self.tickers[i],
-                            "action":            "BUY",
-                            "action_signal":     round(float(action[i]), 4),
-                            "shares":            round(float(shares_buy[k]), 6),
-                            "price":             round(float(p[k]), 4),
-                            "gross_value":       round(float(b[k]), 2),
-                            "fee":               round(float(fees_buy[k]), 4),
-                            "net_value":         round(float(net_b[k]), 2),
-                            "avg_cost":          round(float(self._avg_cost[i]), 4),
-                            "realized_pnl":      0.0,
-                            "holdings_after":    round(float(self._holdings[i]), 6),
-                            "cash_after":        round(float(self._cash), 2),
-                            "thermo_stress":     t_stress,   # [Fix #9] corretto, step t
-                            "thermo_efficiency": t_eff,
-                        })
+                    if self.log_trades:
+                        for k, i in enumerate(valid_indices):
+                            self._trade_log.append({
+                                "date":              date,
+                                "ticker":            self.tickers[i],
+                                "action":            "BUY",
+                                "action_signal":     round(float(action[i]), 4),
+                                "shares":            round(float(shares_buy[k]), 6),
+                                "price":             round(float(p[k]), 4),
+                                "gross_value":       round(float(b[k]), 2),
+                                "fee":               round(float(fees_buy[k]), 4),
+                                "net_value":         round(float(net_b[k]), 2),
+                                "avg_cost":          round(float(self._avg_cost[i]), 4),
+                                "realized_pnl":      0.0,
+                                "holdings_after":    round(float(self._holdings[i]), 6),
+                                "cash_after":        round(float(self._cash), 2),
+                                "thermo_stress":     t_stress,
+                                "thermo_efficiency": t_eff,
+                            })
 
         # ── FORCED SELL + COOLDOWN ────────────────────────────────────────
         if self._step > 0 and self.max_holding_steps > 0:
@@ -452,6 +471,19 @@ class TradingEnv:
         # Garantisce che sell, buy, forced_sell e new_value usino tutti
         # gli stessi prezzi (frame t). Prima il +1 causava rivalutazione a t+1.
         new_value = self._portfolio_value()
+
+        # ── [Fix #12] Hard cap portafoglio ───────────────────────────────
+        # Se il portafoglio esplode oltre il cap (causato da prezzi near-zero
+        # che generano shares_buy astronomici), liquidiamo tutto immediatamente.
+        # Questo elimina i valori tipo $2.6B osservati nei log di training.
+        if new_value > self.hard_portfolio_cap and self._holdings.any():
+            cap_prices = self._current_prices()
+            proceeds_c = self._holdings * cap_prices
+            fees_c     = proceeds_c * self.transaction_cost
+            self._cash            += float((proceeds_c - fees_c).sum())
+            self._holdings[:]      = 0.0
+            self._entry_step[:]    = -1
+            new_value              = self._portfolio_value()
 
         # ── Reward base ───────────────────────────────────────────────────
         reward = self._compute_reward(prev_value, new_value, action, sell_profit_mask)

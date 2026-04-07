@@ -29,7 +29,7 @@ log_every:       1
 n_episodes:  500
 batch_size:  256
 warmup:      5000
-es_patience: 50
+es_patience: 75
 es_metric:   sharpe
 
 # ── Reward shaping ────────────────────────────────────────────────────────────

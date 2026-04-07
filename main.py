@@ -137,6 +137,17 @@ def split_dataframe(df: pd.DataFrame, cfg) -> tuple[pd.DataFrame, pd.DataFrame]:
 def my_app(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
 
+    # ── ALPACA — early exit prima di load_data (i dati arrivano live) ─────────
+    if cfg.step == "alpaca":
+        from modelli.alpaca_live import run_alpaca
+        run_alpaca(cfg)
+        return
+
+    if cfg.step == "alpaca_replay":
+        from modelli.alpaca_live import run_alpaca_replay
+        run_alpaca_replay(cfg)
+        return
+
     tickers          = list(cfg.data.tickers)
     inflation_series = list(cfg.data.inflation_series)
     start            = datetime.datetime.fromisoformat(cfg.data.start_date)
@@ -273,26 +284,51 @@ def my_app(cfg: DictConfig) -> None:
         )
         print("\nTest completato.")
 
-    # ── TRADE ──────────────────────────────────────────────────────────────────
-    elif cfg.step == "trade":
-       
-        run_trade(
-            cfg=cfg,
-            df=df,
-            df_raw=raw_df_with_volumes,
-            tickers=tickers,
-            X_train=X_train,
-            Y_train=Y_train,
-            X_test=X_test,
-            Y_test=Y_test,
-            train_df=train_df,
-            test_df=test_df,
-        )
+    # ── TRADE / WALK-FORWARD ───────────────────────────────────────────────────
+    elif cfg.step in ("trade", "walk_forward"):
+        # Le finestre sull'intero dataset servono per la walk-forward
+        # (il trade normale usa solo X_train/X_test già calcolati sopra)
+        X_all, Y_all = make_windows(df, cfg.prediction.window_size, cfg.prediction.stride)
+
+        if cfg.step == "trade":
+            run_trade(
+                cfg=cfg,
+                df=df,
+                df_raw=raw_df_with_volumes,
+                tickers=tickers,
+                X_train=X_train,
+                Y_train=Y_train,
+                X_test=X_test,
+                Y_test=Y_test,
+                train_df=train_df,
+                test_df=test_df,
+            )
+        else:
+            # ── Walk-forward ──────────────────────────────────────────────
+            from modelli.trade import run_walk_forward
+            wf_cfg = getattr(cfg, "walk_forward", None)
+
+            run_walk_forward(
+                cfg           = cfg,
+                df            = df,
+                tickers       = tickers,
+                train_df      = train_df,
+                test_df       = test_df,
+                X_all         = X_all,
+                Y_all         = Y_all,
+                df_raw        = raw_df_with_volumes,
+                n_folds       = int(getattr(wf_cfg,   "n_folds",        5))       if wf_cfg else 5,
+                mode          = str(getattr(wf_cfg,   "mode",     "sliding"))      if wf_cfg else "sliding",
+                min_train_pct = float(getattr(wf_cfg, "min_train_pct",   0.55))   if wf_cfg else 0.55,
+                test_pct      = float(getattr(wf_cfg, "test_pct",        0.12))   if wf_cfg else 0.12,
+                warm_start    = bool(getattr(wf_cfg,  "warm_start",      True))   if wf_cfg else True,
+            )
 
     else:
         print(
             f"Errore: step sconosciuto '{cfg.step}'. "
-            "Scegli tra 'train', 'test', 'trade', 'stats'."
+            "Scegli tra 'train', 'test', 'trade', 'walk_forward', "
+            "'alpaca', 'alpaca_replay', 'stats'."
         )
 
 

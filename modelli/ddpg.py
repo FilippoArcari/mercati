@@ -275,7 +275,7 @@ class DDPGAgent:
               f"(arch: {self.actor_hidden})")
 
     def load(self, path: str) -> bool:
-        ckpt = torch.load(path, weights_only=False)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
 
         saved_state_dim  = ckpt.get("state_dim")
         saved_action_dim = ckpt.get("action_dim")

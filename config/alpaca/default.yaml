@@ -1,0 +1,9 @@
+max_position_pct:    0.05   # max % portafoglio per ticker
+min_order_usd:       1.0    # ordine minimo in USD
+action_threshold:    0.005  # soglia sotto cui ignorare il segnale DDPG
+min_confidence:      0.10   # confidenza minima per tradare
+circuit_breaker_dd: -0.15   # ferma tutto se drawdown supera 15%
+max_daily_trades:    50     # limite ordini giornalieri
+warmup_bars:         20     # barre prima del primo trade
+bar_buffer:          200    # barre storiche in memoria
+tradeable_tickers:   []     # lista esplicita ticker (default: auto da cfg.data.tickers)

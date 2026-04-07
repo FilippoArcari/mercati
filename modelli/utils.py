@@ -88,6 +88,101 @@ def _load_cache(cache_path: str, min_rows: int = 1) -> pd.DataFrame | None:
     return data
 
 
+# ─── Sliding-window intraday fetcher ──────────────────────────────────────────
+
+def fetch_intraday_sliding_window(
+    tickers:       list[str],
+    interval:      str,
+    cache_path:    str,
+    n_chunks:      int = 6,
+    chunk_days:    int = 55,
+    overlap_days:  int = 5,
+) -> pd.DataFrame:
+    """
+    Aggira il limite di 60 giorni di yfinance per i dati intraday
+    scaricando dati in finestre temporali sovrapposte e accumulandole
+    in una cache locale che cresce nel tempo.
+
+    Logica delle finestre:
+      step = chunk_days - overlap_days  (default 50 giorni)
+      n_chunks=6 → copertura massima: 55 + 5*50 = 305 giorni
+
+    Accumulo progressivo:
+      I chunk già presenti in cache vengono saltati. Eseguendo lo script
+      ogni giorno si costruisce una storia progressivamente più lunga,
+      superando il limite strutturale di yfinance di 60 giorni.
+
+    Returns:
+      DataFrame con colonne = tickers, index = timestamp UTC,
+      già pulito da duplicati e ordinato cronologicamente.
+    """
+    step_days = chunk_days - overlap_days
+    now       = datetime.datetime.now(datetime.timezone.utc)
+
+    # ── Carica cache esistente ────────────────────────────────────────────
+    existing: pd.DataFrame | None = _load_cache(cache_path)
+    if existing is not None:
+        # Normalizza timezone per confronti
+        if existing.index.tzinfo is None:
+            existing.index = existing.index.tz_localize("UTC")
+
+    # ── Scarica chunk in ordine dal più recente al più vecchio ───────────
+    new_chunks: list[pd.DataFrame] = []
+    for i in range(n_chunks):
+        chunk_end   = now - datetime.timedelta(days=i * step_days)
+        chunk_start = chunk_end - datetime.timedelta(days=chunk_days)
+
+        # Skip se questo range è già completamente coperto dalla cache
+        if existing is not None:
+            cache_oldest = existing.index.min()
+            if chunk_start.replace(tzinfo=datetime.timezone.utc) >= cache_oldest:
+                print(f"[SlidingWindow] Chunk {i+1}/{n_chunks}: già in cache, skip "
+                      f"({chunk_start.date()} → {chunk_end.date()})")
+                continue
+
+        try:
+            df_chunk = yf.download(
+                tickers,
+                start    = chunk_start,
+                end      = chunk_end,
+                interval = interval,
+                progress = False,
+                auto_adjust = True,
+            )
+            if df_chunk.empty:
+                print(f"[SlidingWindow] Chunk {i+1}/{n_chunks}: nessun dato "
+                      f"({chunk_start.date()} → {chunk_end.date()})")
+                continue
+
+            close = df_chunk["Close"] if "Close" in df_chunk.columns else df_chunk
+            # Assicura index UTC
+            if close.index.tzinfo is None:
+                close.index = close.index.tz_localize("UTC")
+
+            new_chunks.append(close)
+            print(f"[SlidingWindow] Chunk {i+1}/{n_chunks}: {len(close):,} barre "
+                  f"({chunk_start.date()} → {chunk_end.date()})")
+
+        except Exception as e:
+            print(f"[SlidingWindow] Chunk {i+1}/{n_chunks} fallito: {e}")
+
+    # ── Unisce tutto ─────────────────────────────────────────────────────
+    parts = ([] if existing is None else [existing]) + new_chunks
+    if not parts:
+        raise RuntimeError("[SlidingWindow] Nessun dato disponibile")
+
+    combined = pd.concat(parts)
+    combined = combined[~combined.index.duplicated(keep="first")].sort_index()
+
+    # ── Salva cache aggiornata ────────────────────────────────────────────
+    combined.to_csv(cache_path)
+    span = combined.index[-1] - combined.index[0]
+    print(f"[SlidingWindow] Cache aggiornata: {len(combined):,} barre | "
+          f"{combined.index[0].date()} → {combined.index[-1].date()} "
+          f"({span.days} giorni)")
+    return combined
+
+
 # ─── Thermodynamic helpers ─────────────────────────────────────────────────────
 
 def add_divergence_and_efficiency_features(
@@ -858,6 +953,5 @@ def make_stats(cfg):
 
     print(f"[Stats] Analisi completata. Grafici salvati in {cfg.paths.results_dir}")
     return df_port
-
 
 

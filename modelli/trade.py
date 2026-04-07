@@ -620,3 +620,295 @@ def run_trade(
     _plot_learning(history, results_dir, freq)
     _plot_pnl_and_trades(env_test, tickers, daily, results_dir, freq)
     _analyze_thermo_trades(env_test.trade_log_df(), results_dir, freq)
+
+# ─── Walk-forward validation ──────────────────────────────────────────────────
+
+def run_walk_forward(
+    cfg,
+    df:            pd.DataFrame,
+    tickers:       list[str],
+    train_df:      pd.DataFrame,
+    test_df:       pd.DataFrame,
+    X_all:         "torch.Tensor",
+    Y_all:         "torch.Tensor",
+    df_raw:        "pd.DataFrame | None" = None,
+    n_folds:       int   = 5,
+    mode:          str   = "sliding",
+    min_train_pct: float = 0.55,
+    test_pct:      float = 0.12,
+    warm_start:    bool  = True,
+) -> "WalkForwardReport":
+    """
+    Walk-forward validation completa del sistema DDPG.
+
+    Il CNN predittore è già addestrato e condiviso tra tutti i fold.
+    Per ogni fold il DDPG viene riaddestrato from scratch (o in warm-start
+    dai pesi del fold precedente, se warm_start=True).
+
+    Flusso per ogni fold i:
+      1. Slice di prices_real/prices_pred sulla finestra [tr_s:tr_e] e [te_s:te_e]
+      2. Calcolo feature thermo sul subset raw_df corrispondente
+      3. Training DDPG sul train window
+      4. Valutazione out-of-sample sul test window
+      5. Registrazione FoldResult nel WalkForwardReport
+
+    Il report finale include il giudizio di produzione secondo i 5 criteri
+    definiti in walk_forward.py.
+
+    warm_start=True → i pesi Actor/Critic del fold precedente vengono
+    usati come punto di partenza. Più veloce, potenzialmente più stabile
+    in mercati stazionari (ma attenzione a overfitting al regime passato).
+    """
+    import torch
+    from modelli.walk_forward import make_folds, WalkForwardReport, FoldResult
+    from modelli.ddpg import DDPGAgent
+    from modelli.obs_normalizer import ObsNormalizer, train_ddpg_normalized
+    from modelli.trading_env import TradingEnv
+    from modelli.thermo_state_builder import ThermoStateBuilder
+
+    freq = cfg.frequency.interval
+
+    # ── 1. Carica predittore e inferenza su tutta la serie ─────────────────
+    pred_path = _ckpt(cfg, "pred.pth")
+    if not os.path.exists(pred_path):
+        print(f"[WalkForward] Predittore non trovato: {pred_path}")
+        print(f"  Esegui prima: uv run main.py step=train frequency={freq}")
+        return WalkForwardReport(mode=mode)
+
+    checkpoint   = torch.load(pred_path, weights_only=False)
+    num_features = checkpoint.get("num_features", df.shape[1])
+    predictor    = _load_predictor(cfg, num_features, checkpoint)
+    scaler       = checkpoint["scaler"]
+    all_columns  = list(df.shape[1] * [""] if False else df.columns)
+
+    print(f"[WalkForward] Inferenza CNN su {len(X_all):,} finestre totali...")
+    all_pred_scaled = _predict_batched(predictor, X_all, batch_size=BATCH_SIZE)
+
+    ws          = cfg.prediction.window_size
+    stride      = cfg.prediction.stride
+    all_dates   = df.index[ws::stride][:len(Y_all)]
+
+    prices_real_all, prices_pred_all = _build_price_dfs(
+        all_pred_scaled, Y_all, scaler, all_dates, list(df.columns)
+    )
+
+    n_bars = len(prices_real_all)
+    folds  = make_folds(
+        n_bars        = n_bars,
+        n_folds       = n_folds,
+        mode          = mode,
+        min_train_pct = min_train_pct,
+        test_pct      = test_pct,
+    )
+
+    if not folds:
+        print(f"[WalkForward] Errore: impossibile costruire fold con {n_bars} barre. "
+              "Riduci n_folds o min_train_pct.")
+        return WalkForwardReport(mode=mode)
+
+    print(
+        f"\n[WalkForward] {len(folds)} fold generati | mode={mode} | "
+        f"min_train={min_train_pct:.0%} | test={test_pct:.0%}"
+    )
+    print(f"  Barre totali: {n_bars:,}  |  Freq: {freq}  |  "
+          f"warm_start: {'sì' if warm_start else 'no'}")
+
+    # ── 2. Setup comune ────────────────────────────────────────────────────
+    buyer_cfg      = cfg.buyer
+    ddpg_cfg       = cfg.buyer.ddpg
+    checkpoint_dir = cfg.paths.checkpoint_dir
+    results_dir    = cfg.paths.results_dir
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(results_dir,    exist_ok=True)
+
+    builder = ThermoStateBuilder(interval=freq)
+    report  = WalkForwardReport(mode=mode)
+
+    # Parametri env comuni a train e test
+    _env_common = dict(
+        tickers                    = tickers,
+        initial_capital            = buyer_cfg.initial_capital,
+        transaction_cost           = buyer_cfg.transaction_cost,
+        action_threshold           = getattr(buyer_cfg, "action_threshold",           0.005),
+        max_position_pct           = getattr(buyer_cfg, "max_position_pct",           0.20),
+        max_holding_steps          = getattr(buyer_cfg, "max_holding_steps",          120),
+        forced_sell_cooldown_steps = getattr(buyer_cfg, "forced_sell_cooldown_steps", 20),
+        bars_per_year              = getattr(buyer_cfg, "bars_per_year",              98280),
+        sell_profit_bonus          = getattr(buyer_cfg, "sell_profit_bonus",          0.002),
+        thermo_bonus_sell          = getattr(buyer_cfg, "thermo_bonus_sell",          0.002),
+        thermo_bonus_buy           = getattr(buyer_cfg, "thermo_bonus_buy",           0.001),
+        thermo_penalty_buy         = getattr(buyer_cfg, "thermo_penalty_buy",         0.003),
+        stress_sell_threshold      = getattr(buyer_cfg, "stress_sell_threshold",      1.0),
+        stress_buy_threshold       = getattr(buyer_cfg, "stress_buy_threshold",      -0.5),
+        efficiency_penalty_thresh  = getattr(buyer_cfg, "efficiency_penalty_thresh",  1.5),
+        trust_min                  = getattr(buyer_cfg, "trust_min",                  0.35),
+        trust_max                  = getattr(buyer_cfg, "trust_max",                  0.65),
+    )
+
+    prev_best_path: str | None = None  # warm-start dal fold precedente
+
+    # ── 3. Loop sui fold ───────────────────────────────────────────────────
+    for fold_n, ((tr_s, tr_e), (te_s, te_e)) in enumerate(folds, 1):
+        print(f"\n{'═'*62}")
+        print(f"  FOLD {fold_n}/{len(folds)} | "
+              f"train [{tr_s:,}:{tr_e:,}] ({tr_e-tr_s:,} barre) | "
+              f"test [{te_s:,}:{te_e:,}] ({te_e-te_s:,} barre)")
+
+        pr_train = prices_real_all.iloc[tr_s:tr_e]
+        pp_train = prices_pred_all.iloc[tr_s:tr_e]
+        pr_test  = prices_real_all.iloc[te_s:te_e]
+        pp_test  = prices_pred_all.iloc[te_s:te_e]
+
+        print(f"  Train: {pr_train.index[0]} → {pr_train.index[-1]}")
+        print(f"  Test:  {pr_test.index[0]} → {pr_test.index[-1]}")
+
+        # Thermo features calcolate sul subset di raw_df corrispondente
+        raw_src   = df_raw if df_raw is not None else df
+        th_train  = builder.build(raw_src.reindex(pr_train.index), tickers)
+        th_test   = builder.build(raw_src.reindex(pr_test.index),  tickers)
+
+        # ── Ambienti ──────────────────────────────────────────────────────
+        env_train = TradingEnv(
+            prices_real=pr_train, prices_pred=pp_train,
+            thermo_df=th_train, log_trades=False,
+            lambda_concentration = getattr(buyer_cfg, "lambda_concentration", 0.1),
+            lambda_inaction      = getattr(buyer_cfg, "lambda_inaction",      0.1),
+            lambda_loss          = getattr(buyer_cfg, "lambda_loss",          0.5),
+            loss_threshold       = getattr(buyer_cfg, "loss_threshold",      -0.5),
+            **_env_common,
+        )
+        env_test = TradingEnv(
+            prices_real=pr_test, prices_pred=pp_test,
+            thermo_df=th_test, log_trades=True,
+            lambda_concentration = 0.0,
+            lambda_inaction      = 0.0,
+            lambda_loss          = 0.0,
+            loss_threshold       = getattr(buyer_cfg, "loss_threshold", -0.5),
+            **_env_common,
+        )
+
+        # ── Agente DDPG ───────────────────────────────────────────────────
+        agent = DDPGAgent(
+            state_dim       = env_train.state_dim,
+            action_dim      = env_train.action_dim,
+            actor_hidden    = list(ddpg_cfg.actor_hidden),
+            critic_hidden   = list(ddpg_cfg.critic_hidden),
+            lr_actor        = ddpg_cfg.lr_actor,
+            lr_critic       = ddpg_cfg.lr_critic,
+            gamma           = ddpg_cfg.gamma,
+            tau             = ddpg_cfg.tau,
+            buffer_capacity = buyer_cfg.buffer_capacity,
+            batch_size      = buyer_cfg.batch_size,
+            update_every    = ddpg_cfg.update_every,
+            noise_sigma     = ddpg_cfg.noise_sigma,
+        )
+        normalizer = ObsNormalizer(
+            state_dim = env_train.state_dim,
+            clip      = getattr(buyer_cfg, "obs_clip", 5.0),
+        )
+
+        # Warm start: carica pesi dal fold precedente
+        if warm_start and prev_best_path and os.path.exists(prev_best_path):
+            ok = agent.load(prev_best_path)
+            if ok:
+                print(f"  Warm start da fold {fold_n - 1}: {os.path.basename(prev_best_path)}")
+
+        fold_best = os.path.join(checkpoint_dir, f"ddpg_wf_fold{fold_n}_best_{freq}.pth")
+        fold_norm = os.path.join(checkpoint_dir, f"normalizer_wf_fold{fold_n}_{freq}.npz")
+
+        # ── Training ──────────────────────────────────────────────────────
+        history = train_ddpg_normalized(
+            agent       = agent,
+            env         = env_train,
+            normalizer  = normalizer,
+            n_episodes  = buyer_cfg.n_episodes,
+            warmup      = buyer_cfg.warmup,
+            log_every   = max(1, buyer_cfg.log_every * 5),  # log meno frequente nei fold
+            noise_decay = ddpg_cfg.noise_decay,
+            noise_floor = getattr(ddpg_cfg, "noise_floor", 0.02),
+            es_patience = getattr(buyer_cfg, "es_patience", 50),
+            es_metric   = getattr(buyer_cfg, "es_metric",   "sharpe"),
+            best_path   = fold_best,
+            norm_path   = fold_norm,
+        )
+
+        # ── Valutazione con best checkpoint ───────────────────────────────
+        if os.path.exists(fold_best):
+            agent.load(fold_best)
+        if os.path.exists(fold_norm):
+            normalizer.load(fold_norm)
+
+        raw_state = env_test.reset()
+        state     = normalizer.normalize(raw_state, update=False)
+        done      = False
+        while not done:
+            action               = agent.act(state, explore=False)
+            raw_next, _, done, _ = env_test.step(action)
+            state                = normalizer.normalize(raw_next, update=False)
+
+        # ── Metriche fold ─────────────────────────────────────────────────
+        final_v  = env_test.portfolio_history()[-1]
+        ret_pct  = (final_v - buyer_cfg.initial_capital) / buyer_cfg.initial_capital * 100
+        sharpe   = env_test.sharpe_ratio()
+        max_dd   = env_test.max_drawdown()
+        best_ep  = max(history, key=lambda h: h.get("sharpe", -999))
+
+        # Thermo post-hoc
+        sell_ok_pct = 0.0
+        buy_bad_pct = 0.0
+        tlog = env_test.trade_log_df()
+        if not tlog.empty and "thermo_stress" in tlog.columns:
+            sells = tlog[tlog["action"] == "SELL"]
+            buys  = tlog[tlog["action"] == "BUY"]
+            if len(sells) > 0:
+                sell_ok_pct = 100 * float((sells["thermo_stress"] > 1.0).mean())
+            if len(buys) > 0:
+                buy_bad_pct = 100 * float((buys.get("thermo_efficiency", pd.Series(dtype=float)) > 1.5).mean())
+
+        fold_res = FoldResult(
+            fold               = fold_n,
+            train_bars         = tr_e - tr_s,
+            test_bars          = te_e - te_s,
+            train_start        = str(pr_train.index[0])[:16],
+            train_end          = str(pr_train.index[-1])[:16],
+            test_start         = str(pr_test.index[0])[:16],
+            test_end           = str(pr_test.index[-1])[:16],
+            sharpe             = sharpe,
+            total_return_pct   = ret_pct,
+            max_drawdown       = max_dd,
+            n_episodes_run     = len(history),
+            best_episode       = best_ep["episode"],
+            thermo_sell_ok_pct = sell_ok_pct,
+            thermo_buy_bad_pct = buy_bad_pct,
+        )
+        report.folds.append(fold_res)
+        prev_best_path = fold_best
+
+        print(
+            f"  ✔ Fold {fold_n} — Sharpe: {sharpe:.3f} | "
+            f"Return: {ret_pct:+.2f}% | MaxDD: {max_dd:.3f} | "
+            f"Thm✅: {sell_ok_pct:.1f}% | ep: {len(history)}"
+        )
+
+        # Salva anche il trade log del fold per analisi
+        tlog_path = os.path.join(results_dir, f"wf_fold{fold_n}_trades_{freq}.csv")
+        if not tlog.empty:
+            tlog.to_csv(tlog_path)
+
+    # ── 4. Report finale ───────────────────────────────────────────────────
+    report.print_summary()
+    report.save(os.path.join(results_dir, f"walk_forward_{freq}.csv"))
+
+    # Thermo post-hoc aggregata su tutti i fold
+    _analyze_thermo_trades(
+        pd.concat([
+            pd.read_csv(os.path.join(results_dir, f"wf_fold{i}_trades_{freq}.csv"),
+                        index_col=0, parse_dates=True)
+            for i in range(1, len(folds) + 1)
+            if os.path.exists(os.path.join(results_dir, f"wf_fold{i}_trades_{freq}.csv"))
+        ]) if folds else pd.DataFrame(),
+        results_dir,
+        f"wf_aggregated_{freq}",
+    )
+
+    return report

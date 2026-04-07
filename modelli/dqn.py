@@ -308,7 +308,7 @@ class DQNAgent:
         print(f"[DQN] Checkpoint salvato{label}: {path} (ε={self.epsilon:.3f})")
 
     def load(self, path: str) -> bool:
-        ckpt = torch.load(path, weights_only=False)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
 
         if (ckpt.get("state_dim")  != self.state_dim  or
                 ckpt.get("n_tickers") != self.n_tickers or

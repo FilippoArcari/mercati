@@ -1,0 +1,5 @@
+- step=alpaca_replay
+- frequency=minute
+- training=minute
+- prediction=minute
+- buyer=minute
