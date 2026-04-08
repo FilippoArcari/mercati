@@ -118,7 +118,6 @@ def _init_alpaca(log: logging.Logger):
 
     acc = tc.get_account()
     log.info(f"Account OK | status={acc.status} | equity=${float(acc.equity):,.2f}")
-    
 
     return tc, dc
 
@@ -209,14 +208,23 @@ def _load_predictor(cfg, log: logging.Logger):
     return model, ck["scaler"], nf, device
 
 
-def _load_agent(cfg, state_dim: int, action_dim: int,
-                device: torch.device, log: logging.Logger):
+def _load_agent(cfg, state_dim: int, all_tickers: list[str],
+                tradeable: list[str], device: torch.device,
+                log: logging.Logger):
+    """
+    Carica DDPG e normalizer.
+
+    action_dim = len(all_tickers): identico al training dove l'agente
+    produceva un'azione per ogni ticker del portafoglio.
+    In produzione si eseguono solo le azioni per i ticker tradabili su Alpaca,
+    usando tradeable_indices per estrarre il sottoinsieme corretto.
+    """
     from modelli.ddpg import DDPGAgent
     from modelli.obs_normalizer import ObsNormalizer
 
-    dp = _ddpg_ckpt(cfg)
+    dp  = _ddpg_ckpt(cfg)
     np_ = _norm_ckpt(cfg)
-    dc = cfg.buyer.ddpg
+    dc  = cfg.buyer.ddpg
 
     if not os.path.exists(dp):
         raise FileNotFoundError(
@@ -224,23 +232,46 @@ def _load_agent(cfg, state_dim: int, action_dim: int,
             f"Esegui: uv run main.py step=trade frequency={cfg.frequency.interval}"
         )
 
+    # action_dim = tutti i ticker del training, NON solo i tradeable
+    action_dim = len(all_tickers)
+
     agent = DDPGAgent(
         state_dim=state_dim, action_dim=action_dim,
         actor_hidden=list(dc.actor_hidden), critic_hidden=list(dc.critic_hidden),
         lr_actor=dc.lr_actor, lr_critic=dc.lr_critic,
         gamma=dc.gamma, tau=dc.tau,
         buffer_capacity=1, batch_size=1,
-        update_every=999_999, noise_sigma=0.0,  # no noise in produzione
+        update_every=999_999, noise_sigma=0.0,
     )
-    agent.load(dp)
-    log.info(f"DDPG: {os.path.basename(dp)}")
+    loaded = agent.load(dp)
+    if not loaded:
+        raise RuntimeError(
+            f"DDPG checkpoint incompatibile: {dp}\n"
+            "Verifica che state_dim e action_dim corrispondano al training."
+        )
+    log.info(f"DDPG: {os.path.basename(dp)} | state={state_dim} action={action_dim}")
 
     norm = ObsNormalizer(state_dim=state_dim, clip=5.0)
-    if os.path.exists(np_):
-        norm.load(np_)
-    else:
-        log.warning(f"Normalizer non trovato ({np_}), statistiche vuote")
-    return agent, norm
+    # Prova prima normalizer_2m.npz, poi il fallback normalizer_2m_final.npz
+    # (trade.py salva il best come normalizer_2m.npz e il finale come normalizer_2m_final.npz)
+    norm_candidates = [np_, np_.replace(".npz", "_final.npz")]
+    loaded_norm = False
+    for nc in norm_candidates:
+        if os.path.exists(nc):
+            norm.load(nc)
+            loaded_norm = True
+            break
+    if not loaded_norm:
+        log.warning(f"Normalizer non trovato ({np_}), uso statistiche vuote — "
+                    "le predizioni potrebbero essere instabili")
+
+    # Indici dei ticker tradabili all'interno di all_tickers
+    # Usati per estrarre le azioni corrette dal vettore completo
+    tradeable_indices = [i for i, t in enumerate(all_tickers) if t in set(tradeable)]
+    log.info(f"Ticker tradabili: {len(tradeable)}/{len(all_tickers)} "
+             f"(indici {tradeable_indices[:3]}...)")
+
+    return agent, norm, tradeable_indices
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -451,10 +482,13 @@ def run_alpaca(cfg) -> None:
     state_dim = 2 * num_features + len(all_tickers) + 2 + N_THERMO
     log.info(f"state_dim={state_dim} (F={num_features} ALL_T={len(all_tickers)} tradeable={len(tradeable)} thm={N_THERMO})")
 
-    agent, normalizer = _load_agent(cfg, state_dim, len(tradeable), device, log)
+    agent, normalizer, tradeable_indices = _load_agent(
+        cfg, state_dim, all_tickers, tradeable, device, log
+    )
 
     from modelli.thermo_state_builder import ThermoStateBuilder
     thermo_builder = ThermoStateBuilder(interval=freq)
+
 
     # ── Connessione ────────────────────────────────────────────────────────
     tc, dc = _init_alpaca(log)
@@ -504,15 +538,34 @@ def run_alpaca(cfg) -> None:
             if bars.empty or len(bars) < p["warmup_bars"]:
                 log.info(f"Warm-up: {len(bars)}/{p['warmup_bars']} barre"); continue
 
-            # 2. Frame completo (tutti i training tickers, non-tradeable = 0)
-            full = pd.DataFrame(0.0, index=bars.index, columns=all_tickers)
+            # 2. Frame completo a 58 colonne (51 ticker + 7 thermo)
+            # Il MinMaxScaler è stato fittato su 58 feature — le thermo
+            # devono essere incluse nello stesso ordine del training.
+            _THERMO_COLS = ["Thm_Pressure","Thm_Temperature","Thm_Work",
+                            "Thm_Stress","Thm_Efficiency","Thm_Entropy","Thm_Regime"]
+            all_cols_58 = all_tickers + _THERMO_COLS
+
+            # 2a. Calcola thermo PRIMA dello scaling (serve per il frame)
+            try:
+                thermo_df = thermo_builder.build(bars, tradeable)
+            except Exception as e:
+                log.warning(f"Thermo: {e}")
+                thermo_df = pd.DataFrame()
+
+            # 2b. Costruisce il frame con prezzi + thermo
+            full = pd.DataFrame(0.0, index=bars.index, columns=all_cols_58)
             for t in tradeable:
                 if t in bars.columns and t in all_tickers:
                     full[t] = bars[t].values
+            if not thermo_df.empty:
+                for col in _THERMO_COLS:
+                    if col in thermo_df.columns:
+                        aligned = thermo_df[col].reindex(full.index).ffill().bfill().fillna(0.0)
+                        full[col] = aligned.values
 
             # 3. Scaling
             try:
-                scaled = scaler.transform(full.values)
+                scaled = scaler.transform(full)
             except Exception as e:
                 log.error(f"Scaling: {e}"); continue
 
@@ -528,11 +581,7 @@ def run_alpaca(cfg) -> None:
                     out = out[:, 0, :]
                 pred = out.cpu().numpy()
 
-            # 5. Thermo
-            try:
-                thermo_df = thermo_builder.build(bars, tradeable)
-            except Exception as e:
-                log.warning(f"Thermo: {e}"); thermo_df = pd.DataFrame()
+            # 5. thermo_df già calcolato al passo 2a — non ricalcolare
 
             # 6. Portafoglio
             account = _fetch_account(tc)
@@ -550,7 +599,9 @@ def run_alpaca(cfg) -> None:
                 state_raw = (np.pad(state_raw, (0, state_dim - len(state_raw)))
                              if len(state_raw) < state_dim else state_raw[:state_dim])
 
-            actions = agent.act(normalizer.normalize(state_raw, update=False), explore=False)
+            actions_full = agent.act(normalizer.normalize(state_raw, update=False), explore=False)
+            # Estrai solo le azioni per i ticker tradabili (sottoinsieme di all_tickers)
+            actions = actions_full[tradeable_indices]
 
             # Log segnali
             sig = [(tradeable[i], float(a)) for i, a in enumerate(actions)
@@ -800,7 +851,9 @@ def run_alpaca_replay(cfg) -> None:
     N_THERMO  = 7
     state_dim = 2 * num_features + len(all_tickers) + 2 + N_THERMO
     log.info(f"state_dim={state_dim} (F={num_features} ALL_T={len(all_tickers)} tradeable={len(tradeable)} thm={N_THERMO})")
-    agent, normalizer = _load_agent(cfg, state_dim, len(tradeable), device, log)
+    agent, normalizer, tradeable_indices = _load_agent(
+        cfg, state_dim, all_tickers, tradeable, device, log
+    )
 
     from modelli.thermo_state_builder import ThermoStateBuilder
     thermo_builder = ThermoStateBuilder(interval=freq)
@@ -844,15 +897,34 @@ def run_alpaca_replay(cfg) -> None:
         window_raw = all_bars.iloc[bar_i - ws: bar_i]
         ts         = all_bars.index[bar_i]
 
-        # Frame completo (tutti i training tickers)
-        full = pd.DataFrame(0.0, index=window_raw.index, columns=all_tickers)
+        # Frame completo a 58 colonne (51 ticker + 7 thermo)
+        # Il MinMaxScaler è fittato su 58 feature — le thermo devono
+        # essere incluse nello stesso ordine usato durante il training.
+        _THERMO_COLS = ["Thm_Pressure","Thm_Temperature","Thm_Work",
+                        "Thm_Stress","Thm_Efficiency","Thm_Entropy","Thm_Regime"]
+        all_cols_58 = all_tickers + _THERMO_COLS
+
+        # Calcola thermo PRIMA dello scaling (serve sia per il frame che per lo stato)
+        try:
+            thermo_df = thermo_builder.build(window_raw, tradeable)
+        except Exception:
+            thermo_df = pd.DataFrame()
+
+        # Costruisce frame prezzi + thermo
+        full = pd.DataFrame(0.0, index=window_raw.index, columns=all_cols_58)
         for t in tradeable:
             if t in window_raw.columns and t in all_tickers:
                 full[t] = window_raw[t].values
+        if not thermo_df.empty:
+            for col in _THERMO_COLS:
+                if col in thermo_df.columns:
+                    aligned = thermo_df[col].reindex(full.index).ffill().bfill().fillna(0.0)
+                    full[col] = aligned.values
 
         # Scaling
         try:
-            scaled = scaler.transform(full.values)
+            
+            scaled = scaler.transform(full)
         except Exception as e:
             log.warning(f"Scaling step {step_n}: {e}")
             continue
@@ -865,11 +937,7 @@ def run_alpaca_replay(cfg) -> None:
                 out = out[:, 0, :]
             pred = out.cpu().numpy()
 
-        # Thermo (su finestra mobile)
-        try:
-            thermo_df = thermo_builder.build(window_raw, tradeable)
-        except Exception:
-            thermo_df = pd.DataFrame()
+        # thermo_df già calcolato sopra — non ricalcolare
 
         # Prezzi correnti (ultima barra della finestra)
         prices = {t: float(all_bars[t].iloc[bar_i])
@@ -895,7 +963,9 @@ def run_alpaca_replay(cfg) -> None:
             state_raw = (np.pad(state_raw, (0, state_dim - len(state_raw)))
                          if len(state_raw) < state_dim else state_raw[:state_dim])
 
-        actions = agent.act(normalizer.normalize(state_raw, update=False), explore=False)
+        actions_full = agent.act(normalizer.normalize(state_raw, update=False), explore=False)
+        # Estrai solo le azioni per i ticker tradabili
+        actions = actions_full[tradeable_indices]
 
         # Esegui ordini (simulati localmente)
         positions, cash, orders = _replay_execute(

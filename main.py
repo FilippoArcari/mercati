@@ -247,7 +247,7 @@ def my_app(cfg: DictConfig) -> None:
             print(f"Esegui prima: uv run main.py step=train frequency={freq}")
             return
 
-        checkpoint     = torch.load(pred_path, weights_only=False)
+        checkpoint     = torch.load(pred_path, map_location=device, weights_only=False)
         saved_features = checkpoint.get("num_features", num_features)
         predictor      = build_predictor(cfg, saved_features).to(device)
         predictor.load_state_dict(checkpoint["model_state_dict"])

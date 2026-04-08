@@ -400,7 +400,7 @@ def run_trade(
         print(f"Esegui prima: uv run main.py step=train frequency={freq}")
         return
 
-    checkpoint   = torch.load(pred_path, weights_only=False)
+    checkpoint   = torch.load(pred_path, map_location=torch.device('cuda' if torch.cuda.is_available() else 'cpu'), weights_only=False)
     num_features = checkpoint.get("num_features", df.shape[1])
     predictor    = _load_predictor(cfg, num_features, checkpoint)
     scaler       = checkpoint["scaler"]
@@ -675,7 +675,7 @@ def run_walk_forward(
         print(f"  Esegui prima: uv run main.py step=train frequency={freq}")
         return WalkForwardReport(mode=mode)
 
-    checkpoint   = torch.load(pred_path, weights_only=False)
+    checkpoint   = torch.load(pred_path, map_location=torch.device('cuda' if torch.cuda.is_available() else 'cpu'), weights_only=False)
     num_features = checkpoint.get("num_features", df.shape[1])
     predictor    = _load_predictor(cfg, num_features, checkpoint)
     scaler       = checkpoint["scaler"]
