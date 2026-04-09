@@ -66,6 +66,16 @@ CANONICAL_COLS = [
     "Thm_Regime",
 ]
 
+# Colonne estese: calcolate e disponibili nel thermo_df per TradingEnv
+# (vengono incluse nello stato del DDPG tramite il prefisso Thm_),
+# ma ESCLUSE da CANONICAL_COLS per non alterare il numero di canali
+# della CNN già addestrata (58 canali). Per includerle nella CNN
+# occorre ri-addestrare il predictor con il nuovo dataset.
+EXTENDED_THERMO_COLS = [
+    "Thm_GibbsEnergy",   # G = H - T·S  (G<0 = processo spontaneo → trade favorevole)
+    "Thm_StressAccel",   # d²(Stress)/dt²  (stress sta accelerando → sell anticipato)
+]
+
 # Finestre adattive per frequenza
 _WINDOWS = {
     "daily":   {"pressure": 20, "entropy": 20, "stress": 60, "efficiency": 10},
@@ -351,6 +361,22 @@ class ThermoStateBuilder:
         result["Thm_Entropy"]     = _sanitize(ent_norm, fill=0.5)
         result["Thm_Regime"]      = regime
 
+        # ── Gibbs Free Energy: G = H - T·S ─────────────────────────────────
+        # H (entalpia) ≈ pressione × |lavoro| → energia contenuta nel trend corrente.
+        # T = temperatura (agitazione locale), S = entropia (disordine).
+        # G < 0 → processo spontaneo → trade energeticamente favorevole.
+        # G > 0 → processo non spontaneo → il mercato sta "forzando" il movimento.
+        H_raw = base["raw_pressure"].abs() * (base["raw_work"].abs() + 1e-8)
+        G_raw = H_raw - base["raw_temperature"] * base["raw_entropy"]
+        result["Thm_GibbsEnergy"] = _sanitize(_norm_minmax(_sanitize(G_raw)))
+
+        # ── Stress Acceleration: d²(Stress)/dt² ────────────────────────────
+        # Derivata seconda dello stress. Positivo = stress accelera verso l'alto
+        # (sell anticipato). Usata in TradingEnv [Fix #15] per il bonus sell precoce.
+        d1_stress = result["Thm_Stress"].diff()
+        d2_stress = d1_stress.diff()
+        result["Thm_StressAccel"] = _sanitize(d2_stress.clip(-3.0, 3.0), fill=0.0)
+
         # ── Psi per ticker (daily only) ─────────────────────────────────────
         if self.is_daily:
             rates_col = _find_rates_col(df_raw)
@@ -378,12 +404,14 @@ class ThermoStateBuilder:
                 result = pd.concat([result, trust_df], axis=1)
                 result = result.ffill().bfill().fillna(0.0)
 
-        n_trust = len([c for c in result.columns if c.startswith("Trust_")])
-        n_psi   = len([c for c in result.columns if c.startswith("Thm_Psi")])
+        n_trust    = len([c for c in result.columns if c.startswith("Trust_")])
+        n_psi      = len([c for c in result.columns if c.startswith("Thm_Psi")])
+        n_extended = len([c for c in result.columns if c in EXTENDED_THERMO_COLS])
         print(
             f"[ThermoBuilder] {'Daily' if self.is_daily else 'Intraday'} | "
             f"{len(result.columns)} col totali: "
-            f"{len(CANONICAL_COLS)} canonical + {n_psi} Psi + {n_trust} Trust"
+            f"{len(CANONICAL_COLS)} canonical + {n_extended} extended "
+            f"+ {n_psi} Psi + {n_trust} Trust"
         )
         return result
 

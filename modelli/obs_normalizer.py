@@ -22,6 +22,7 @@ Utilizzo tipico:
 from __future__ import annotations
 
 import numpy as np
+from typing import Callable, Optional
 
 
 # ─── Running Mean / Variance (Welford online algorithm) ───────────────────────
@@ -39,17 +40,13 @@ class RunningMeanStd:
         self.count   = epsilon   # evita divisione per zero al primo step
 
     def update(self, x: np.ndarray) -> None:
-        """
-        Aggiorna con un singolo campione (1-D) o un batch (2-D: batch x features).
-        """
         x = np.asarray(x, dtype=np.float64)
         if x.ndim == 1:
-            x = x[np.newaxis, :]          # (1, features)
+            x = x[np.newaxis, :]
 
         batch_count = x.shape[0]
         batch_mean  = x.mean(axis=0)
         batch_var   = x.var(axis=0)
-
         self._parallel_update(batch_mean, batch_var, batch_count)
 
     def _parallel_update(
@@ -58,10 +55,8 @@ class RunningMeanStd:
         batch_var:   np.ndarray,
         batch_count: int,
     ) -> None:
-        """Chan's parallel variance formula — combina statistiche di due gruppi."""
-        total = self.count + batch_count
-        delta = batch_mean - self.mean
-
+        total    = self.count + batch_count
+        delta    = batch_mean - self.mean
         new_mean = self.mean + delta * batch_count / total
         m_a      = self.var   * self.count
         m_b      = batch_var  * batch_count
@@ -85,13 +80,8 @@ class ObsNormalizer:
     Parametri
     ---------
     state_dim : int
-        Dimensione del vettore di stato.
-    clip : float
-        Valore massimo (assoluto) dopo la normalizzazione.
-        Default 5.0 — i valori oltre +-5 sigma vengono troncati, riducendo
-        l'influenza degli outlier senza perdere il segno.
-    epsilon : float
-        Piccolo valore aggiunto a std per evitare divisioni per zero.
+    clip      : float — valore massimo (assoluto) dopo la normalizzazione.
+    epsilon   : float — aggiunto a std per evitare divisioni per zero.
     """
 
     def __init__(self, state_dim: int, clip: float = 5.0, epsilon: float = 1e-8):
@@ -100,73 +90,79 @@ class ObsNormalizer:
         self.epsilon = epsilon
 
     def normalize(self, obs: np.ndarray, update: bool = True) -> np.ndarray:
-        """
-        Normalizza l'osservazione.
-
-        Parameters
-        ----------
-        obs    : np.ndarray — stato grezzo da TradingEnv
-        update : bool
-            True  -> aggiorna le statistiche (usa durante il training)
-            False -> applica solo la trasformazione (usa in eval/produzione)
-
-        Returns
-        -------
-        np.ndarray float32 — stato normalizzato, clippato in [-clip, +clip]
-        """
         obs = np.asarray(obs, dtype=np.float64)
-
         if update:
             self.rms.update(obs)
-
         normalized = (obs - self.rms.mean) / (self.rms.std + self.epsilon)
-        clipped    = np.clip(normalized, -self.clip, self.clip)
-
-        return clipped.astype(np.float32)
-
-    # ── persistenza ───────────────────────────────────────────────────────────
+        return np.clip(normalized, -self.clip, self.clip).astype(np.float32)
 
     def save(self, path: str) -> None:
-        np.savez(
-            path,
-            mean  = self.rms.mean,
-            var   = self.rms.var,
-            count = np.array([self.rms.count]),
-        )
+        np.savez(path, mean=self.rms.mean, var=self.rms.var,
+                 count=np.array([self.rms.count]))
         print(f"[ObsNormalizer] Statistiche salvate -> {path}  (n={self.rms.count:.0f})")
 
     def load(self, path: str) -> None:
-        data = np.load(path)
+        data           = np.load(path)
         self.rms.mean  = data["mean"]
         self.rms.var   = data["var"]
         self.rms.count = float(data["count"][0])
         print(f"[ObsNormalizer] Statistiche caricate <- {path}  (n={self.rms.count:.0f})")
 
 
-# ─── Integrazione con train_ddpg ──────────────────────────────────────────────
+# ─── Training loop normalizzato ───────────────────────────────────────────────
 
 def train_ddpg_normalized(
     agent,
     env,
-    normalizer:   ObsNormalizer,
-    n_episodes:   int   = 200,
-    warmup:       int   = 1000,
-    log_every:    int   = 10,
-    noise_decay:  float = 0.995,
-    noise_floor:  float = 0.05,
-    es_patience:  int   = 20,
-    es_metric:    str   = "sharpe",
-    best_path:    str | None = None,
-    norm_path:    str | None = None,
+    normalizer:            ObsNormalizer,
+    n_episodes:            int   = 200,
+    warmup:                int   = 1000,
+    log_every:             int   = 10,
+    noise_decay:           float = 0.995,
+    noise_floor:           float = 0.05,
+    es_patience:           int   = 20,
+    es_metric:             str   = "sharpe",
+    best_path:             str | None = None,
+    norm_path:             str | None = None,
+    episodic_episodes:     int   = 20,
+    # ── [NUOVO] Tau dinamico ────────────────────────────────────────────────
+    # Callable(step: int) → float che ritorna Thm_Stress al passo dato.
+    # Se None il tau rimane fisso (comportamento originale).
+    thermo_stress_fn:      Optional[Callable[[int], float]] = None,
+    # ── [NUOVO] Curriculum episodico ────────────────────────────────────────
+    # Se True, curriculum_ratio sale da 0 a 1 nelle prime curriculum_warmup_eps
+    # epoche. L'episodic buffer campiona solo dai migliori episodi all'inizio,
+    # poi progressivamente da tutti (vedi EpisodicReplayBuffer.sample).
+    use_curriculum:        bool  = True,
+    curriculum_warmup_eps: int   = None,   # default = n_episodes // 2
 ) -> list[dict]:
     """
     Drop-in replacement di train_ddpg con normalizzazione online.
 
-    Differenze chiave rispetto alla versione base:
-      - Ogni stato raw viene normalizzato prima di essere passato all'agente
-      - update=True durante il training, update=False per eval
-      - Il normalizer viene salvato insieme al checkpoint del modello
+    Novità rispetto alla versione base
+    -----------------------------------
+    - Normalizzazione RunningMeanStd online (update=True in training).
+    - EpisodicReplayBuffer: conserva i migliori K episodi per Sharpe e
+      arricchisce le batch (30% episodic / 70% uniform).
+    - Tau dinamico termodinamico: se `thermo_stress_fn` è fornita, tau
+      viene aggiornato ogni step in base a Thm_Stress tramite sigmoid invertita.
+      Stress alto → tau basso (target network si congela, comportamento stabile).
+      Stress basso → tau alto (apprendimento aggressivo).
+    - Curriculum episodico: nelle prime `curriculum_warmup_eps` epoche l'episodic
+      buffer campiona solo dal top 25% degli episodi, salendo gradualmente al 100%.
     """
+    from modelli.ddpg import EpisodicReplayBuffer
+
+    # ── Attiva il buffer episodico sull'agente ─────────────────────────────
+    if episodic_episodes > 0:
+        agent.episodic_buffer = EpisodicReplayBuffer(
+            max_episodes=episodic_episodes,
+            device=agent.device,
+        )
+    else:
+        agent.episodic_buffer = None
+
+    warmup_eps   = curriculum_warmup_eps or (n_episodes // 2)
     history      = []
     total_step   = 0
     best_metric  = -float("inf")
@@ -174,14 +170,23 @@ def train_ddpg_normalized(
 
     for ep in range(1, n_episodes + 1):
         raw_state = env.reset()
-        # update=True: le prime osservazioni calibrano le statistiche
-        state = normalizer.normalize(raw_state, update=True)
+        state     = normalizer.normalize(raw_state, update=True)
         agent.reset_noise()
+
+        # [NUOVO] Curriculum ratio: sale linearmente 0→1 in warmup_eps episodi
+        if use_curriculum and agent.episodic_buffer is not None:
+            agent._curriculum_ratio = min(1.0, (ep - 1) / max(1, warmup_eps))
+        else:
+            agent._curriculum_ratio = 1.0
+
+        # [NUOVO] Segnala l'inizio di un nuovo episodio al buffer episodico
+        if agent.episodic_buffer is not None:
+            agent.episodic_buffer.start_episode()
 
         ep_reward     = 0.0
         critic_losses = []
         actor_losses  = []
-        done = False
+        done          = False
 
         while not done:
             if total_step < warmup:
@@ -190,10 +195,16 @@ def train_ddpg_normalized(
                 action = agent.act(state, explore=True)
 
             raw_next, reward, done, info = env.step(action)
-            # Normalizza il next_state (update=True: continua ad affinare le stats)
             next_state = normalizer.normalize(raw_next, update=True)
 
             agent.store(state, action, reward, next_state, done)
+
+            # [NUOVO] Aggiorna tau in base allo stress termodinamico corrente.
+            # env._step è già avanzato di 1 dopo step(), leggiamo step-1.
+            if thermo_stress_fn is not None:
+                current_step = info.get("step", total_step) - 1
+                stress       = thermo_stress_fn(max(0, current_step))
+                agent.update_tau_from_thermo(stress)
 
             losses = agent.update()
             if losses:
@@ -210,19 +221,25 @@ def train_ddpg_normalized(
         portfolio = env.portfolio_history()[-1]
         max_dd    = env.max_drawdown()
 
+        # [NUOVO] Chiudi l'episodio nel buffer episodico
+        if agent.episodic_buffer is not None:
+            agent.episodic_buffer.end_episode(sharpe=sharpe)
+
         ep_info = {
-            "episode":         ep,
-            "total_reward":    ep_reward,
-            "portfolio_value": portfolio,
-            "sharpe":          sharpe,
-            "max_drawdown":    max_dd,
-            "noise_sigma":     agent.noise.sigma,
-            "critic_loss":     float(np.mean(critic_losses)) if critic_losses else None,
-            "actor_loss":      float(np.mean(actor_losses))  if actor_losses  else None,
+            "episode":          ep,
+            "total_reward":     ep_reward,
+            "portfolio_value":  portfolio,
+            "sharpe":           sharpe,
+            "max_drawdown":     max_dd,
+            "noise_sigma":      agent.noise.sigma,
+            "tau":              agent.tau,
+            "curriculum_ratio": agent._curriculum_ratio,
+            "critic_loss":      float(np.mean(critic_losses)) if critic_losses else None,
+            "actor_loss":       float(np.mean(actor_losses))  if actor_losses  else None,
         }
         history.append(ep_info)
 
-        metric_map = {"sharpe": sharpe, "portfolio": portfolio, "reward": ep_reward}
+        metric_map     = {"sharpe": sharpe, "portfolio": portfolio, "reward": ep_reward}
         current_metric = metric_map.get(es_metric, sharpe)
 
         if current_metric > best_metric:
@@ -231,14 +248,24 @@ def train_ddpg_normalized(
             if best_path:
                 agent.save(best_path, tag=f"BEST ep{ep} {es_metric}={best_metric:.4f}")
             if norm_path:
-                normalizer.save(norm_path)   # salva le stats insieme al modello
+                normalizer.save(norm_path)
         else:
             no_improve += 1
 
         if ep % log_every == 0:
             cl = f"{ep_info['critic_loss']:.5f}" if ep_info["critic_loss"] else "n/a"
             al = f"{ep_info['actor_loss']:.5f}"  if ep_info["actor_loss"]  else "n/a"
+
             best_tag = " ★" if no_improve == 0 else f" (no improve: {no_improve}/{es_patience})"
+
+            ep_buf_tag = ""
+            if agent.episodic_buffer is not None and agent.episodic_buffer.n_episodes > 0:
+                ep_buf_tag = (
+                    f" | EpBuf: {agent.episodic_buffer.n_episodes}ep"
+                    f" best={agent.episodic_buffer.best_sharpe:.2f}"
+                    f" curr={agent._curriculum_ratio:.2f}"
+                )
+
             print(
                 f"Ep {ep:4d}/{n_episodes} | "
                 f"Reward: {ep_reward:+.4f} | "
@@ -246,8 +273,9 @@ def train_ddpg_normalized(
                 f"Sharpe: {sharpe:.3f} | "
                 f"MaxDD: {max_dd:.3f} | "
                 f"sigma: {agent.noise.sigma:.3f} | "
+                f"τ: {agent.tau:.4f} | "
                 f"C: {cl} | A: {al}"
-                f"{best_tag}"
+                f"{best_tag}{ep_buf_tag}"
             )
 
         if es_patience > 0 and no_improve >= es_patience:
@@ -259,4 +287,3 @@ def train_ddpg_normalized(
             break
 
     return history
-

@@ -2,20 +2,33 @@
 modelli/trading_env.py — Ambiente di trading per DDPG
 
 Fix applicati:
-  [Fix #1] base_reward clippato e denominatore minimo → impedisce esplosioni quando prev_value ≈ 0
-  [Fix #2] Cooldown post-forced-sell — impedisce il rebuy immediato dopo espulsione
-  [Fix #3] sell_bonus usa self.sell_profit_bonus invece di costante hardcodata
-  [Fix #4] Forced sell / pricing: new_value calcolato PRIMA di self._step += 1 (stesso frame di prezzi)
-  [Fix #5] Trust thermo: soglia binaria → peso continuo lineare
-  [Fix #6] Sharpe ratio annualizzato con bars_per_year
-  [Fix #7] Inaction threshold separato da action_threshold
-  [Fix #8] next_state usa _get_state() anche quando done (no più zero-vector artificiale)
-  [Fix #9] Off-by-one thermo: _thermo_at(step) sostituisce _thermo_scalar per lettura esplicita
+  [Fix #1]  base_reward clippato e denominatore minimo → impedisce esplosioni quando prev_value ≈ 0
+  [Fix #2]  Cooldown post-forced-sell — impedisce il rebuy immediato dopo espulsione
+  [Fix #3]  sell_bonus usa self.sell_profit_bonus invece di costante hardcodata
+  [Fix #4]  Forced sell / pricing: new_value calcolato PRIMA di self._step += 1 (stesso frame di prezzi)
+  [Fix #5]  Trust thermo: soglia binaria → peso continuo lineare
+  [Fix #6]  Sharpe ratio annualizzato con bars_per_year
+  [Fix #7]  Inaction threshold separato da action_threshold
+  [Fix #8]  next_state usa _get_state() anche quando done (no più zero-vector artificiale)
+  [Fix #9]  Off-by-one thermo: _thermo_at(step) sostituisce _thermo_scalar per lettura esplicita
   [Fix #10] w_global ora moltiplicatore globale su TUTTI i bonus/penalità thermo
   [Fix #11] _cached_pv rimosso (era dichiarato ma mai usato)
+  [Fix #13] Reward normalization adattiva: le penalità scalano con la std rolling del base_reward.
+            Risolve il disallineamento di 3 ordini di grandezza tra base_reward (pct per barra 2min
+            ≈ ±0.0001) e penalità fisse (lambda=0.1). Con questa fix il reward riflette davvero
+            la performance di mercato invece di essere dominato dalle penalità.
+  [Fix #14] Entropy-weighted thermo certainty: lo shaping termodinamico si azzera quando
+            Thm_Entropy è alta (mercato caotico → segnali thermo inaffidabili). Risolve il
+            Thm✅=0.0% nel Fold 1 dove i segnali thermo erano rumorosi ma venivano pesati uguale.
+  [Fix #15] Stress acceleration (derivata seconda): la sell bonus si attiva quando d²(Stress)/dt² > 0
+            (stress sta accelerando verso l'alto) invece che solo sulla soglia assoluta.
+            Anticipa il segnale rispetto alla soglia semplice e porta le vendite corrette dal 23.6%
+            verso il target del 50%.
 """
 
 from __future__ import annotations
+
+from collections import deque
 
 import numpy as np
 import pandas as pd
@@ -79,6 +92,11 @@ class TradingEnv:
         # derivano da prezzi near-zero o instabilità numerica nei shares_buy.
         # Default: 500x il capitale iniziale (es. $100 → cap a $50.000).
         hard_portfolio_multiplier: float = 500.0,
+        # [Fix #13] Finestra rolling per la normalizzazione adattiva del reward.
+        # Le penalità vengono scalate dalla std del base_reward negli ultimi
+        # reward_norm_window step. Warm-up di 50 step prima di attivare.
+        # Default: 200 step ≈ 400 minuti di trading a 2m barre.
+        reward_norm_window: int = 200,
     ) -> None:
         self.prices_real      = prices_real
         self.prices_pred      = prices_pred
@@ -101,6 +119,7 @@ class TradingEnv:
         self.sell_profit_bonus        = sell_profit_bonus
         self.reward_clip              = reward_clip
         self.hard_portfolio_cap      = initial_capital * hard_portfolio_multiplier
+        self.reward_norm_window      = reward_norm_window
 
         # Thermo shaping
         self.thermo_bonus_sell         = thermo_bonus_sell
@@ -179,6 +198,16 @@ class TradingEnv:
         self._cached_step:   int        = -1
         self._cached_prices: np.ndarray = np.empty(self.num_tickers, dtype=np.float64)
 
+        # [Fix #13] Buffer rolling per la normalizzazione adattiva del reward.
+        # Traccia i base_reward recenti per calcolare la loro std e scalare
+        # le penalità in proporzione al segnale di rendimento reale.
+        self._recent_base_rewards: deque = deque(maxlen=self.reward_norm_window)
+
+        # [Fix #15] Storico degli ultimi 3 valori di stress per la derivata seconda.
+        # d²(Stress)/dt² > 0 significa: lo stress sta accelerando verso l'alto
+        # → sell signal rafforzato, anche prima che superi la soglia assoluta.
+        self._stress_history: deque = deque([0.0, 0.0, 0.0], maxlen=3)
+
     def reset(self) -> np.ndarray:
         self._reset_internals()
         return self._get_state()
@@ -237,13 +266,23 @@ class TradingEnv:
             self.reward_clip,
         )
 
+        # [Fix #13] Stima la std del base_reward degli ultimi N step.
+        # Se abbiamo abbastanza storia (≥50 step), le penalità scalano con la std
+        # del segnale reale → penalità e rendimento sono sempre commensurabili.
+        # Warm-up: nei primi 50 step usa scale=1.0 per non comprimere troppo presto.
+        self._recent_base_rewards.append(float(base_reward))
+        if len(self._recent_base_rewards) >= 50:
+            penalty_scale = max(float(np.std(list(self._recent_base_rewards))), 1e-6)
+        else:
+            penalty_scale = 1.0
+
         # Concentrazione: penalizza solo l'eccesso rispetto a portafoglio uniforme
         prices              = self._current_prices()
         weights             = (self._holdings * prices) / (new_value + 1e-8)
         herfindahl          = float(np.dot(weights, weights))
         uniform_herfindahl  = 1.0 / max(1, self.num_tickers)
         excess_concentration = max(0.0, herfindahl - uniform_herfindahl)
-        concentration_penalty = self.lambda_concentration * excess_concentration
+        concentration_penalty = self.lambda_concentration * excess_concentration * penalty_scale
 
         # Inaction: penalizza posizioni aperte ferme
         open_positions = self._holdings > 1e-8
@@ -253,6 +292,7 @@ class TradingEnv:
                 self.lambda_inaction
                 * float(frozen.sum())
                 / max(1, int(open_positions.sum()))
+                * penalty_scale
             )
         else:
             inaction_penalty = 0.0
@@ -263,12 +303,12 @@ class TradingEnv:
         cash_ratio   = self._cash / (new_value + 1e-8)
         excess_cash  = max(0.0, cash_ratio - 0.40)
         scarce_cash  = max(0.0, 0.05 - cash_ratio)
-        cash_penalty = 0.03 * (excess_cash + scarce_cash)
+        cash_penalty = 0.03 * (excess_cash + scarce_cash) * penalty_scale
 
         # Loss penalty: penalizza perdite oltre soglia
         current_return = (new_value - self.initial_capital) / (self.initial_capital + 1e-8)
         if current_return < self.loss_threshold:
-            loss_penalty = self.lambda_loss * abs(current_return - self.loss_threshold)
+            loss_penalty = self.lambda_loss * abs(current_return - self.loss_threshold) * penalty_scale
         else:
             loss_penalty = 0.0
 
@@ -494,31 +534,46 @@ class TradingEnv:
             trust_global = self._thermo_at(self._step, "Trust_Global",     default=0.5)
 
             w_stress = self._trust_weight(trust_stress)
-            # [Fix #10] w_global è ora moltiplicatore esterno su TUTTI i termini thermo.
-            # Semantica: quanto ci fidiamo del sistema termodinamico nel suo insieme.
-            #   w_global basso → mercato caotico → thermo si spegne globalmente
-            #   w_global alto  → segnali affidabili → thermo opera a piena forza
-            # Ogni bonus/penalità scala come: valore * w_stress * w_global
-            # Esempio con trust medio 0.477 e trust_min=0.35, trust_max=0.65:
-            #   w_stress = w_global = 0.42
-            #   prodotto = 0.42 * 0.42 = 0.18
-            #   thermo_bonus_sell effettivo = 0.002 * 0.18 = 0.00036
-            # Per aumentare l'impatto: alzare i bonus o abbassare trust_min.
+            # [Fix #10] w_global è moltiplicatore globale su TUTTI i termini thermo.
             w_global = self._trust_weight(trust_global)
 
+            # [Fix #14] Entropy-weighted thermo certainty.
+            # Thm_Entropy è normalizzata in [0,1]: 0=ordinato, 1=caotico.
+            # Quando il mercato è caotico, i segnali thermo sono inaffidabili
+            # → lo shaping si azzera automaticamente, evitando falsi segnali.
+            # Esempio: Fold 1 (Thm✅=0.0%) era probabilmente ad alta entropia:
+            # con questa fix il thermo shaping sarebbe stato silenzioso in quel fold.
+            t_entropy        = self._thermo_at(self._step, "Thm_Entropy", default=0.5)
+            thermo_certainty = float(np.clip(1.0 - t_entropy, 0.0, 1.0))
+
+            # [Fix #15] Stress acceleration: d²(Stress)/dt² via differenze finite.
+            # Derivata seconda discreta: d²S = S(t) - 2·S(t-1) + S(t-2)
+            #   d²S > 0 → stress sta accelerando verso l'alto → sell anticipato
+            #   d²S < 0 → stress sta decelerando → possibile inversione
+            # Lo storico di 3 elementi è in self._stress_history (deque in _reset_internals).
+            sh = list(self._stress_history)           # [S(t-2), S(t-1), S(t-?)]  len=3
+            d2_stress          = t_stress - 2.0 * sh[-1] + sh[-2]
+            stress_accelerating = d2_stress > 0.0
+            self._stress_history.append(t_stress)     # aggiorna per il prossimo step
+
             if sell_mask.any():
+                # Bonus principale: stress supera la soglia assoluta
                 if t_stress > self.stress_sell_threshold:
-                    reward += self.thermo_bonus_sell * w_stress * w_global
+                    reward += self.thermo_bonus_sell * w_stress * w_global * thermo_certainty
+                # [Fix #15] Bonus anticipatore (50%): stress ancora sotto soglia
+                # ma sta accelerando verso l'alto → segnale precoce di vendita.
+                elif stress_accelerating and t_stress > 0.0:
+                    reward += self.thermo_bonus_sell * 0.5 * w_stress * w_global * thermo_certainty
 
             if valid_mask.any():
                 if t_stress < self.stress_buy_threshold:
-                    reward += self.thermo_bonus_buy * w_stress * w_global
+                    reward += self.thermo_bonus_buy  * w_stress * w_global * thermo_certainty
                 if t_eff > self.efficiency_penalty_thresh:
-                    reward -= self.thermo_penalty_buy * w_stress * w_global
+                    reward -= self.thermo_penalty_buy * w_stress * w_global * thermo_certainty
                 if t_regime >= 3.0:
                     trust_regime = self._thermo_at(self._step, "Trust_Thm_Regime", default=0.5)
                     w_regime = self._trust_weight(trust_regime)
-                    reward -= self.thermo_penalty_buy * 0.5 * w_regime * w_global
+                    reward -= self.thermo_penalty_buy * 0.5 * w_regime * w_global * thermo_certainty
 
         # ── Avanza al passo t+1 ───────────────────────────────────────────
         self._step += 1

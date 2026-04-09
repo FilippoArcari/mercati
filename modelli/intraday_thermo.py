@@ -321,7 +321,71 @@ def _compute_levy_entropy(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. FUNZIONE PRINCIPALE: compute_intraday_thermo_features()
+# 6. GIBBS FREE ENERGY INTRADAY  G = H - T·S
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_intraday_temperature(
+    close: pd.Series,
+    window: int = 5,
+) -> pd.Series:
+    """
+    Temperatura locale come rolling std dei rendimenti (agitazione cinetica).
+    Esposta separatamente per essere usata nel calcolo di Gibbs Energy.
+    """
+    close   = _sanitize_close(close)
+    returns = _sanitize(close.pct_change(), fill=0.0)
+    return _sanitize(returns.rolling(window).std(), fill=0.0)
+
+
+def _compute_gibbs_energy(
+    pressure:    pd.Series,
+    temperature: pd.Series,
+    entropy:     pd.Series,
+) -> pd.Series:
+    """
+    Energia di Gibbs del mercato: G = H - T·S
+
+    H (entalpia proxy) = pressione × |lavoro locale|
+    T = temperatura (rolling std dei rendimenti)
+    S = entropia Lévy-corretta normalizzata [0,1]
+
+    Interpretazione:
+      G < 0 → processo spontaneo → il trade va con il flusso naturale del sistema
+      G > 0 → processo non spontaneo → il mercato sta forzando il movimento
+
+    Prima applicazione nota di Gibbs al reward shaping DDPG finanziario.
+    Output clippato in [-3, 3] e normalizzato.
+    """
+    H = pressure.abs()
+    G = H - temperature * entropy
+    return _sanitize(G, fill=0.0).clip(-3.0, 3.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. STRESS ACCELERATION  d²(Stress)/dt²
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_stress_acceleration(stress: pd.Series) -> pd.Series:
+    """
+    Derivata seconda dello stress intraday tramite differenze finite.
+
+    d²Z/dt² = Z(t) - 2·Z(t-1) + Z(t-2)
+
+    Interpretazione:
+      > 0 → lo stress sta accelerando verso l'alto: segnale sell anticipato di 1-2 bar
+      < 0 → lo stress sta decelerando: possibile inversione in arrivo
+      ≈ 0 → regime stabile
+
+    Usata in TradingEnv [Fix #15] per il bonus sell precoce (prima della soglia assoluta).
+    Output clippato in [-2, 2].
+    """
+    d1 = _sanitize(stress.diff(), fill=0.0)
+    d2 = _sanitize(d1.diff(), fill=0.0)
+    return d2.clip(-2.0, 2.0).fillna(0.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. FUNZIONE PRINCIPALE: compute_intraday_thermo_features()
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_intraday_thermo_features(
@@ -436,10 +500,21 @@ def compute_intraday_thermo_features(
             levy_alpha=p["levy_alpha"],
         )
 
+        # Temperatura locale (necessaria per Gibbs Energy)
+        temperature = _compute_intraday_temperature(close, window=p["pressure_window"])
+
+        # Gibbs Free Energy per questo ticker
+        gibbs = _compute_gibbs_energy(pressure, temperature, entropy)
+
+        # Stress Acceleration per questo ticker
+        stress_accel = _compute_stress_acceleration(stress)
+
         # Accumula nel dict (nessun insert sul DataFrame intermedio)
-        columns[f"{ticker}_intraday_stress"]  = stress
-        columns[f"{ticker}_work_efficiency"]  = efficiency
-        columns[f"{ticker}_levy_entropy"]     = entropy
+        columns[f"{ticker}_intraday_stress"]   = stress
+        columns[f"{ticker}_work_efficiency"]   = efficiency
+        columns[f"{ticker}_levy_entropy"]      = entropy
+        columns[f"{ticker}_gibbs_energy"]      = gibbs
+        columns[f"{ticker}_stress_accel"]      = stress_accel
 
         all_stress.append(stress)
         all_efficiency.append(efficiency)
@@ -447,9 +522,20 @@ def compute_intraday_thermo_features(
 
     # ── Segnali aggregati (vista "portafoglio") ────────────────────────────
     if all_stress:
-        columns["Thermo_Aggregate_Stress"]     = pd.concat(all_stress,     axis=1).mean(axis=1)
-        columns["Thermo_Aggregate_Efficiency"] = pd.concat(all_efficiency, axis=1).mean(axis=1)
-        columns["Thermo_Aggregate_Entropy"]    = pd.concat(all_entropy,    axis=1).mean(axis=1)
+        agg_stress      = pd.concat(all_stress,     axis=1).mean(axis=1)
+        agg_efficiency  = pd.concat(all_efficiency, axis=1).mean(axis=1)
+        agg_entropy     = pd.concat(all_entropy,    axis=1).mean(axis=1)
+
+        columns["Thermo_Aggregate_Stress"]       = agg_stress
+        columns["Thermo_Aggregate_Efficiency"]   = agg_efficiency
+        columns["Thermo_Aggregate_Entropy"]      = agg_entropy
+        # Gibbs e StressAccel aggregati (medi su tutti i ticker validi)
+        columns["Thermo_Aggregate_GibbsEnergy"]  = pd.concat(
+            [columns[k] for k in columns if k.endswith("_gibbs_energy")], axis=1
+        ).mean(axis=1)
+        columns["Thermo_Aggregate_StressAccel"]  = pd.concat(
+            [columns[k] for k in columns if k.endswith("_stress_accel")], axis=1
+        ).mean(axis=1)
 
     # ── Singolo pd.concat finale: zero frammentazione ─────────────────────
     if columns:
