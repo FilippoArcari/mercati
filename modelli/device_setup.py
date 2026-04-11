@@ -26,9 +26,16 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Union
+from typing import Union, List, Tuple
 
 import torch
+
+
+# ─── Compute capability minima supportata da PyTorch 2.x ─────────────────────
+# sm_60 (P100, GP100)       → NON supportato da torch>=2.0
+# sm_70 (V100, Titan V)     → primo supportato
+# Fonte: https://pytorch.org/get-started/locally/
+_MIN_CUDA_SM: Tuple[int, int] = (7, 0)
 
 
 # ─── Struttura DeviceConfig ───────────────────────────────────────────────────
@@ -84,7 +91,9 @@ def detect_device(force: str | None = None, verbose: bool = True) -> DeviceConfi
         Configurazione completa del device.
     """
     global _DEVICE_CFG
-    if _DEVICE_CFG is not None and force is None:
+    if force is not None:
+        _DEVICE_CFG = None   # reset esplicito quando richiesto
+    if _DEVICE_CFG is not None:
         return _DEVICE_CFG
 
     # ── Override: env var o parametro diretto ────────────────────────────────
@@ -129,22 +138,39 @@ def detect_device(force: str | None = None, verbose: bool = True) -> DeviceConfi
         backend_req = "cpu"
 
     if backend_req in ("cuda", "") and _cuda_available:
-        n_gpus  = torch.cuda.device_count()
-        gpu_name = torch.cuda.get_device_name(0) if n_gpus > 0 else "unknown"
-        nw      = min(4, os.cpu_count() or 1)
-        cfg = DeviceConfig(
-            device              = torch.device("cuda"),
-            backend             = "cuda",
-            n_accelerators      = n_gpus,
-            is_multi            = n_gpus > 1,
-            supports_pin_memory = True,
-            optimal_num_workers = nw,
-            hardware_label      = f"CUDA {n_gpus}×GPU ({gpu_name})",
-        )
-        if verbose:
-            print(f"[device_setup] Backend: {cfg.hardware_label}")
-        _DEVICE_CFG = cfg
-        return cfg
+        # ── Filtra GPU incompatibili con questa build PyTorch ─────────────────
+        compatible_gpus = _get_compatible_cuda_devices()
+        n_gpus_total    = torch.cuda.device_count()
+
+        if not compatible_gpus:
+            # Nessuna GPU utilizzabile (es. solo P100 sm_60 con torch>=2.0)
+            print(
+                f"[device_setup] ⚠️  {n_gpus_total} GPU rilevate ma nessuna compatibile "
+                f"con questa build PyTorch (min sm_{_MIN_CUDA_SM[0]}{_MIN_CUDA_SM[1]}) → fallback CPU"
+            )
+            # Lascia proseguire verso il blocco CPU
+        else:
+            n_gpus   = len(compatible_gpus)
+            gpu_name = torch.cuda.get_device_name(compatible_gpus[0])
+            nw       = min(4, os.cpu_count() or 1)
+            cfg = DeviceConfig(
+                device              = torch.device("cuda"),
+                backend             = "cuda",
+                n_accelerators      = n_gpus,
+                is_multi            = n_gpus > 1,
+                supports_pin_memory = True,
+                optimal_num_workers = nw,
+                hardware_label      = f"CUDA {n_gpus}×GPU ({gpu_name})",
+            )
+            if verbose:
+                if n_gpus < n_gpus_total:
+                    print(
+                        f"[device_setup] ℹ️  {n_gpus_total - n_gpus} GPU escluse (sm<70), "
+                        f"uso {n_gpus} GPU compatibili"
+                    )
+                print(f"[device_setup] Backend: {cfg.hardware_label}")
+            _DEVICE_CFG = cfg
+            return cfg
 
     # ── 3. CPU fallback ───────────────────────────────────────────────────────
     nw = min(4, os.cpu_count() or 1)
@@ -170,6 +196,36 @@ def _count_xla_cores() -> int:
         return xm.xrt_world_size()
     except Exception:
         return 1
+
+
+def _get_compatible_cuda_devices() -> List[int]:
+    """
+    Restituisce gli indici delle GPU CUDA compatibili con la build PyTorch corrente.
+
+    Filtra le GPU la cui compute capability è inferiore a ``_MIN_CUDA_SM``
+    (default sm_70 per PyTorch 2.x). Questo evita il crash
+    ``CUDA error: no kernel image is available for execution on the device``
+    che si verifica su GPU come la P100 (sm_60) con PyTorch>=2.0.
+
+    Returns
+    -------
+    List[int]
+        Lista di indici (es. [0, 1]) delle GPU effettivamente usabili.
+        Lista vuota se nessuna GPU supera la soglia.
+    """
+    compatible = []
+    for i in range(torch.cuda.device_count()):
+        cap  = torch.cuda.get_device_capability(i)
+        name = torch.cuda.get_device_name(i)
+        if cap >= _MIN_CUDA_SM:
+            compatible.append(i)
+        else:
+            print(
+                f"[device_setup] ⚠️  GPU {i} ({name}) sm_{cap[0]}{cap[1]} "
+                f"NON compatibile con questa build PyTorch "
+                f"(min sm_{_MIN_CUDA_SM[0]}{_MIN_CUDA_SM[1]}) → esclusa"
+            )
+    return compatible
 
 
 # ─── Wrapper retrocompatibile ─────────────────────────────────────────────────
