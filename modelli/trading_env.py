@@ -131,24 +131,37 @@ class TradingEnv(gym.Env):
         super().__init__()
 
         self.df               = df.sort_index()
+        # ── Ottimizzazione NumPy (Collo di Bottiglia CPU) ────────────────────
+        self._df_values       = self.df.values.astype(np.float32)
+        
         self.tickers          = tickers
         self.n_tickers        = len(tickers)
         self.initial_capital  = initial_capital
         self.max_position_pct = max_position_pct
         self.fee_pct          = fee_pct
         self.prediction_window = prediction_window
+        
         self.thermo_df        = thermo_df
+        self._has_thermo      = self.thermo_df is not None and not self.thermo_df.empty
+        if self._has_thermo:
+            self._thermo_values = self.thermo_df.values.astype(np.float32)
+            self._thermo_cols   = {col: i for i, col in enumerate(self.thermo_df.columns)}
+        else:
+            self._thermo_values = np.array([], dtype=np.float32)
+            self._thermo_cols   = {}
+
         self._reward_gate     = ThermodynamicRewardGate(thermo_reward_cfg)
 
-        # Mappa ticker → colonna prezzo
-        self._price_col: dict[str, str] = {}
+        # Mappa ticker → Indice array (velocissimo) invece di colonna stringa
+        self._price_col_idx: dict[str, int] = {}
+        df_cols = list(self.df.columns)
         for t in tickers:
             for candidate in (f"{t}_Close", f"{t}_close", "Close", "close", t):
-                if candidate in self.df.columns:
-                    self._price_col[t] = candidate
+                if candidate in df_cols:
+                    self._price_col_idx[t] = df_cols.index(candidate)
                     break
-            if t not in self._price_col:
-                self._price_col[t] = self.df.columns[0]
+            if t not in self._price_col_idx:
+                self._price_col_idx[t] = 0
 
         # Barre per anno
         diffs = self.df.index.to_series().diff().dt.total_seconds().dropna()
@@ -179,14 +192,14 @@ class TradingEnv(gym.Env):
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _price(self, step: int, ticker: str) -> float:
-        return float(self.df.iloc[step][self._price_col[ticker]])
+        # Costo: O(1) puro C-level, aggirando il .iloc di pandas
+        return float(self._df_values[step, self._price_col_idx[ticker]])
 
     def _thermo_val(self, col: str, default: float = 0.0) -> float:
-        if self.thermo_df is None or self.thermo_df.empty:
+        if not self._has_thermo or col not in self._thermo_cols:
             return default
-        idx = min(self.current_step, len(self.thermo_df) - 1)
-        row = self.thermo_df.iloc[idx]
-        return float(row[col]) if col in row.index else default
+        idx = min(self.current_step, len(self._thermo_values) - 1)
+        return float(self._thermo_values[idx, self._thermo_cols[col]])
 
     # ── Gym API ──────────────────────────────────────────────────────────────
 
@@ -215,7 +228,8 @@ class TradingEnv(gym.Env):
             return obs
 
     def _get_state(self, step: int) -> np.ndarray:
-        obs = self.df.iloc[step].values.astype(np.float32)
+        # Slice Numpy nativa (copia memoria non necessaria per forward)
+        obs = self._df_values[step]
 
         holdings_val = sum(
             self.positions[t] * self._price(step, t) for t in self.tickers
@@ -226,9 +240,9 @@ class TradingEnv(gym.Env):
         ], dtype=np.float32)
 
         thermo_state = np.array([], dtype=np.float32)
-        if self.thermo_df is not None and not self.thermo_df.empty:
-            idx = min(step, len(self.thermo_df) - 1)
-            thermo_state = self.thermo_df.iloc[idx].values.astype(np.float32)
+        if self._has_thermo:
+            idx = min(step, len(self._thermo_values) - 1)
+            thermo_state = self._thermo_values[idx]
 
         return np.concatenate([obs, port_state, thermo_state])
 

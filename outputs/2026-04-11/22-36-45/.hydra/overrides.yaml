@@ -1,0 +1,7 @@
+- step=trade
+- frequency=minute
+- training.epochs=1
+- buyer.n_episodes=2
+- training=minute
+- prediction=minute
+- buyer=minute

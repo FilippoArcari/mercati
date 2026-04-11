@@ -27,7 +27,7 @@ log_every:       1
 
 # ── Training ──────────────────────────────────────────────────────────────────
 n_episodes:  500
-batch_size:  256
+batch_size:  4096
 warmup:      5000
 es_patience: 75
 es_metric:   sharpe
@@ -67,7 +67,7 @@ ddpg:
   lr_critic:     0.0003
   gamma:         0.98
   tau:           0.005
-  update_every:  5
+  update_every:  50
   noise_sigma:   0.15
   noise_decay:   0.995
   noise_floor:   0.02
