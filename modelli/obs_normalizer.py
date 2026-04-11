@@ -83,6 +83,7 @@ def train_ddpg_normalized(
     n_episodes:  int                    = 50,
     normalizer:  Optional[ObsNormalizer] = None,
     norm_path:   Optional[str]           = None,
+    ckpt_path:   Optional[str]           = None,
     log_every:   int                    = 5,
     es_patience: int                    = 20,
     noise_decay: float                  = 0.995,
@@ -224,6 +225,8 @@ def train_ddpg_normalized(
             no_improve  = 0
             if norm_path:
                 normalizer.save(norm_path)
+            if ckpt_path and hasattr(agent, "save"):
+                agent.save(ckpt_path, tag=f"BEST Ep {ep}")
         else:
             no_improve += 1
 

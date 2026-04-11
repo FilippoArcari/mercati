@@ -391,6 +391,7 @@ def run_trade(
         normalizer  = normalizer,
         n_episodes  = buyer_cfg.n_episodes,
         norm_path   = norm_path,
+        ckpt_path   = ddpg_best_path,
         log_every   = buyer_cfg.log_every,
         es_patience = es_patience,
     )
