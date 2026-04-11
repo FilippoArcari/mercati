@@ -453,7 +453,7 @@ def run_trade(
     ept  = getattr(buyer_cfg, "efficiency_penalty_thresh", 1.5)
 
     env_train = TradingEnv(
-        prices_real=prices_real_train, prices_pred=prices_pred_train,
+        df=prices_real_train, prices_pred=prices_pred_train,
         tickers=tickers,
         initial_capital=buyer_cfg.initial_capital,
         transaction_cost=buyer_cfg.transaction_cost,
@@ -468,7 +468,7 @@ def run_trade(
         efficiency_penalty_thresh=ept,
     )
     env_test = TradingEnv(
-        prices_real=prices_real_test, prices_pred=prices_pred_test,
+        df=prices_real_test, prices_pred=prices_pred_test,
         tickers=tickers,
         initial_capital=buyer_cfg.initial_capital,
         transaction_cost=buyer_cfg.transaction_cost,
