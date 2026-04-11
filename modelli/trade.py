@@ -369,7 +369,7 @@ def run_trade(
     )
 
     norm_clip  = getattr(buyer_cfg, "obs_clip", 5.0)
-    normalizer = ObsNormalizer(state_dim=env_train.observation_space.shape[0], clip=norm_clip)
+    normalizer = ObsNormalizer(shape=env_train.observation_space.shape[0], clip=norm_clip)
 
     if os.path.exists(norm_path):
         normalizer.load(norm_path)
@@ -616,7 +616,7 @@ def run_walk_forward(
             episodic_episodes = getattr(buyer_cfg, "episodic_episodes", 20),
         )
         normalizer = ObsNormalizer(
-            state_dim = env_train.observation_space.shape[0],
+            shape = env_train.observation_space.shape[0],
             clip      = getattr(buyer_cfg, "obs_clip", 5.0),
         )
 
