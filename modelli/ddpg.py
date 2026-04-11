@@ -68,31 +68,13 @@ class ReplayBuffer:
 class EpisodicReplayBuffer:
     """
     Buffer episodico con curriculum graduato.
-
     Memorizza i migliori K episodi per Sharpe e li usa per arricchire le
     batch di training (split configurabile, default 30% episodic / 70% uniform).
-
-    [NUOVO] Curriculum graduato via `curriculum_ratio`:
-      ratio = 0.0 → campiona solo dal top 25% degli episodi (fase iniziale,
-                    l'agente impara dai comportamenti già vincenti)
-      ratio = 0.5 → top 62.5% (fase intermedia)
-      ratio = 1.0 → tutti gli episodi (comportamento standard, fase finale)
-
-    Razionale: nelle prime epoche il segnale di gradiente è già distorto dai
-    penalty del reward (vedi reward sistematicamente negativo a -100/-200 anche
-    con portfolio in crescita). Ancorare il learning sui migliori episodi
-    nelle fasi iniziali riduce la varianza e accelera la convergenza verso
-    comportamenti stabili, introducendo gradualmente episodi difficili man mano
-    che l'agente matura.
-
-    Ispirato a Episodic Memory in RL (Lengyel & Dayan, 2007), con curriculum
-    scheduling originale applicato al livello di episodio.
     """
 
     def __init__(self, max_episodes: int = 20, device: torch.device = None):
         self.max_episodes = max_episodes
         self.device       = device or torch.device("cpu")
-        # Lista di (sharpe, transitions) ordinata per Sharpe decrescente
         self._episodes:   List[Tuple[float, list]] = []
         self._current_ep: list = []
 
@@ -110,7 +92,6 @@ class EpisodicReplayBuffer:
         self._current_ep.append((state, action, reward, next_state, done))
 
     def end_episode(self, sharpe: float) -> None:
-        """Salva l'episodio; mantiene solo i migliori max_episodes per Sharpe."""
         if not self._current_ep:
             return
         self._episodes.append((sharpe, list(self._current_ep)))
@@ -120,24 +101,13 @@ class EpisodicReplayBuffer:
         self._current_ep = []
 
     def sample(self, batch_size: int, curriculum_ratio: float = 1.0) -> Optional[tuple]:
-        """
-        Campiona transizioni dagli episodi in memoria.
-
-        Args:
-            batch_size:        numero di transizioni da campionare.
-            curriculum_ratio:  float in [0, 1]. Controlla quanti episodi
-                               (ordinati per Sharpe desc) sono eligibili.
-                               0.0 → top 25%  |  1.0 → tutti (default).
-        """
         n_eps = len(self._episodes)
         if n_eps == 0:
             return None
 
-        # Calcola quanti episodi includere nella pool di campionamento
-        # min_frac=0.25 garantisce che almeno il 25% degli episodi sia sempre eligibile
         min_frac  = 0.25
         n_include = max(1, int(n_eps * (min_frac + (1.0 - min_frac) * curriculum_ratio)))
-        eligible  = self._episodes[:n_include]  # già ordinati Sharpe desc
+        eligible  = self._episodes[:n_include] 
 
         all_t = [t for _, ep in eligible for t in ep]
         if len(all_t) < batch_size:
@@ -239,6 +209,26 @@ class Critic(nn.Module):
         return self.out(x)
 
 
+# ─── Phase-Aware Noise Scaler [NUOVO] ─────────────────────────────────────────
+
+def get_phase_aware_noise_scale(current_regime: float, base_sigma: float = 0.2) -> float:
+    """
+    Adatta il rumore di esplorazione in base alla fase termodinamica.
+    I regimi estratti da ThermoStateBuilder sono:
+    0: NEUTRO, 1: RALLY_REALE, 2: RALLY_ESAUSTO, 3: COMPRESSIONE, 4: RIMBALZO
+    """
+    regime = int(current_regime)
+    phase_multipliers = {
+        1: 1.2,  # RALLY_REALE: Esplora di più in crescita sana
+        2: 0.8,  # RALLY_ESAUSTO: Più cauto, probabile inversione
+        3: 0.5,  # COMPRESSIONE: Mercato stressato, riduci rumore
+        4: 1.0,  # RIMBALZO: Neutrale
+        0: 1.0   # NEUTRO: Neutrale
+    }
+    multiplier = phase_multipliers.get(regime, 1.0)
+    return base_sigma * multiplier
+
+
 # ─── DDPG Agent ───────────────────────────────────────────────────────────────
 
 class DDPGAgent:
@@ -252,23 +242,14 @@ class DDPGAgent:
         lr_critic=3e-4,
         gamma=0.99,
         tau=0.005,
-        # ── [NUOVO] Tau dinamico termodinamico ──────────────────────────
-        # tau_base è il valore di partenza; update_tau_from_thermo() lo sposta
-        # tra tau_min e tau_max in base allo stress del mercato.
-        # - stress > 0 (mercato surriscaldato) → tau → tau_min: le reti target
-        #   si aggiornano lentamente, l'agente "congela" il comportamento.
-        # - stress < 0 (mercato fresco)        → tau → tau_max: apprendimento
-        #   aggressivo, l'agente esplora più velocemente.
         tau_min=0.001,
         tau_max=0.015,
-        # ────────────────────────────────────────────────────────────────
         buffer_capacity=100_000,
         batch_size=64,
         update_every=1,
         noise_sigma=0.2,
-        # ── [NUOVO] Episodic buffer: attivato se episodic_episodes > 0 ─
         episodic_episodes: int = 20,
-        episodic_mix: float = 0.30,      # frazione della batch dall'episodic buf
+        episodic_mix: float = 0.30,
         device: torch.device = None,
     ):
         self.device = device or get_device()
@@ -282,7 +263,7 @@ class DDPGAgent:
         self.tau          = tau
         self.tau_min      = tau_min
         self.tau_max      = tau_max
-        self.tau_base     = tau        # usato per reset
+        self.tau_base     = tau
         self.batch_size   = batch_size
         self.update_every = update_every
         self._step_count  = 0
@@ -310,46 +291,35 @@ class DDPGAgent:
                 device=self.device,
             )
 
-        # curriculum_ratio viene aggiornato dal training loop (0→1 nel corso
-        # degli episodi) e passato a episodic_buffer.sample()
         self._curriculum_ratio: float = 1.0
 
-    # ── [NUOVO] Tau dinamico termodinamico ────────────────────────────────────
-
     def update_tau_from_thermo(self, stress: float) -> float:
-        """
-        Modula tau in base allo stress termodinamico corrente.
-
-        Usa una sigmoid invertita: stress alto → tau basso (congelamento),
-        stress basso → tau alto (apprendimento aggressivo).
-
-        Matematica:
-          sig   = sigmoid(stress) ∈ (0, 1)
-          tau   = tau_max − sig × (tau_max − tau_min)
-          → stress → +∞  :  sig → 1  →  tau = tau_min  (freeze)
-          → stress → −∞  :  sig → 0  →  tau = tau_max  (explore)
-          → stress = 0   :  sig = 0.5 →  tau ≈ tau_base (neutro)
-
-        Returns il nuovo valore di tau (utile per logging).
-        """
         sig      = 1.0 / (1.0 + np.exp(-float(stress)))
         self.tau = self.tau_max - sig * (self.tau_max - self.tau_min)
         return self.tau
 
     def reset_tau(self) -> None:
-        """Riporta tau al valore base (utile all'inizio di ogni fold)."""
         self.tau = self.tau_base
 
     # ── Act / Store ───────────────────────────────────────────────────────────
-
-    def act(self, state, explore=True):
+    # ★ MODIFICATO: Ora supporta current_regime per scalare il rumore
+    def act(self, state, explore=True, current_regime: float = 0.0):
         s = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         self.actor.eval()
         with torch.no_grad():
             action = self.actor(s).squeeze(0).cpu().numpy()
         self.actor.train()
+        
         if explore:
-            action = action + self.noise.sample()
+            # ★ NUOVO: Scala rumore in base alla fase termodinamica
+            if current_regime is not None:
+                original_sigma = self.noise.sigma
+                self.noise.sigma = get_phase_aware_noise_scale(current_regime, original_sigma)
+                action = action + self.noise.sample()
+                self.noise.sigma = original_sigma  # Ripristina originale
+            else:
+                action = action + self.noise.sample()
+                
         return np.clip(action, -1.0, 1.0)
 
     def store(self, state, action, reward, next_state, done):
@@ -365,7 +335,6 @@ class DDPGAgent:
                 self._step_count % self.update_every != 0):
             return None
 
-        # ── Campionamento misto con curriculum ────────────────────────────
         ep_batch_size = int(self.batch_size * self.episodic_mix)
         use_episodic  = (
             self.episodic_buffer is not None
@@ -379,7 +348,6 @@ class DDPGAgent:
             states_u, actions_u, rewards_u, next_states_u, dones_u = \
                 self.buffer.sample(main_size)
 
-            # [NUOVO] Passa curriculum_ratio per lo staging episodico
             ep_batch = self.episodic_buffer.sample(
                 ep_batch_size,
                 curriculum_ratio=self._curriculum_ratio,
@@ -421,13 +389,10 @@ class DDPGAgent:
         nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.opt_actor.step()
 
-        # ── Soft update con tau corrente (potenzialmente dinamico) ────────
         self._soft_update(self.actor_target,  self.actor)
         self._soft_update(self.critic_target, self.critic)
 
         return {"critic_loss": critic_loss.item(), "actor_loss": actor_loss.item()}
-
-    # ── Utilities ─────────────────────────────────────────────────────────────
 
     def _soft_update(self, target, source):
         for t_p, s_p in zip(target.parameters(), source.parameters()):
@@ -501,38 +466,11 @@ def train_ddpg(
     es_patience:        int   = 20,
     es_metric:          str   = "sharpe",
     best_path:          Optional[str] = None,
-    # ── [NUOVO] Tau dinamico ────────────────────────────────────────────
-    # Callable(step: int) → float che ritorna Thm_Stress al passo `step`.
-    # Se None, tau rimane fisso al valore base (comportamento originale).
-    # Esempio di wiring in trade.py / obs_normalizer.py:
-    #   thermo_stress_fn = (
-    #       lambda step: env._thermo_at(step, "Thm_Stress")
-    #       if env._has_thermo else None
-    #   )
     thermo_stress_fn:   Optional[Callable[[int], float]] = None,
-    # ── [NUOVO] Curriculum ─────────────────────────────────────────────
-    # Se True, curriculum_ratio parte da 0 e raggiunge 1.0 a metà training.
-    # L'agente impara prima dai migliori episodi, poi gradualmente da tutti.
     use_curriculum:     bool  = True,
-    curriculum_warmup_eps: int = None,   # default = n_episodes // 2
+    curriculum_warmup_eps: int = None,
 ) -> list[dict]:
-    """
-    Training loop DDPG con tre novità integrate:
 
-    1. **Tau dinamico termodinamico**: se `thermo_stress_fn` è fornita, tau
-       viene aggiornato ad ogni step in base allo stress del mercato.
-       Stress alto → tau basso (target network si congela).
-       Stress basso → tau alto (apprendimento aggressivo).
-
-    2. **Episodic buffer con curriculum**: se `agent.episodic_buffer` è attivo,
-       ogni episodio viene archiviato e la batch viene arricchita con le
-       transizioni dei migliori episodi. Con `use_curriculum=True`, nelle prime
-       `curriculum_warmup_eps` epoche si campiona solo dal top 25% degli episodi,
-       aumentando gradualmente fino al 100%.
-
-    3. **EpisodicReplayBuffer wiring**: start_episode/end_episode vengono chiamati
-       automaticamente (nel vecchio codice questo non avveniva in train_ddpg).
-    """
     history       = []
     total_step    = 0
     best_metric   = -float("inf")
@@ -544,13 +482,11 @@ def train_ddpg(
         state = env.reset()
         agent.reset_noise()
 
-        # [NUOVO] Curriculum ratio: sale linearmente da 0 a 1 in warmup_eps
         if use_curriculum and agent.episodic_buffer is not None:
             agent._curriculum_ratio = min(1.0, (ep - 1) / max(1, warmup_eps))
         else:
             agent._curriculum_ratio = 1.0
 
-        # [NUOVO] Avvia tracciamento episodio per episodic buffer
         if agent.episodic_buffer is not None:
             agent.episodic_buffer.start_episode()
 
@@ -563,13 +499,13 @@ def train_ddpg(
             if total_step < warmup:
                 action = np.random.uniform(-1, 1, env.action_dim).astype(np.float32)
             else:
-                action = agent.act(state, explore=True)
+                # ★ MODIFICA: Ottieni il regime corrente dall'ambiente e passalo per esplorare
+                current_regime = env.get_current_regime() if hasattr(env, 'get_current_regime') else 0.0
+                action = agent.act(state, explore=True, current_regime=current_regime)
 
             next_state, reward, done, info = env.step(action)
             agent.store(state, action, reward, next_state, done)
 
-            # [NUOVO] Aggiorna tau in base allo stress termodinamico corrente
-            # env._step è già avanzato di 1 dopo step(), leggiamo step-1
             if thermo_stress_fn is not None:
                 current_step = info.get("step", total_step) - 1
                 stress = thermo_stress_fn(max(0, current_step))
@@ -590,7 +526,6 @@ def train_ddpg(
         portfolio = env.portfolio_history()[-1]
         max_dd    = env.max_drawdown()
 
-        # [NUOVO] Chiude l'episodio nell'episodic buffer
         if agent.episodic_buffer is not None:
             agent.episodic_buffer.end_episode(sharpe=sharpe)
 
@@ -660,44 +595,6 @@ def train_ddpg(
 # ─── ThermoEnsemble ───────────────────────────────────────────────────────────
 
 class ThermoEnsemble:
-    """
-    Ensemble di policy DDPG pesate in tempo reale dalla similarità
-    termodinamica tra il regime corrente e il regime di training di ogni fold.
-
-    Idea: ogni fold ha imparato a operare in un regime termodinamico specifico.
-    Invece di scegliere "il miglior fold" come warm start (scelta statica e
-    fragile), pesiamo le azioni di tutti i fold in base a quanto il mercato
-    attuale assomiglia al loro regime di training.
-
-    Algoritmo:
-      1. Per ogni fold k, calcola il profilo termodinamico medio durante
-         il suo training: μ_k = mean(Thm_features) su train_k.
-      2. A ogni step live, misura la distanza euclidea tra il vettore
-         termodinamico corrente x e ogni μ_k.
-      3. Converti le distanze in pesi tramite softmax negativa:
-         w_k = softmax(−distance(x, μ_k) / temperature)
-      4. L'azione finale è la media pesata delle azioni dei K agenti.
-
-    Questo è un meta-learning implicito: il sistema seleziona dinamicamente
-    quale "memoria di mercato" usare, senza alcun retraining.
-
-    Args:
-        agents:          lista di DDPGAgent (uno per fold, già caricati).
-        fold_profiles:   lista di array 1D, profilo termodinamico medio di
-                         ogni fold (stessa lunghezza di Thm_features).
-        temperature:     scala della softmax. Valori bassi = winner-take-all,
-                         alti = media uniforme. Default 1.0.
-        feature_names:   nomi delle feature termodinamiche usate per il profilo
-                         (es. ["Thm_Pressure","Thm_Temperature","Thm_Work",
-                               "Thm_Stress","Thm_Efficiency","Thm_Entropy"]).
-                         Utile per estrarre il sottoinsieme corretto dallo stato.
-
-    Utilizzo tipico (in alpaca_live.py o trade.py):
-        profiles = [compute_thermo_profile(thermo_df, train_slice_k) for k in folds]
-        ensemble = ThermoEnsemble(agents=fold_agents, fold_profiles=profiles)
-        action   = ensemble.act(state, current_thermo_vector)
-    """
-
     def __init__(
         self,
         agents:        List[DDPGAgent],
@@ -705,31 +602,81 @@ class ThermoEnsemble:
         temperature:   float = 1.0,
         feature_names: Optional[List[str]] = None,
     ):
+        """
+        Inizializza ensemble con validazione dimensionale dei profili.
+        
+        ★ FIX CRASH: Gestisce profili con dimensioni diverse tra fold
+        """
         if len(agents) != len(fold_profiles):
             raise ValueError(
                 f"ThermoEnsemble: numero agenti ({len(agents)}) != "
                 f"numero profili ({len(fold_profiles)})"
             )
+        
+        # ★ NUOVO: Valida dimensioni dei profili
+        profile_shapes = [p.shape for p in fold_profiles]
+        unique_shapes = set(profile_shapes)
+        
+        if len(unique_shapes) > 1:
+            print(f"⚠️  WARNING: Profili termodinamici hanno dimensioni diverse!")
+            print(f"   Shapes trovate: {unique_shapes}")
+            print(f"   Profilo per fold:")
+            for i, shape in enumerate(profile_shapes):
+                print(f"     Fold {i}: {shape}")
+            
+            # Strategia: usa il minimo comune denominatore
+            min_dim = min(p.shape[0] for p in fold_profiles)
+            print(f"   → Taglio tutti i profili a {min_dim} feature (safe mode)")
+            
+            fold_profiles = [p[:min_dim] for p in fold_profiles]
+            self._expected_dim = min_dim
+        else:
+            self._expected_dim = fold_profiles[0].shape[0]
+            print(f"✅ Profili termodinamici validati: {len(fold_profiles)} fold, "
+                f"{self._expected_dim} feature")
+        
         self.agents        = agents
         self.fold_profiles = [np.asarray(p, dtype=np.float32) for p in fold_profiles]
         self.temperature   = temperature
         self.feature_names = feature_names
-        self._last_weights: Optional[np.ndarray] = None  # per logging/debug
+        self._last_weights: Optional[np.ndarray] = None
 
+    
     def _compute_weights(self, current_thermo: np.ndarray) -> np.ndarray:
         """
-        Calcola pesi softmax basati sulla similarità con ogni profilo di fold.
-        Distanza euclidea negativa → similarità → softmax.
+        Calcola pesi softmax basati sulla similarità con profili di fold.
+        
+        ★ FIX CRASH: Valida e adatta dimensioni automaticamente
         """
         x = np.asarray(current_thermo, dtype=np.float32)
+        
+        # ★ NUOVO: Verifica dimensioni e adatta se necessario
+        if x.shape[0] != self._expected_dim:
+            print(f"⚠️  current_thermo ha {x.shape[0]} feature, "
+                f"ma profili hanno {self._expected_dim}")
+            
+            if x.shape[0] > self._expected_dim:
+                print(f"   → Taglio current_thermo da {x.shape[0]} a {self._expected_dim}")
+                x = x[:self._expected_dim]
+            else:
+                print(f"   → Pad current_thermo da {x.shape[0]} a {self._expected_dim} con zeri")
+                x = np.pad(x, (0, self._expected_dim - x.shape[0]), 'constant')
+        
+        # Calcolo standard (uguale a prima)
         distances = np.array([
             np.linalg.norm(x - p) for p in self.fold_profiles
         ], dtype=np.float32)
+        
         # Softmax su distanze negate: fold più vicino → peso più alto
         logits = -distances / (self.temperature + 1e-8)
-        logits = logits - logits.max()     # stabilità numerica
+        logits = logits - logits.max()
         exp    = np.exp(logits)
-        return exp / (exp.sum() + 1e-8)
+        
+        weights = exp / (exp.sum() + 1e-8)
+        self._last_weights = weights  # salva per debug
+        
+        return weights
+
 
     def act(
         self,
@@ -737,26 +684,12 @@ class ThermoEnsemble:
         current_thermo: np.ndarray,
         explore:        bool = False,
     ) -> np.ndarray:
-        """
-        Azione ensemble pesata per similarità termodinamica.
-
-        Args:
-            state:          osservazione corrente (già normalizzata).
-            current_thermo: vettore delle feature termodinamiche al passo
-                            corrente (Thm_Pressure, Thm_Temperature, ...).
-            explore:        se True, aggiunge rumore OU a ogni agente.
-
-        Returns:
-            np.ndarray di shape (action_dim,), clippato in [-1, 1].
-        """
         weights = self._compute_weights(current_thermo)
         self._last_weights = weights
 
         actions = np.stack([
             agent.act(state, explore=explore) for agent in self.agents
-        ])  # shape: (n_agents, action_dim)
-
-        # Media pesata: w · A
+        ])
         blended = (weights[:, None] * actions).sum(axis=0)
         return np.clip(blended, -1.0, 1.0)
 
@@ -766,28 +699,20 @@ class ThermoEnsemble:
         current_thermo: np.ndarray,
         explore:        bool = False,
     ) -> np.ndarray:
-        """
-        Alternativa winner-take-all: usa solo l'agente del fold più simile.
-        Utile per confrontare con il metodo blend.
-        """
         weights = self._compute_weights(current_thermo)
         best_k  = int(np.argmax(weights))
         return self.agents[best_k].act(state, explore=explore)
 
     @property
     def last_weights(self) -> Optional[np.ndarray]:
-        """Pesi dell'ultima chiamata ad act() — utile per logging."""
         return self._last_weights
 
     def weights_summary(self) -> str:
-        """Stringa human-readable dei pesi correnti."""
         if self._last_weights is None:
             return "n/a"
         parts = [f"fold{i+1}={w:.3f}" for i, w in enumerate(self._last_weights)]
         return " | ".join(parts)
 
-
-# ─── Utility: calcola il profilo termodinamico di un fold ─────────────────────
 
 def compute_thermo_profile(
     thermo_df,
@@ -795,23 +720,6 @@ def compute_thermo_profile(
     end_idx:   int,
     feature_names: Optional[List[str]] = None,
 ) -> np.ndarray:
-    """
-    Calcola il vettore medio delle feature termodinamiche su una finestra
-    di training, da usare come profilo fold per ThermoEnsemble.
-
-    Args:
-        thermo_df:     DataFrame con colonne Thm_* (output di ThermoStateBuilder).
-        start_idx:     indice di inizio della finestra (incluso).
-        end_idx:       indice di fine della finestra (escluso).
-        feature_names: colonne da usare. Se None, usa tutte le colonne Thm_*.
-
-    Returns:
-        np.ndarray 1D, media delle feature sulla finestra.
-
-    Esempio in walk_forward.py:
-        profile_k = compute_thermo_profile(thermo_df, train_start, train_end)
-        ensemble  = ThermoEnsemble(agents, [profile_0, profile_1, ...])
-    """
     import pandas as pd
 
     if feature_names is None:

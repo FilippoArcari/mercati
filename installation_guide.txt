@@ -1,0 +1,412 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════╗
+║                                                                          ║
+║     GUIDA COMPLETA ALL'INSTALLAZIONE - THERMO INNOVATIONS               ║
+║     Repository: https://github.com/FilippoArcari/mercati                ║
+║                                                                          ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+TEMPO STIMATO: 15-20 minuti
+DIFFICOLTÀ: ⭐⭐ (Intermedia - richiede attenzione ai dettagli)
+
+═══════════════════════════════════════════════════════════════════════════
+PREREQUISITI
+═══════════════════════════════════════════════════════════════════════════
+
+✅ Hai accesso alla repository GitHub: github.com/FilippoArcari/mercati
+✅ Hai git installato
+✅ Hai un editor di testo (VS Code, Sublime, Vim, Nano, etc.)
+✅ Python 3.12 + dipendenze della repo già installate
+
+═══════════════════════════════════════════════════════════════════════════
+STEP 1: BACKUP DELLA REPOSITORY (5 minuti)
+═══════════════════════════════════════════════════════════════════════════
+
+IMPORTANTE: Prima di modificare qualsiasi cosa, crea un backup!
+
+1. Vai nella cartella della tua repository:
+   
+   cd /path/to/mercati
+
+2. Crea un branch di backup:
+   
+   git checkout -b backup-pre-innovations
+   git add -A
+   git commit -m "Backup prima di integrare thermo innovations"
+
+3. Torna al branch main (o quello che usi):
+   
+   git checkout main
+
+4. Crea un nuovo branch per le modifiche:
+   
+   git checkout -b thermo-innovations
+
+Ora sei sicuro: puoi sempre tornare indietro con:
+   git checkout backup-pre-innovations
+
+═══════════════════════════════════════════════════════════════════════════
+STEP 2: AGGIUNGI IL NUOVO FILE (2 minuti)
+═══════════════════════════════════════════════════════════════════════════
+
+1. Copia il file thermo_innovations_final.py nella cartella modelli/:
+
+   Dalla cartella /mnt/user-data/outputs/ copia:
+   thermo_innovations_final.py
+   
+   DESTINAZIONE:
+   /path/to/mercati/modelli/thermo_innovations.py
+   
+   NOTA: Rinominalo da "thermo_innovations_final.py" a "thermo_innovations.py"
+
+2. Verifica che il file sia nella posizione corretta:
+   
+   ls -la modelli/thermo_innovations.py
+   
+   Deve mostrare il file (circa 10-15 KB)
+
+═══════════════════════════════════════════════════════════════════════════
+STEP 3: MODIFICA ddpg.py - FIX CRASH ENSEMBLE (5 minuti)
+═══════════════════════════════════════════════════════════════════════════
+
+FILE: modelli/ddpg.py
+
+1. Apri il file:
+   
+   code modelli/ddpg.py
+   # oppure vim, nano, etc.
+
+2. Usa la funzione "Find" (Ctrl+F o Cmd+F) e cerca:
+   
+   class ThermoEnsemble:
+
+   Dovresti trovarla intorno alla riga 690-700
+
+3. All'interno di questa classe, trova il metodo __init__
+   (cerca "def __init__" dentro la classe ThermoEnsemble)
+
+4. SOSTITUISCI il metodo __init__ con quello nel file ddpg_fix.py
+   
+   - Copia TUTTO il metodo __init__ dal file ddpg_fix.py
+   - Incolla sopra il metodo esistente
+   - Assicurati che l'indentazione sia corretta (4 spazi)
+
+5. Trova il metodo _compute_weights (subito dopo __init__)
+
+6. SOSTITUISCI il metodo _compute_weights con quello nel file ddpg_fix.py
+   
+   - Copia TUTTO il metodo _compute_weights dal file ddpg_fix.py
+   - Incolla sopra il metodo esistente
+   - Assicurati che l'indentazione sia corretta (4 spazi)
+
+7. Salva il file (Ctrl+S o Cmd+S)
+
+8. VERIFICA: Cerca "self._expected_dim" nel file
+   
+   Deve comparire almeno 4 volte (2 in __init__, 2 in _compute_weights)
+
+═══════════════════════════════════════════════════════════════════════════
+STEP 4: MODIFICA trading_env.py - REWARD SHAPING (5 minuti)
+═══════════════════════════════════════════════════════════════════════════
+
+FILE: modelli/trading_env.py
+
+1. Apri il file:
+   
+   code modelli/trading_env.py
+
+2. AGGIUNGI IMPORT all'inizio (dopo gli altri import, intorno alla riga 15):
+   
+   from modelli.thermo_innovations import should_sell_now, get_phase_aware_noise_scale
+
+3. Trova il metodo _compute_reward (cerca "def _compute_reward")
+   
+   Dovrebbe essere intorno alla riga 253
+
+4. SOSTITUISCI COMPLETAMENTE questo metodo con quello nel file:
+   trading_env_fix.py
+   
+   - Copia TUTTO il metodo _compute_reward
+   - Incolla sopra il metodo esistente
+   - L'indentazione deve essere 4 spazi (è un metodo di classe)
+
+5. OPZIONALE MA CONSIGLIATO: Aggiungi il metodo get_current_phase
+   
+   Dopo il metodo _thermo_at (cerca "def _thermo_at"),
+   AGGIUNGI il metodo get_current_phase dal file trading_env_fix.py
+
+6. Salva il file
+
+7. VERIFICA: Cerca "thermo_bonus" nel file
+   
+   Deve comparire almeno 5 volte
+
+═══════════════════════════════════════════════════════════════════════════
+STEP 5: MODIFICA thermo_state_builder.py - INTEGRAZIONE (5 minuti)
+═══════════════════════════════════════════════════════════════════════════
+
+FILE: modelli/thermo_state_builder.py
+
+1. Apri il file:
+   
+   code modelli/thermo_state_builder.py
+
+2. AGGIUNGI IMPORT all'inizio (dopo gli altri import, intorno alla riga 15):
+   
+   from modelli.thermo_innovations import compute_advanced_thermo_features, STANDARD_THERMO_FEATURES
+
+3. Trova il metodo build() della classe ThermoStateBuilder
+   
+   Cerca "def build(" - dovrebbe essere intorno alla riga 307
+
+4. Scorri fino alla FINE di questo metodo (intorno alla riga 416)
+   
+   Troverai:
+   
+   print(
+       f"[ThermoBuilder] {'Daily' if self.is_daily else 'Intraday'} | "
+       ...
+   )
+   return result  # ← QUESTA È L'ULTIMA RIGA
+
+5. AGGIUNGI il blocco try-except dal file thermo_state_builder_fix.py
+   
+   POSIZIONE: Tra il print() e il return result
+   
+   Sequenza corretta:
+   
+   print(...) 
+   
+   # ★ NUOVO: blocco try-except qui
+   try:
+       ...
+   except:
+       ...
+   
+   return result
+
+6. Salva il file
+
+7. VERIFICA: Cerca "Thermo Innovations" nel file
+   
+   Deve comparire 2 volte
+
+═══════════════════════════════════════════════════════════════════════════
+STEP 6: MODIFICA alpaca_live.py - FIX NORMALIZER (5 minuti)
+═══════════════════════════════════════════════════════════════════════════
+
+FILE: modelli/alpaca_live.py
+
+1. Apri il file:
+   
+   code modelli/alpaca_live.py
+
+2. Trova la funzione _load_agent (cerca "def _load_agent")
+   
+   Dovrebbe essere intorno alla riga 212
+
+3. All'interno di questa funzione, trova la sezione normalizer
+   
+   Cerca "norm = ObsNormalizer" - dovrebbe essere intorno alla riga 254
+
+4. SOSTITUISCI l'intero blocco di caricamento normalizer
+   
+   DA:
+   norm = ObsNormalizer(state_dim=state_dim, clip=5.0)
+   # Prova prima normalizer_2m.npz...
+   ...
+   if not loaded_norm:
+       log.warning(...)
+   
+   CON il blocco dal file alpaca_live_fix.py
+
+5. Salva il file
+
+6. VERIFICA: Cerca "derived_norm_path" nel file
+   
+   Deve comparire 2 volte
+
+═══════════════════════════════════════════════════════════════════════════
+STEP 7: TEST PRELIMINARE (5 minuti)
+═══════════════════════════════════════════════════════════════════════════
+
+Prima di eseguire training completo, verifica che non ci siano errori di syntax.
+
+1. Test import:
+   
+   cd /path/to/mercati
+   python -c "from modelli.thermo_innovations import compute_advanced_thermo_features; print('✅ Import OK')"
+
+2. Test sintassi ddpg.py:
+   
+   python -c "from modelli.ddpg import ThermoEnsemble; print('✅ ddpg.py OK')"
+
+3. Test sintassi trading_env.py:
+   
+   python -c "from modelli.trading_env import TradingEnv; print('✅ trading_env.py OK')"
+
+4. Test sintassi thermo_state_builder.py:
+   
+   python -c "from modelli.thermo_state_builder import ThermoStateBuilder; print('✅ thermo_state_builder.py OK')"
+
+Se TUTTI i test mostrano "✅ ... OK", puoi procedere.
+
+Se c'è un errore:
+- Leggi il messaggio di errore (di solito indica la riga)
+- Controlla l'indentazione (deve essere 4 spazi, non tab)
+- Verifica di aver copiato tutto il metodo/blocco
+
+═══════════════════════════════════════════════════════════════════════════
+STEP 8: COMMIT DELLE MODIFICHE (2 minuti)
+═══════════════════════════════════════════════════════════════════════════
+
+Se tutti i test sono passati:
+
+1. Vedi i file modificati:
+   
+   git status
+
+2. Aggiungi tutti i file modificati:
+   
+   git add modelli/thermo_innovations.py
+   git add modelli/ddpg.py
+   git add modelli/trading_env.py
+   git add modelli/thermo_state_builder.py
+   git add modelli/alpaca_live.py
+
+3. Commit:
+   
+   git commit -m "Integra thermo innovations: adaptive lag, efficiency detector, phase detector
+
+   - Aggiunto thermo_innovations.py con 3 innovazioni
+   - Fix crash ensemble in ddpg.py (validazione dimensionale)
+   - Reward shaping termodinamico in trading_env.py
+   - Integrazione feature avanzate in thermo_state_builder.py
+   - Fix normalizer mancante in alpaca_live.py"
+
+═══════════════════════════════════════════════════════════════════════════
+STEP 9: TEST WALK-FORWARD COMPLETO (20-30 minuti)
+═══════════════════════════════════════════════════════════════════════════
+
+Ora testa il sistema completo:
+
+1. Esegui walk-forward validation:
+   
+   uv run main.py step=walk_forward frequency=2m
+
+2. Monitora i log:
+   
+   - Cerca "✅ Profili termodinamici validati" → fix crash OK
+   - Cerca "✅ Thermo Innovations integrate" → integration OK
+   - Cerca "✅ Normalizer caricato" → normalizer fix OK
+   
+   - NO crash ValueError shapes
+   - NO warning "Normalizer non trovato"
+
+3. Alla fine, controlla le metriche:
+   
+   - Sharpe std < 5 (vs. 14.5 prima)
+   - Tutti i fold con Sharpe > 0
+   - Verdetto: 🟢 PRONTO (vs. 🔴 NON PRONTO)
+
+═══════════════════════════════════════════════════════════════════════════
+STEP 10: TEST REPLAY (10 minuti)
+═══════════════════════════════════════════════════════════════════════════
+
+Testa il sistema in modalità replay:
+
+1. Esegui replay:
+   
+   # Modifica il tuo script di replay per usare il modello migliore
+   uv run main.py step=replay_alpaca frequency=2m
+
+2. Monitora le operazioni:
+   
+   - Ratio BUY/SELL dovrebbe essere tra 2:1 e 5:1 (vs. 23:3)
+   - Log deve mostrare segnali "🎯 SELL bonus" quando vende correttamente
+   - Verdetto termodinamico: 🟢 OTTIMO (vendite corrette > 70%)
+
+═══════════════════════════════════════════════════════════════════════════
+TROUBLESHOOTING
+═══════════════════════════════════════════════════════════════════════════
+
+PROBLEMA: ImportError: cannot import name 'compute_advanced_thermo_features'
+SOLUZIONE: Verifica che thermo_innovations.py sia in modelli/ e non altrove
+
+PROBLEMA: IndentationError
+SOLUZIONE: Controlla che usi 4 spazi (non tab) per l'indentazione
+
+PROBLEMA: ValueError: shapes (X,) (Y,)
+SOLUZIONE: Il fix in ddpg.py non è stato applicato correttamente
+           Ricontrolla il metodo _compute_weights
+
+PROBLEMA: KeyError: 'Thm_SellSignal'
+SOLUZIONE: Le feature non vengono calcolate. Verifica thermo_state_builder.py
+           Il blocco try-except deve essere PRIMA del return
+
+PROBLEMA: Normalizer non trovato
+SOLUZIONE: Il fix in alpaca_live.py non è stato applicato
+           Ricontrolla la sezione di caricamento normalizer
+
+═══════════════════════════════════════════════════════════════════════════
+CHECKLIST FINALE
+═══════════════════════════════════════════════════════════════════════════
+
+Prima di considerare il lavoro completo:
+
+[ ] File thermo_innovations.py aggiunto in modelli/
+[ ] ddpg.py: metodi __init__ e _compute_weights modificati
+[ ] trading_env.py: import aggiunto e _compute_reward modificato
+[ ] thermo_state_builder.py: import aggiunto e blocco try-except aggiunto
+[ ] alpaca_live.py: sezione normalizer modificata
+[ ] Tutti i test import passano (Step 7)
+[ ] Walk-forward completa senza crash
+[ ] Log mostra "✅ Thermo Innovations integrate"
+[ ] Log mostra "✅ Normalizer caricato"
+[ ] Sharpe std < 5
+[ ] Ratio BUY/SELL migliorato
+
+Se TUTTI i checkbox sono ✅, l'installazione è completa!
+
+═══════════════════════════════════════════════════════════════════════════
+PROSSIMI PASSI
+═══════════════════════════════════════════════════════════════════════════
+
+Dopo l'installazione:
+
+1. SETTIMANA 1-2: Tuning hyperparameters
+   - Regola thermo_bonus (prova 0.3, 0.5, 0.7)
+   - Test su diversi timeframe (1m, 5m, 1h)
+
+2. SETTIMANA 3: Extensive backtesting
+   - Test su 6+ mesi out-of-sample
+   - Analisi per fase termodinamica
+   - Confronto con baseline vanilla DDPG
+
+3. SETTIMANA 4: Paper trading esteso
+   - 1 mese di paper trading
+   - Monitor stress, efficiency, phase in real-time
+   - A/B test vs DDPG vanilla
+
+4. GO LIVE: Solo quando
+   - Sharpe > 5 per almeno 3 mesi
+   - Drawdown max < 15%
+   - Win rate vendite > 65%
+
+═══════════════════════════════════════════════════════════════════════════
+SUPPORTO
+═══════════════════════════════════════════════════════════════════════════
+
+Se hai problemi:
+
+1. Rileggi questa guida attentamente
+2. Controlla i file di fix (ddpg_fix.py, etc.) per esempi
+3. Verifica i log per messaggi di errore specifici
+4. Usa git per tornare al backup se necessario:
+   
+   git checkout backup-pre-innovations
+
+Buon lavoro! 🚀
+
+═══════════════════════════════════════════════════════════════════════════
+"""

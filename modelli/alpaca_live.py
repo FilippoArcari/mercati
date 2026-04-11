@@ -251,19 +251,50 @@ def _load_agent(cfg, state_dim: int, all_tickers: list[str],
         )
     log.info(f"DDPG: {os.path.basename(dp)} | state={state_dim} action={action_dim}")
 
-    norm = ObsNormalizer(state_dim=state_dim, clip=5.0)
-    # Prova prima normalizer_2m.npz, poi il fallback normalizer_2m_final.npz
-    # (trade.py salva il best come normalizer_2m.npz e il finale come normalizer_2m_final.npz)
-    norm_candidates = [np_, np_.replace(".npz", "_final.npz")]
+    norm = ObsNormalizer(shape=state_dim, clip=5.0)
+    
+    # ★ FIX: Deriva il path del normalizer dal modello DDPG caricato
+    # Esempio: ddpg_best_2m.pth → normalizer_best_2m.npz
+    #          ddpg_wf_fold4_2m.pth → normalizer_wf_fold4_2m.npz
+    ddpg_basename = os.path.basename(dp)  # es: "ddpg_best_2m.pth"
+    
+    # Estrai il suffisso tra "ddpg_" e ".pth"
+    if ddpg_basename.startswith("ddpg_") and ddpg_basename.endswith(".pth"):
+        suffix = ddpg_basename[5:-4]  # rimuove "ddpg_" e ".pth"
+        derived_norm_name = f"normalizer_{suffix}.npz"
+        derived_norm_path = os.path.join(cfg.paths.checkpoint_dir, derived_norm_name)
+    else:
+        # Fallback: usa il path generico
+        derived_norm_path = np_
+    
+    # Prova in ordine:
+    # 1. Normalizer derivato dal modello (es: normalizer_wf_fold4_2m.npz)
+    # 2. Normalizer generico (es: normalizer_2m.npz)
+    # 3. Normalizer generico con _final (es: normalizer_2m_final.npz)
+    norm_candidates = [
+        derived_norm_path,
+        np_,
+        np_.replace(".npz", "_final.npz")
+    ]
+    
+    # Rimuovi duplicati mantenendo l'ordine
+    norm_candidates = list(dict.fromkeys(norm_candidates))
+    
     loaded_norm = False
     for nc in norm_candidates:
         if os.path.exists(nc):
             norm.load(nc)
             loaded_norm = True
+            log.info(f"✅ Normalizer caricato: {os.path.basename(nc)}")
             break
+    
     if not loaded_norm:
-        log.warning(f"Normalizer non trovato ({np_}), uso statistiche vuote — "
-                    "le predizioni potrebbero essere instabili")
+        log.warning(
+            f"⚠️  Normalizer non trovato!\n"
+            f"   Provati: {[os.path.basename(nc) for nc in norm_candidates]}\n"
+            f"   Uso statistiche vuote — le predizioni potrebbero essere instabili"
+        )
+ 
 
     # Indici dei ticker tradabili all'interno di all_tickers
     # Usati per estrarre le azioni corrette dal vettore completo

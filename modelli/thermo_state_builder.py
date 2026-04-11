@@ -50,6 +50,8 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from typing import Optional
+from modelli.thermo_innovations import compute_advanced_thermo_features, STANDARD_THERMO_FEATURES
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -413,6 +415,67 @@ class ThermoStateBuilder:
             f"{len(CANONICAL_COLS)} canonical + {n_extended} extended "
             f"+ {n_psi} Psi + {n_trust} Trust"
         )
+        
+         # ★ NUOVO: Integra feature termodinamiche avanzate (innovations)
+        try:
+            # Prepara DataFrame temporaneo con dati necessari
+            temp_df = pd.DataFrame(index=df_raw.index)
+            temp_df['Close'] = close
+            temp_df['Market_Pressure'] = base["raw_pressure"]
+            temp_df['Market_Temperature'] = base["raw_temperature"]
+            temp_df['Market_Entropy'] = base["raw_entropy"]
+            temp_df['Market_Work_Cum'] = base["raw_work"]
+            
+            # Trova rates_col se disponibile
+            rates_col = _find_rates_col(df_raw)
+            if rates_col:
+                temp_df['DGS10'] = df_raw[rates_col]
+            else:
+                temp_df['DGS10'] = 0.045  # default
+            
+            # Calcola feature avanzate (lag adattivo, efficiency, phase, etc.)
+            temp_df_enhanced = compute_advanced_thermo_features(
+                temp_df,
+                pressure_col='Market_Pressure',
+                temp_col='Market_Temperature',
+                entropy_col='Market_Entropy',
+                work_col='Market_Work_Cum',
+                price_col='Close',
+                rates_col='DGS10'
+            )
+            
+            # Aggiungi solo le nuove colonne al result
+            new_cols = [
+                'Thm_Phase', 
+                'Thm_Efficiency',  # Sovrascrive quella esistente con versione avanzata
+                'Thm_MonetaryLag',
+                'Thm_StressThreshold',
+                'Thm_SellSignal',
+                'Thm_StressZScore'
+            ]
+            
+            for col in new_cols:
+                if col in temp_df_enhanced.columns:
+                    # Thm_Phase è stringa, converti in int per il modello
+                    if col == 'Thm_Phase':
+                        phase_map = {
+                            'Espansione': 0,
+                            'Compressione': 1,
+                            'Transizione': 2,
+                            'Caos': 3
+                        }
+                        result[col] = temp_df_enhanced[col].map(phase_map).fillna(2).astype(float)
+                    else:
+                        result[col] = temp_df_enhanced[col]
+            
+            print(f"[ThermoBuilder] ✅ Thermo Innovations integrate: {len(new_cols)} nuove feature")
+            
+        except Exception as e:
+            print(f"[ThermoBuilder] ⚠️  Errore in thermo innovations (continuo senza): {e}")
+        
+        # Assicurati che tutto sia sanitizzato
+        result = result.ffill().bfill().fillna(0.0)
+
         return result
 
     @property
