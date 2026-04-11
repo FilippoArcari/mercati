@@ -750,7 +750,7 @@ def run_walk_forward(
 
         # ── Ambienti ──────────────────────────────────────────────────────
         env_train = TradingEnv(
-            prices_real=pr_train, prices_pred=pp_train,
+            df=pr_train, prices_pred=pp_train,
             thermo_df=th_train, log_trades=False,
             lambda_concentration=getattr(buyer_cfg, "lambda_concentration", 0.1),
             lambda_inaction     =getattr(buyer_cfg, "lambda_inaction",      0.1),
@@ -759,7 +759,7 @@ def run_walk_forward(
             **_env_common,
         )
         env_test = TradingEnv(
-            prices_real=pr_test, prices_pred=pp_test,
+            df=pr_test, prices_pred=pp_test,
             thermo_df=th_test, log_trades=True,
             lambda_concentration=0.0, lambda_inaction=0.0, lambda_loss=0.0,
             loss_threshold=getattr(buyer_cfg, "loss_threshold", -0.5),
