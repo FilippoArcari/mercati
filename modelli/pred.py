@@ -4,6 +4,8 @@ from torch import nn
 import torch.nn.functional as F
 from typing import Optional
 
+from modelli.device_setup import wrap_model_for_backend, xla_mark_step
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -309,17 +311,14 @@ class Pred(nn.Module):
         self.train()
         device = next(self.parameters()).device
 
-        # ── Multi-GPU: avvolge il modello con DataParallel se disponibili >1 GPU ──
-        # DataParallel divide il batch tra le GPU disponibili automaticamente.
-        # Nota: usa `self` (non il wrapper) per optimizer e state_dict.
-        n_gpus = torch.cuda.device_count()
-        if n_gpus > 1:
-            model = torch.nn.DataParallel(self)
-            if not getattr(self, "_multigpu_logged", False):
-                print(f"[{label}] Multi-GPU attivo: {n_gpus} GPU con DataParallel")
-                self._multigpu_logged = True
-        else:
-            model = self
+        # ── Parallelismo device-aware ───────────────────────────────────
+        # • CUDA 2×T4 / 2×GPU  → DataParallel (divide il batch tra le GPU)
+        # • CUDA 1×P100         → nessun wrapper
+        # • XLA / TPU v5e-8     → nessun wrapper (lazy graph, no DataParallel)
+        # • CPU                 → nessun wrapper
+        model = wrap_model_for_backend(self)
+        if model is not self and not getattr(self, "_multigpu_logged", False):
+            self._multigpu_logged = True
 
         if prior_mean    is not None: prior_mean    = prior_mean.to(device)
         if prior_std     is not None: prior_std     = prior_std.to(device)
@@ -343,6 +342,8 @@ class Pred(nn.Module):
                 # Salta il batch se la loss è NaN/inf (difesa a strato finale)
                 if not torch.isfinite(loss):
                     nan_batches += 1
+                    # Su XLA serve mark_step anche in caso di skip per scaricare il grafo
+                    xla_mark_step()
                     continue
 
                 loss.backward()
@@ -354,6 +355,11 @@ class Pred(nn.Module):
                     )
 
                 optimizer.step()
+
+                # Su XLA (TPU) è necessario materializzare il grafo lazy
+                # dopo ogni step per evitare OOM e deadlock.
+                xla_mark_step()
+
                 total_l      += loss.item()
                 total_data_l += info.get("data", 0.0)
 

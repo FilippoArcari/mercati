@@ -19,8 +19,19 @@ scipy>=1.14.0
 scikit-learn>=1.5.0
 seaborn>=0.13.0
 
-# Optional: For CUDA support
-# torch-cuda>=2.10.0  # Uncomment for GPU acceleration (or use: pip install torch --index-url https://download.pytorch.org/whl/cu118)
+# ── Acceleratore hardware (installa UNO dei seguenti) ─────────────────────────
+#
+# CUDA (GPU NVIDIA T4 / P100 / etc.):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu118
+#   oppure lascia la dipendenza torch>=2.10.0 sopra (Kaggle la gestisce in auto)
+#
+# TPU v5e-8 (Kaggle TPU runtime):
+#   torch_xla è pre-installato automaticamente — non serve aggiungerlo.
+#   Su GCP TPU VM manuale:
+#     pip install torch_xla[tpu] -f https://storage.googleapis.com/libtpu-releases/index.html
+#
+# In locale (sviluppo su CPU):
+#   nessuna dipendenza aggiuntiva — il codice rileva automaticamente CPU come fallback.
 
 # Python Version Requirement
 # Python >= 3.13

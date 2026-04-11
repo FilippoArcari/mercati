@@ -180,7 +180,7 @@ def _fetch_account(tc) -> dict:
 
 def _load_predictor(cfg, log: logging.Logger):
     from modelli.pred import Pred
-    from modelli.utils import get_device
+    from modelli.device_setup import get_device, get_map_location
 
     path = _pred_ckpt(cfg)
     if not os.path.exists(path):
@@ -189,7 +189,7 @@ def _load_predictor(cfg, log: logging.Logger):
             f"Esegui: uv run main.py step=train frequency={cfg.frequency.interval}"
         )
     device = get_device()
-    ck     = torch.load(path, map_location=device, weights_only=False)
+    ck     = torch.load(path, map_location=get_map_location(), weights_only=False)
     nf     = ck["num_features"]
     mc     = ck.get("config", {}).get("model", {})
 

@@ -28,6 +28,7 @@ from modelli.pred import Pred
 from modelli.ddpg import DDPGAgent, train_ddpg
 from modelli.trading_env import TradingEnv
 from modelli.obs_normalizer import ObsNormalizer, train_ddpg_normalized
+from modelli.device_setup import get_device, get_map_location
 
 BATCH_SIZE = 256
 
@@ -79,7 +80,7 @@ def _load_predictor(cfg, num_features, checkpoint):
     predictor.load_state_dict(checkpoint["model_state_dict"])
     predictor.eval()
 
-    from modelli.utils import get_device
+    from modelli.device_setup import get_device
     return predictor.to(get_device())
 
 
@@ -280,8 +281,7 @@ def run_trade(
         print(f"Esegui prima: uv run main.py step=train frequency={freq}")
         return
 
-    checkpoint   = torch.load(pred_path, map_location=torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"), weights_only=False)
+    checkpoint   = torch.load(pred_path, map_location=get_map_location(), weights_only=False)
     num_features = checkpoint.get("num_features", df.shape[1])
     predictor    = _load_predictor(cfg, num_features, checkpoint)
     scaler       = checkpoint["scaler"]
@@ -472,8 +472,7 @@ def run_walk_forward(
         print(f"[WalkForward] Predittore non trovato: {pred_path}")
         return WalkForwardReport(mode=mode)
 
-    checkpoint   = torch.load(pred_path, map_location=torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"), weights_only=False)
+    checkpoint   = torch.load(pred_path, map_location=get_map_location(), weights_only=False)
     num_features = checkpoint.get("num_features", df.shape[1])
     predictor    = _load_predictor(cfg, num_features, checkpoint)
     scaler       = checkpoint["scaler"]
@@ -689,6 +688,30 @@ def run_walk_forward(
     report.print_summary()
     report.save(os.path.join(results_dir, f"walk_forward_{freq}.csv"))
 
+    # ── 4b. FIX Bug #1: copia normalizer del fold migliore → normalizer_best_{freq}.npz
+    # alpaca_live cerca "normalizer_best_{freq}.npz" ma la walk-forward salva solo
+    # "normalizer_wf_fold{N}_{freq}.npz". Questo blocco colma il gap.
+    if report.folds:
+        import shutil
+        best_fold_n   = max(report.folds, key=lambda f: f.sharpe).fold
+        src_norm      = os.path.join(checkpoint_dir, f"normalizer_wf_fold{best_fold_n}_{freq}.npz")
+        dst_norm_best = os.path.join(checkpoint_dir, f"normalizer_best_{freq}.npz")
+        dst_norm_gen  = os.path.join(checkpoint_dir, f"normalizer_{freq}.npz")
+        if os.path.exists(src_norm):
+            shutil.copy2(src_norm, dst_norm_best)
+            shutil.copy2(src_norm, dst_norm_gen)
+            print(
+                f"  [Fix #1] Normalizer fold {best_fold_n} (Sharpe={report.folds[best_fold_n-1].sharpe:.3f}) "
+                f"copiato in:\n"
+                f"    → {os.path.basename(dst_norm_best)}\n"
+                f"    → {os.path.basename(dst_norm_gen)}"
+            )
+        else:
+            print(
+                f"  [Fix #1] AVVISO: normalizer del fold {best_fold_n} non trovato in {src_norm}.\n"
+                f"  Verifica che norm_path venga passato correttamente a train_ddpg_normalized()."
+            )
+
     # ── 5. ThermoEnsemble — valutazione post walk-forward ────────────────────
     if len(ensemble_agents) >= 2 and folds:
         print(f"\n{'─'*62}")
@@ -708,8 +731,10 @@ def run_walk_forward(
             temperature   = getattr(buyer_cfg, "ensemble_temperature", 0.5),
         )
 
+        # FIX Bug #2: rimosso [:6] hardcoded che troncava le colonne Thm_ a 6
+        # lasciando 8 zeri di padding nel ThermoEnsemble (profili hanno 14 feature).
         thm_cols = (
-            [c for c in th_test_last.columns if c.startswith("Thm_")][:6]
+            [c for c in th_test_last.columns if c.startswith("Thm_")]
             if th_test_last is not None and not th_test_last.empty
             else []
         )

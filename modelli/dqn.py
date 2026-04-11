@@ -22,7 +22,7 @@ import random
 import os
 from typing import Optional
 
-from modelli.utils import get_device
+from modelli.device_setup import get_device, safe_save
 
 
 # ─── Prioritized Replay Buffer ─────────────────────────────────────────────────
@@ -41,11 +41,13 @@ class PrioritizedReplayBuffer:
 
     def __init__(self, capacity: int, alpha: float = 0.6, beta_start: float = 0.4, beta_end: float = 1.0, device: torch.device = None):
         self.capacity   = capacity
-        self.alpha      = alpha          # quanto conta la priorità (0 = uniforme, 1 = piena priorità)
-        self.beta       = beta_start     # importance-sampling correction (annealing → 1)
+        self.alpha      = alpha
+        self.beta       = beta_start
         self.beta_end   = beta_end
         self.beta_step  = 0
-        self.device     = device or torch.device('cpu')
+        # Il buffer è sempre su CPU; il batch viene spostato sul device di calcolo
+        # solo al momento del campionamento (compatibile con CUDA, XLA e CPU).
+        self._compute_device = device or torch.device('cpu')
 
         self.buffer:     list[Transition]  = []
         self.priorities: list[float]       = []
@@ -76,20 +78,22 @@ class PrioritizedReplayBuffer:
         # Importance-sampling weights
         N  = len(self.buffer)
         ws = (N * probs[indices]) ** (-self.beta)
-        ws = ws / ws.max()  # normalizza per stabilità numerica
+        ws = ws / ws.max()
 
-        states      = torch.tensor(np.array([s.state      for s in samples]), dtype=torch.float32, device=self.device)
-        action_idxs = torch.tensor(np.array([s.action_idx for s in samples]), dtype=torch.long, device=self.device)
-        rewards     = torch.tensor(np.array([s.reward     for s in samples]), dtype=torch.float32, device=self.device).unsqueeze(1)
-        next_states = torch.tensor(np.array([s.next_state for s in samples]), dtype=torch.float32, device=self.device)
-        dones       = torch.tensor(np.array([s.done       for s in samples]), dtype=torch.float32, device=self.device).unsqueeze(1)
-        weights     = torch.tensor(ws, dtype=torch.float32, device=self.device).unsqueeze(1)
+        # Costruisci i tensori su CPU, poi sposta sul device di calcolo
+        dev = self._compute_device
+        states      = torch.tensor(np.array([s.state      for s in samples]), dtype=torch.float32).to(dev)
+        action_idxs = torch.tensor(np.array([s.action_idx for s in samples]), dtype=torch.long).to(dev)
+        rewards     = torch.tensor(np.array([s.reward     for s in samples]), dtype=torch.float32).unsqueeze(1).to(dev)
+        next_states = torch.tensor(np.array([s.next_state for s in samples]), dtype=torch.float32).to(dev)
+        dones       = torch.tensor(np.array([s.done       for s in samples]), dtype=torch.float32).unsqueeze(1).to(dev)
+        weights     = torch.tensor(ws, dtype=torch.float32).unsqueeze(1).to(dev)
 
         return states, action_idxs, rewards, next_states, dones, weights, indices
 
     def update_priorities(self, indices, td_errors: np.ndarray):
         for idx, err in zip(indices, td_errors):
-            self.priorities[idx] = float(abs(err)) + 1e-6   # epsilon per evitare prio zero
+            self.priorities[idx] = float(abs(err)) + 1e-6
 
     def __len__(self):
         return len(self.buffer)
@@ -258,7 +262,8 @@ class DQNAgent:
             2, action_idxs.unsqueeze(2)
         ).squeeze(2).mean(dim=1, keepdim=True)                    # (B, 1)
 
-        td_errors = (current_q - td_target).detach().squeeze(1).numpy()
+        # .detach().cpu() garantisce compatibilità con XLA/TPU (lazy tensors)
+        td_errors = (current_q - td_target).detach().cpu().squeeze(1).numpy()
 
         loss = (weights * F.smooth_l1_loss(current_q, td_target, reduction="none")).mean()
 
@@ -303,7 +308,7 @@ class DQNAgent:
 
     def save(self, path: str, tag: str = "") -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        torch.save(self._state(), path)
+        safe_save(self._state(), path)
         label = f" [{tag}]" if tag else ""
         print(f"[DQN] Checkpoint salvato{label}: {path} (ε={self.epsilon:.3f})")
 

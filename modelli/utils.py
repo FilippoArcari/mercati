@@ -39,34 +39,20 @@ _RATES_CANDIDATES = ["GS10", "T10YIE", "FEDFUNDS", "^TNX"]
 
 
 # ─── Device Management ─────────────────────────────────────────────────────────
+# Re-export dal modulo centralizzato device_setup.
+# Mantiene la retrocompatibilità: tutti i `from modelli.utils import get_device`
+# continuano a funzionare senza modifiche.
 
-def get_device() -> torch.device:
-    """
-    Seleziona il device per PyTorch (GPU o CPU) in base a:
-      1. Variabile di ambiente PYTORCH_DEVICE (es. 'cpu', 'cuda')
-      2. Se non settata, usa GPU se disponibile, altrimenti CPU
-      3. Se GPU richiesta ma non disponibile, fallback a CPU
-    """
-    device_env = os.environ.get("PYTORCH_DEVICE", "").lower()
-
-    if device_env:
-        if device_env == "cpu":
-            device = torch.device("cpu")
-        elif device_env in ("cuda", "gpu"):
-            if torch.cuda.is_available():
-                device = torch.device("cuda")
-            else:
-                print("[get_device] CUDA richiesto ma non disponibile, fallback a CPU")
-                device = torch.device("cpu")
-        else:
-            print(f"[get_device] Device '{device_env}' non riconosciuto, uso CPU")
-            device = torch.device("cpu")
-    else:
-        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-
-    device_name = "GPU (CUDA)" if device.type == "cuda" else "CPU"
-    print(f"[get_device] Usando device: {device_name}")
-    return device
+from modelli.device_setup import (  # noqa: E402
+    get_device,
+    detect_device,
+    get_map_location,
+    safe_save,
+    xla_mark_step,
+    wrap_model_for_backend,
+    unwrap_model,
+    DeviceConfig,
+)
 
 
 # ─── Cache ─────────────────────────────────────────────────────────────────────

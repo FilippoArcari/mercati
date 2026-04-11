@@ -9,7 +9,7 @@ import random
 import os
 from typing import Optional, Callable, List, Tuple
 
-from modelli.utils import get_device
+from modelli.device_setup import get_device, safe_save
 
 
 # ─── Ornstein-Uhlenbeck Noise ─────────────────────────────────────────────────
@@ -41,9 +41,17 @@ class OUNoise:
 # ─── Replay Buffer ─────────────────────────────────────────────────────────────
 
 class ReplayBuffer:
+    """
+    Replay buffer standard.
+
+    I dati vengono sempre memorizzati su CPU (piccoli array numpy/float).
+    Solo al momento del campionamento il batch viene spostato sul device
+    di calcolo (CUDA, XLA o CPU). Questo evita OOM su TPU dove la memoria
+    HBM è limitata e gestita dal runtime XLA.
+    """
     def __init__(self, capacity, device: torch.device = None):
-        self.buffer: deque = deque(maxlen=capacity)
-        self.device = device or torch.device('cpu')
+        self.buffer: deque    = deque(maxlen=capacity)
+        self._compute_device  = device or torch.device('cpu')
 
     def push(self, state, action, reward, next_state, done):
         self.buffer.append((state, action, reward, next_state, done))
@@ -51,12 +59,13 @@ class ReplayBuffer:
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
+        dev = self._compute_device
         return (
-            torch.tensor(np.array(states),      dtype=torch.float32, device=self.device),
-            torch.tensor(np.array(actions),     dtype=torch.float32, device=self.device),
-            torch.tensor(np.array(rewards),     dtype=torch.float32, device=self.device).unsqueeze(1),
-            torch.tensor(np.array(next_states), dtype=torch.float32, device=self.device),
-            torch.tensor(np.array(dones),       dtype=torch.float32, device=self.device).unsqueeze(1),
+            torch.tensor(np.array(states),      dtype=torch.float32).to(dev),
+            torch.tensor(np.array(actions),     dtype=torch.float32).to(dev),
+            torch.tensor(np.array(rewards),     dtype=torch.float32).unsqueeze(1).to(dev),
+            torch.tensor(np.array(next_states), dtype=torch.float32).to(dev),
+            torch.tensor(np.array(dones),       dtype=torch.float32).unsqueeze(1).to(dev),
         )
 
     def __len__(self):
@@ -70,11 +79,14 @@ class EpisodicReplayBuffer:
     Buffer episodico con curriculum graduato.
     Memorizza i migliori K episodi per Sharpe e li usa per arricchire le
     batch di training (split configurabile, default 30% episodic / 70% uniform).
+
+    I dati sono sempre su CPU; il batch viene spostato sul device di calcolo
+    al momento del campionamento (stesso pattern di ReplayBuffer).
     """
 
     def __init__(self, max_episodes: int = 20, device: torch.device = None):
-        self.max_episodes = max_episodes
-        self.device       = device or torch.device("cpu")
+        self.max_episodes    = max_episodes
+        self._compute_device = device or torch.device("cpu")
         self._episodes:   List[Tuple[float, list]] = []
         self._current_ep: list = []
 
@@ -107,7 +119,7 @@ class EpisodicReplayBuffer:
 
         min_frac  = 0.25
         n_include = max(1, int(n_eps * (min_frac + (1.0 - min_frac) * curriculum_ratio)))
-        eligible  = self._episodes[:n_include] 
+        eligible  = self._episodes[:n_include]
 
         all_t = [t for _, ep in eligible for t in ep]
         if len(all_t) < batch_size:
@@ -115,12 +127,13 @@ class EpisodicReplayBuffer:
 
         batch = random.sample(all_t, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
+        dev = self._compute_device
         return (
-            torch.tensor(np.array(states),      dtype=torch.float32, device=self.device),
-            torch.tensor(np.array(actions),     dtype=torch.float32, device=self.device),
-            torch.tensor(np.array(rewards),     dtype=torch.float32, device=self.device).unsqueeze(1),
-            torch.tensor(np.array(next_states), dtype=torch.float32, device=self.device),
-            torch.tensor(np.array(dones),       dtype=torch.float32, device=self.device).unsqueeze(1),
+            torch.tensor(np.array(states),      dtype=torch.float32).to(dev),
+            torch.tensor(np.array(actions),     dtype=torch.float32).to(dev),
+            torch.tensor(np.array(rewards),     dtype=torch.float32).unsqueeze(1).to(dev),
+            torch.tensor(np.array(next_states), dtype=torch.float32).to(dev),
+            torch.tensor(np.array(dones),       dtype=torch.float32).unsqueeze(1).to(dev),
         )
 
     def __len__(self) -> int:
@@ -422,7 +435,7 @@ class DDPGAgent:
 
     def save(self, path: str, tag: str = "") -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        torch.save(self._state(), path)
+        safe_save(self._state(), path)
         label = f" [{tag}]" if tag else ""
         print(f"[DDPG] Checkpoint salvato{label}: {path} "
               f"(arch: {self.actor_hidden})")
