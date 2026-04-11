@@ -637,17 +637,8 @@ def run_walk_forward(
             env               = env_train,
             normalizer        = normalizer,
             n_episodes        = buyer_cfg.n_episodes,
-            warmup            = buyer_cfg.warmup,
             log_every         = max(1, buyer_cfg.log_every * 5),
-            noise_decay       = ddpg_cfg.noise_decay,
-            noise_floor       = getattr(ddpg_cfg, "noise_floor", 0.02),
-            es_patience       = getattr(buyer_cfg, "es_patience", 50),
-            es_metric         = getattr(buyer_cfg, "es_metric",   "sharpe"),
-            best_path         = fold_best,
-            norm_path         = fold_norm,
-            episodic_episodes = getattr(buyer_cfg, "episodic_episodes", 20),
-            thermo_stress_fn  = stress_fn,
-            use_curriculum    = True,
+            norm_path= fold_norm,
         )
 
         # ── Valutazione con best checkpoint ───────────────────────────────
