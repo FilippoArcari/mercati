@@ -397,17 +397,8 @@ def run_trade(
         env           = env_train,
         normalizer    = normalizer,
         n_episodes    = buyer_cfg.n_episodes,
-        warmup        = buyer_cfg.warmup,
+        norm_path = norm_path,
         log_every     = buyer_cfg.log_every,
-        noise_decay   = ddpg_cfg.noise_decay,
-        noise_floor   = noise_floor,
-        es_patience   = es_patience,
-        es_metric     = es_metric,
-        best_path     = ddpg_best_path,
-        norm_path     = norm_path,
-        episodic_episodes = getattr(buyer_cfg, "episodic_episodes", 20),
-        thermo_stress_fn  = stress_fn,
-        use_curriculum    = True,
     )
     agent.save(ddpg_path, tag="FINAL")
 
