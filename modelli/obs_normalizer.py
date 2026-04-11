@@ -113,16 +113,48 @@ def train_ddpg_normalized(
 
     FIX 6  Aggiunta gestione episodic_buffer.start_episode() / end_episode()
            (necessaria per il curriculum replay)
+
+    FIX 7  Gestione API gymnasium vs gym:
+           - reset() → (obs, info) in gymnasium, obs in gym
+           - step()  → (obs, r, terminated, truncated, info) in gymnasium
+                        (obs, r, done, info) in gym
+           Senza questo fix, raw_state è una tupla e np.mean() crasha
+           con ValueError: inhomogeneous shape.
     """
     if normalizer is None:
         normalizer = ObsNormalizer(shape=env.observation_space.shape[0])
+
+    # ── Rileva API: gymnasium (5-tuple step) vs gym (4-tuple step) ───────────
+    _gymnasium_api = False
+    try:
+        import gymnasium  # noqa: F401
+        _gymnasium_api = True
+    except ImportError:
+        pass
+
+    def _reset_env():
+        """Spacchetta reset() per gymnasium (obs, info) e gym (obs)."""
+        result = env.reset()
+        if _gymnasium_api and isinstance(result, tuple):
+            return result[0]           # estrai solo obs
+        return result
+
+    def _step_env(action):
+        """Spacchetta step() per gymnasium (obs,r,term,trunc,info) e gym (obs,r,done,info)."""
+        result = env.step(action)
+        if _gymnasium_api and len(result) == 5:
+            obs, reward, terminated, truncated, info = result
+            done = terminated or truncated
+            return obs, reward, done, info
+        # gym classico: (obs, reward, done, info)
+        return result
 
     history     : list[dict] = []
     best_sharpe : float      = -np.inf
     no_improve  : int        = 0
 
     for ep in range(1, n_episodes + 1):
-        raw_state = env.reset()
+        raw_state = _reset_env()                              # FIX 7
         state     = normalizer.normalize(raw_state, update=True)
 
         # FIX 6 — notifica inizio episodio al buffer episodico
@@ -146,7 +178,7 @@ def train_ddpg_normalized(
 
             action = agent.act(state, explore=True, current_regime=current_regime)
 
-            next_raw_state, reward, done, info = env.step(action)
+            next_raw_state, reward, done, info = _step_env(action)  # FIX 7
             next_state = normalizer.normalize(next_raw_state, update=True)
 
             # FIX 1 — agent.store() scrive su buffer + episodic_buffer insieme

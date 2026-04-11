@@ -441,27 +441,41 @@ class DDPGAgent:
               f"(arch: {self.actor_hidden})")
 
     def load(self, path: str) -> bool:
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        from modelli.device_setup import get_map_location
+        ckpt = torch.load(path, map_location=get_map_location(), weights_only=False)
 
         saved_state_dim  = ckpt.get("state_dim")
         saved_action_dim = ckpt.get("action_dim")
-        saved_actor_h    = ckpt.get("actor_hidden")
+        # Normalizza a list per evitare falsi negativi (list vs tuple)
+        saved_actor_h    = list(ckpt.get("actor_hidden",  []))
+        saved_critic_h   = list(ckpt.get("critic_hidden", []))
 
-        if (saved_state_dim != self.state_dim or
-            saved_action_dim != self.action_dim or
-            saved_actor_h != self.actor_hidden):
+        mismatches = []
+        if saved_state_dim  != self.state_dim:    mismatches.append(f"state_dim:  ckpt={saved_state_dim}  now={self.state_dim}")
+        if saved_action_dim != self.action_dim:   mismatches.append(f"action_dim: ckpt={saved_action_dim} now={self.action_dim}")
+        if saved_actor_h    != list(self.actor_hidden):   mismatches.append(f"actor_hidden:  ckpt={saved_actor_h}  now={list(self.actor_hidden)}")
+        if saved_critic_h   != list(self.critic_hidden):  mismatches.append(f"critic_hidden: ckpt={saved_critic_h} now={list(self.critic_hidden)}")
+
+        if mismatches:
             print(
-                f"[DDPG] Checkpoint incompatibile (Architettura differente).\n"
-                f"  Checkpoint : {saved_actor_h}\n"
-                f"  Corrente   : {self.actor_hidden}\n"
-                f"  L'agente riparte da zero."
+                f"[DDPG] Checkpoint incompatibile — differenze:\n"
+                + "\n".join(f"  • {m}" for m in mismatches)
+                + "\n  L'agente riparte da zero."
             )
             return False
 
+        # Sposta i pesi sul device corrente dopo il caricamento
+        device = self.device
         self.actor.load_state_dict(ckpt["actor"])
         self.actor_target.load_state_dict(ckpt["actor_target"])
         self.critic.load_state_dict(ckpt["critic"])
         self.critic_target.load_state_dict(ckpt["critic_target"])
+        # Ensure weights are on the correct device (needed when checkpoint was on
+        # a different device and get_map_location() returned cpu as intermediate)
+        self.actor.to(device)
+        self.actor_target.to(device)
+        self.critic.to(device)
+        self.critic_target.to(device)
         print(f"[DDPG] Checkpoint caricato correttamente: {path}")
         return True
 
