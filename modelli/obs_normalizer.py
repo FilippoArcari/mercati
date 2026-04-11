@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import numpy as np
 import os
-from typing import Callable, Optional
+from typing import Optional
 
 
 # ─── Running Mean / Variance (Welford online algorithm) ───────────────────────
@@ -18,10 +18,10 @@ class RunningMeanStd:
     """
 
     def __init__(self, shape: int | tuple, epsilon: float = 1e-4):
-        self.shape   = (shape,) if isinstance(shape, int) else shape
-        self.mean    = np.zeros(self.shape, dtype=np.float64)
-        self.var     = np.ones(self.shape,  dtype=np.float64)
-        self.count   = epsilon
+        self.shape = (shape,) if isinstance(shape, int) else shape
+        self.mean  = np.zeros(self.shape, dtype=np.float64)
+        self.var   = np.ones(self.shape,  dtype=np.float64)
+        self.count = epsilon
 
     def update(self, x: np.ndarray):
         """Aggiorna le statistiche con un nuovo campione o batch x."""
@@ -29,18 +29,18 @@ class RunningMeanStd:
         batch_var   = np.var(x,  axis=0)
         batch_count = x.shape[0] if x.ndim > 1 else 1
 
-        delta        = batch_mean - self.mean
-        tot_count    = self.count + batch_count
+        delta     = batch_mean - self.mean
+        tot_count = self.count + batch_count
 
-        new_mean     = self.mean + delta * batch_count / tot_count
-        m_a          = self.var * self.count
-        m_b          = batch_var * batch_count
-        m2           = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
-        new_var      = m2 / tot_count
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a      = self.var * self.count
+        m_b      = batch_var * batch_count
+        m2       = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var  = m2 / tot_count
 
-        self.mean    = new_mean
-        self.var     = new_var
-        self.count   = tot_count
+        self.mean  = new_mean
+        self.var   = new_var
+        self.count = tot_count
 
 
 class ObsNormalizer:
@@ -56,82 +56,135 @@ class ObsNormalizer:
     def normalize(self, obs: np.ndarray, update: bool = True) -> np.ndarray:
         if update:
             self.rms.update(obs)
-        
-        # Standardizzazione: (x - mu) / sigma
-        std = np.sqrt(self.rms.var + 1e-8)
+
+        std      = np.sqrt(self.rms.var + 1e-8)
         norm_obs = (obs - self.rms.mean) / std
-        
-        # Clipping per evitare outliner estremi che destabilizzano la rete
+
         return np.clip(norm_obs, -self.clip, self.clip).astype(np.float32)
 
     def save(self, path: str):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         np.savez(path, mean=self.rms.mean, var=self.rms.var, count=self.rms.count)
 
     def load(self, path: str):
         if not os.path.exists(path):
             return
-        data = np.load(path)
+        data           = np.load(path)
         self.rms.mean  = data["mean"]
         self.rms.var   = data["var"]
         self.rms.count = data["count"]
 
 
-# ─── Training Loop con Normalizzazione e Integrazione Termodinamica ──────────
+# ─── Training Loop con Normalizzazione e Integrazione Termodinamica ───────────
 
 def train_ddpg_normalized(
     env,
     agent,
-    n_episodes: int = 50,
-    normalizer: Optional[ObsNormalizer] = None,
-    norm_path:  Optional[str] = None,
-    log_every:  int = 5,
-    es_patience: int = 20, # Early stopping
-):
+    n_episodes:  int                    = 50,
+    normalizer:  Optional[ObsNormalizer] = None,
+    norm_path:   Optional[str]           = None,
+    log_every:   int                    = 5,
+    es_patience: int                    = 20,
+    noise_decay: float                  = 0.995,
+    noise_floor: float                  = 0.02,
+) -> list[dict]:
     """
-    Loop di training standard con normalizzazione online dello stato.
-    Integrazione v3.0: Supporto per Adaptive Exploration Regime.
+    Loop di training con normalizzazione online dello stato.
+
+    Restituisce la history degli episodi (list[dict]), coerente con
+    run_trade / run_walk_forward che iterano su di essa.
+
+    Bug corretti rispetto alla versione precedente
+    ─────────────────────────────────────────────
+    FIX 1  agent.replay_buffer.push()  →  agent.store()
+           (l'attributo si chiama 'buffer', il metodo pubblico è store()
+            che aggiorna anche l'episodic_buffer in un colpo solo)
+
+    FIX 2  agent.get_last_train_info() →  raccolta losses da agent.update()
+           (il metodo non esiste su DDPGAgent; update() restituisce già il dict)
+
+    FIX 3  env._get_portfolio_value()  →  env.portfolio_history()[-1]
+           (il metodo privato non esiste nell'env)
+
+    FIX 4  return normalizer           →  return history
+           (trade.py assegna il risultato a 'history' e la itera)
+
+    FIX 5  Aggiunto agent.decay_noise() dopo ogni episodio (era assente)
+
+    FIX 6  Aggiunta gestione episodic_buffer.start_episode() / end_episode()
+           (necessaria per il curriculum replay)
     """
     if normalizer is None:
         normalizer = ObsNormalizer(shape=env.observation_space.shape[0])
 
-    best_sharpe = -np.inf
-    no_improve  = 0
+    history     : list[dict] = []
+    best_sharpe : float      = -np.inf
+    no_improve  : int        = 0
 
     for ep in range(1, n_episodes + 1):
         raw_state = env.reset()
-        # Primo step: non aggiorniamo il normalizzatore sul reset per evitare bias
-        state = normalizer.normalize(raw_state, update=True)
-        
-        ep_reward = 0.0
-        done = False
-        
+        state     = normalizer.normalize(raw_state, update=True)
+
+        # FIX 6 — notifica inizio episodio al buffer episodico
+        if agent.episodic_buffer is not None:
+            agent.episodic_buffer.start_episode()
+
+        agent.reset_noise()
+
+        ep_reward     : float      = 0.0
+        critic_losses : list[float] = []
+        actor_losses  : list[float] = []
+        done          : bool        = False
+
         while not done:
-            # ★ INNOVAZIONE: Recupero del regime termodinamico dall'ambiente
-            # Se l'ambiente non ha ancora il metodo, default a 0.0 (regime neutro)
-            current_regime = env.get_current_regime() if hasattr(env, 'get_current_regime') else 0.0
-            
-            # ★ INNOVAZIONE: Passaggio del regime all'agente per scalare il rumore (noise)
+            # Regime termodinamico per scalare il rumore (0 = neutro se assente)
+            current_regime: float = (
+                env.get_current_regime()
+                if hasattr(env, "get_current_regime")
+                else 0.0
+            )
+
             action = agent.act(state, explore=True, current_regime=current_regime)
-            
+
             next_raw_state, reward, done, info = env.step(action)
-            
-            # Normalizziamo il prossimo stato
             next_state = normalizer.normalize(next_raw_state, update=True)
-            
-            # Memorizzazione ed eventuale update
-            agent.replay_buffer.push(state, action, reward, next_state, done)
-            
-            if len(agent.replay_buffer) > getattr(agent, "batch_size", 256):
-                agent.update()
-                
-            state = next_state
+
+            # FIX 1 — agent.store() scrive su buffer + episodic_buffer insieme
+            agent.store(state, action, reward, next_state, done)
+
+            # FIX 2 — losses dal valore di ritorno di update(), non da un metodo inesistente
+            losses = agent.update()
+            if losses:
+                critic_losses.append(losses["critic_loss"])
+                actor_losses.append(losses["actor_loss"])
+
+            state      = next_state
             ep_reward += reward
+
+        # FIX 5 — decadimento rumore dopo ogni episodio
+        agent.decay_noise(factor=noise_decay, floor=noise_floor)
 
         # Metriche di fine episodio
         sharpe    = env.sharpe_ratio()
-        portfolio = env._get_portfolio_value()
+        # FIX 3 — portfolio_history()[-1] invece di _get_portfolio_value()
+        portfolio = env.portfolio_history()[-1]
         max_dd    = env.max_drawdown()
-        ep_info   = agent.get_last_train_info()
+
+        # FIX 6 — notifica fine episodio al buffer episodico
+        if agent.episodic_buffer is not None:
+            agent.episodic_buffer.end_episode(sharpe=sharpe)
+
+        ep_info: dict = {
+            "episode":         ep,
+            "total_reward":    ep_reward,
+            "portfolio_value": portfolio,
+            "sharpe":          sharpe,
+            "max_drawdown":    max_dd,
+            "noise_sigma":     agent.noise.sigma,
+            "critic_loss":     float(np.mean(critic_losses)) if critic_losses else None,
+            "actor_loss":      float(np.mean(actor_losses))  if actor_losses  else None,
+        }
+        history.append(ep_info)
 
         # Early Stopping / Saving Logic
         if sharpe > best_sharpe:
@@ -143,23 +196,33 @@ def train_ddpg_normalized(
             no_improve += 1
 
         if ep % log_every == 0:
-            cl = f"{ep_info['critic_loss']:.5f}" if ep_info["critic_loss"] else "n/a"
-            al = f"{ep_info['actor_loss']:.5f}"  if ep_info["actor_loss"]  else "n/a"
-
+            cl       = f"{ep_info['critic_loss']:.5f}" if ep_info["critic_loss"] else "n/a"
+            al       = f"{ep_info['actor_loss']:.5f}"  if ep_info["actor_loss"]  else "n/a"
             best_tag = " ★" if no_improve == 0 else f" ({no_improve}/{es_patience})"
-            
+
+            ep_buf_str = ""
+            if agent.episodic_buffer is not None:
+                ep_buf_str = (
+                    f" | EpBuf: {agent.episodic_buffer.n_episodes}/"
+                    f"{agent.episodic_buffer.max_episodes}"
+                    f" best={agent.episodic_buffer.best_sharpe:.2f}"
+                )
+
             print(
                 f"Ep {ep:4d}/{n_episodes} | "
                 f"Reward: {ep_reward:+.4f} | "
                 f"Portfolio: ${portfolio:,.0f} | "
                 f"Sharpe: {sharpe:.3f} | "
                 f"MaxDD: {max_dd:.3f} | "
-                f"Sigma: {agent.noise.sigma:.3f} | "
-                f"C: {cl} | A: {al}{best_tag}"
+                f"σ: {agent.noise.sigma:.3f} | "
+                f"C: {cl} | A: {al}"
+                f"{ep_buf_str}"
+                f"{best_tag}"
             )
 
         if no_improve >= es_patience:
             print(f"Early stopping triggerato all'episodio {ep}")
             break
 
-    return normalizer
+    # FIX 4 — restituisce history (atteso da trade.py), non normalizer
+    return history
