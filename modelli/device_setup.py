@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Union, List, Tuple
+from typing import Union, List, Tuple, Callable
 
 import torch
 
@@ -239,6 +239,30 @@ def get_device(verbose: bool = True) -> torch.device:
     return detect_device(verbose=verbose).device
 
 
+# ─── Monkey-patch torch.load per gestire location 'xla:0' ──────────────────────
+
+def _patch_torch_serialization():
+    """
+    Riconosce e gestisce tag di device non registrati (es. 'xla:0' su macchine non-TPU).
+    Evita il RuntimeError: 'don't know how to restore data location...'.
+    """
+    import torch.serialization
+    original_restore = torch.serialization.default_restore_location
+
+    def patched_restore(storage, location):
+        try:
+            return original_restore(storage, location)
+        except RuntimeError as e:
+            if "don't know how to restore data location" in str(e):
+                # Fallback: carica lo storage così com'è (CPU)
+                return storage
+            raise e
+
+    torch.serialization.default_restore_location = patched_restore
+
+_patch_torch_serialization()
+
+
 # ─── map_location per torch.load ─────────────────────────────────────────────
 
 def get_map_location() -> Union[torch.device, str, None]:
@@ -247,20 +271,15 @@ def get_map_location() -> Union[torch.device, str, None]:
 
     Garantisce che un checkpoint addestrato su qualsiasi backend
     (CUDA, XLA, CPU) venga caricato correttamente sul device corrente.
-
-    Esempi
-    ------
-    Checkpoint addestrato su 2×T4 → caricato su TPU:
-        torch.load(path, map_location=get_map_location())
     """
     cfg = detect_device(verbose=False)
+    target_device = cfg.device
 
+    # Se il target è XLA (TPU), caricare prima su CPU e poi spostare è spesso più sicuro
     if cfg.backend == "xla":
-        # XLA non accetta torch.device direttamente: usa la stringa 'xla:0'
-        # o lasciamo a CPU e poi spostiamo noi (più sicuro)
-        return torch.device("cpu")   # il chiamante farà .to(get_device()) dopo
+        return torch.device("cpu")
 
-    return cfg.device
+    return target_device
 
 
 # ─── Salvataggio portabile ────────────────────────────────────────────────────

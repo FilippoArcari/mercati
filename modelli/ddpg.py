@@ -9,7 +9,7 @@ from stable_baselines3 import DDPG
 from stable_baselines3.common.noise import OrnsteinUhlenbeckActionNoise
 from stable_baselines3.common.callbacks import BaseCallback
 
-from modelli.device_setup import get_device
+from modelli.device_setup import get_device, get_map_location
 
 # ─── Phase-Aware Noise Scaler ─────────────────────────────────────────────────
 
@@ -147,7 +147,7 @@ class DDPGAgent:
         if path.endswith(".pth"):
             path = path.replace(".pth", "")
         if os.path.exists(path + ".zip") or os.path.exists(path):
-            self.model = DDPG.load(path, device=self.device)
+            self.model = DDPG.load(path, device=get_map_location())
             print(f"[SB3 DDPG] Checkpoint caricato: {path}")
             return True
         return False
