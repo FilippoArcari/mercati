@@ -306,8 +306,10 @@ def calibrate_single(
         std1 = np.std(returns[:-1])
         std2 = np.std(returns[1:])
         if std1 > 1e-8 and std2 > 1e-8:
-            ac = np.corrcoef(returns[:-1], returns[1:])[0, 1]
-            momentum_strength = float(max(0.0, np.nan_to_num(ac)))
+            with np.errstate(divide='ignore', invalid='ignore'):
+                c_matrix = np.corrcoef(returns[:-1], returns[1:])
+                ac = c_matrix[0, 1] if not np.isnan(c_matrix[0, 1]) else 0.0
+            momentum_strength = float(max(0.0, ac))
         else:
             momentum_strength = 0.0
     else:

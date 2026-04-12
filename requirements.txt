@@ -11,6 +11,8 @@ pandas>=2.3.0
 pandas-datareader>=0.10.0
 python-dotenv>=1.2.2
 torch>=2.10.0
+pytorch-lightning>=2.0.0
+stable-baselines3>=2.0.0
 yfinance>=0.2.66
 
 # Transitive Dependencies (explicitly declared for clarity)

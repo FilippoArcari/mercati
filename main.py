@@ -5,6 +5,7 @@ import torch
 import os
 import hydra
 import sys
+from typing import Optional
 
 from modelli.pred import Pred
 from modelli.trade import run_trade
@@ -80,7 +81,13 @@ def compute_moment_target(train_df, tickers, cfg):
     return F
 
 
-def build_predictor(cfg, num_features: int) -> Pred:
+def build_predictor(
+    cfg,
+    num_features: int,
+    prior_mean: Optional[torch.Tensor] = None,
+    prior_std: Optional[torch.Tensor] = None,
+    moment_target: Optional[torch.Tensor] = None,
+) -> Pred:
     return Pred(
         num_features=num_features,
         window_size=cfg.prediction.window_size,
@@ -89,7 +96,10 @@ def build_predictor(cfg, num_features: int) -> Pred:
         kernel_size=cfg.model.kernel_size,
         activation=cfg.model.activation,
         prediction_steps=cfg.model.prediction_steps,
-        max_grad_norm=getattr(cfg.training, "max_grad_norm", 1.0),
+        training_cfg=OmegaConf.to_container(cfg.training, resolve=True),
+        prior_mean=prior_mean,
+        prior_std=prior_std,
+        moment_target=moment_target,
     )
 
 
@@ -204,30 +214,42 @@ def my_app(cfg: DictConfig) -> None:
             persistent_workers=_pw,
             prefetch_factor=2 if _nw > 0 else None,
         )
+        import pytorch_lightning as pl
+
         print(f"[DataLoader] num_workers={_nw}, pin_memory={_pin}, backend={_dev_cfg.backend}")
         print(f"[Device] {_dev_cfg.hardware_label}")
-        predictor     = build_predictor(cfg, num_features).to(device)
-        moment_target = compute_moment_target(train_df, tickers, cfg)
-        if moment_target is not None:
-            moment_target = moment_target.to(device)
-
+        
         mre_cfg  = getattr(cfg.training, "mre", None)
+        prior_mean, prior_std = None, None
+        if mre_cfg and getattr(mre_cfg, "enabled", False):
+            from modelli.pred import PriorEstimator
+            prior = PriorEstimator()
+            prior.fit(train_loader)
+            prior_mean = prior.mean
+            prior_std = prior.std
+            
+        moment_target = compute_moment_target(train_df, tickers, cfg)
+        
+        predictor = build_predictor(cfg, num_features, prior_mean, prior_std, moment_target)
+
         mre_mode = getattr(mre_cfg, "update_mode", "mse") if mre_cfg else "mse"
         print(f"\nInizio addestramento (modalità: {mre_mode}, freq: {freq})...")
 
-        predictor.fit(
-            train_loader,
-            training_cfg=cfg.training,
-            moment_target=moment_target,
+        trainer = pl.Trainer(
+            max_epochs=cfg.training.epochs,
+            accelerator="auto",
+            devices="auto",
+            gradient_clip_val=getattr(cfg.training, "max_grad_norm", 1.0),
+            enable_progress_bar=True,
+            logger=False,
         )
+        trainer.fit(predictor, train_dataloaders=train_loader)
 
         pred_path = checkpoint_name(cfg, "pred.pth")
         os.makedirs(cfg.paths.checkpoint_dir, exist_ok=True)
-        # unwrap_model gestisce DataParallel *e* qualsiasi wrapper XLA
-        _model_to_save = unwrap_model(predictor)
         safe_save(
             {
-                "model_state_dict": _model_to_save.state_dict(),
+                "model_state_dict": predictor.state_dict(),
                 "scaler":           scaler,
                 "num_features":     num_features,
                 "frequency":        freq,
@@ -252,8 +274,10 @@ def my_app(cfg: DictConfig) -> None:
 
         checkpoint     = torch.load(pred_path, map_location=get_map_location(), weights_only=False)
         saved_features = checkpoint.get("num_features", num_features)
-        predictor      = build_predictor(cfg, saved_features).to(device)
-        predictor.load_state_dict(checkpoint["model_state_dict"])
+        # build_predictor expects the tensors if there were any, but here we just
+        # let checkpoint's load_state_dict fill the buffers, so we can pass None.
+        predictor      = build_predictor(cfg, saved_features, None, None, None).to(device)
+        predictor.load_state_dict(checkpoint["model_state_dict"], strict=False)
         predictor.eval()
 
         X_test_device  = X_test.to(device)

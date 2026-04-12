@@ -18,12 +18,8 @@ import pandas as pd
 from typing import Optional, List
 from dataclasses import dataclass
 
-try:
-    import gymnasium as gym
-    from gymnasium import spaces
-except ImportError:
-    import gym
-    from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 
 
 # ─── Thermodynamic Reward Gate ────────────────────────────────────────────────
@@ -220,12 +216,7 @@ class TradingEnv(gym.Env):
         self._reward_gate.reset()
 
         obs = self._get_state(self.current_step)
-        # Gymnasium restituisce (obs, info); gym restituisce solo obs
-        try:
-            import gymnasium
-            return obs, {}
-        except ImportError:
-            return obs
+        return obs, {}
 
     def _get_state(self, step: int) -> np.ndarray:
         # Slice Numpy nativa (copia memoria non necessaria per forward)
@@ -249,11 +240,7 @@ class TradingEnv(gym.Env):
     def step(self, action: np.ndarray):
         if self.done:
             obs = self._get_state(self.current_step)
-            try:
-                import gymnasium
-                return obs, 0.0, True, False, {}
-            except ImportError:
-                return obs, 0.0, True, {}
+            return obs, 0.0, True, False, {}
 
         prev_value   = self._get_portfolio_value()
         action_types = {}
@@ -308,11 +295,7 @@ class TradingEnv(gym.Env):
         obs    = self._get_state(self.current_step)
         info   = {"step": self.current_step}
 
-        try:
-            import gymnasium
-            return obs, reward, self.done, False, info
-        except ImportError:
-            return obs, reward, self.done, info
+        return obs, reward, self.done, False, info
 
     def _get_portfolio_value(self) -> float:
         value = self.balance

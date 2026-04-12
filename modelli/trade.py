@@ -23,9 +23,10 @@ import torch
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.ticker import FuncFormatter
+from omegaconf import OmegaConf
 
 from modelli.pred import Pred
-from modelli.ddpg import DDPGAgent, train_ddpg
+from modelli.ddpg import DDPGAgent
 from modelli.trading_env import TradingEnv
 from modelli.obs_normalizer import ObsNormalizer, train_ddpg_normalized
 from modelli.device_setup import get_device, get_map_location
@@ -75,9 +76,9 @@ def _load_predictor(cfg, num_features, checkpoint):
         kernel_size      = cfg.model.kernel_size,
         activation       = cfg.model.activation,
         prediction_steps = pred_steps,
-        max_grad_norm    = getattr(cfg.training, "max_grad_norm", 1.0),
+        training_cfg     = OmegaConf.to_container(cfg.training, resolve=True),
     )
-    predictor.load_state_dict(checkpoint["model_state_dict"])
+    predictor.load_state_dict(checkpoint["model_state_dict"], strict=False)
     predictor.eval()
 
     from modelli.device_setup import get_device
@@ -405,11 +406,18 @@ def run_trade(
 
     print("\nValutazione sul test set...")
     raw_state = env_test.reset()
+    if isinstance(raw_state, tuple):
+        raw_state = raw_state[0]
     state     = normalizer.normalize(raw_state, update=False)
     done      = False
     while not done:
         action               = agent.act(state, explore=False)
-        raw_next, _, done, _ = env_test.step(action)
+        step_result          = env_test.step(action)
+        if len(step_result) == 5:
+            raw_next, _, terminated, truncated, _ = step_result
+            done = terminated or truncated
+        else:
+            raw_next, _, done, _ = step_result
         state                = normalizer.normalize(raw_next, update=False)
 
     # ── 8. Output ─────────────────────────────────────────────────────────────
@@ -637,11 +645,18 @@ def run_walk_forward(
             normalizer.load(fold_norm)
 
         raw_state = env_test.reset()
+        if isinstance(raw_state, tuple):
+            raw_state = raw_state[0]
         state     = normalizer.normalize(raw_state, update=False)
         done      = False
         while not done:
             action               = agent.act(state, explore=False)
-            raw_next, _, done, _ = env_test.step(action)
+            step_result          = env_test.step(action)
+            if len(step_result) == 5:
+                raw_next, _, terminated, truncated, _ = step_result
+                done = terminated or truncated
+            else:
+                raw_next, _, done, _ = step_result
             state                = normalizer.normalize(raw_next, update=False)
 
         # ── Metriche fold ─────────────────────────────────────────────────────
@@ -741,6 +756,8 @@ def run_walk_forward(
         )
 
         raw_state  = env_ensemble.reset()
+        if isinstance(raw_state, tuple):
+            raw_state = raw_state[0]
         last_norm  = ensemble_norms[-1]
         state      = last_norm.normalize(raw_state, update=False)
         done       = False
@@ -753,7 +770,12 @@ def run_walk_forward(
                 current_thermo = np.zeros(len(ensemble_profiles[0]), dtype=np.float32)
 
             action               = ensemble.act(state, current_thermo, explore=False)
-            raw_next, _, done, _ = env_ensemble.step(action)
+            step_result          = env_ensemble.step(action)
+            if len(step_result) == 5:
+                raw_next, _, terminated, truncated, _ = step_result
+                done = terminated or truncated
+            else:
+                raw_next, _, done, _ = step_result
             state                = last_norm.normalize(raw_next, update=False)
             step_idx            += 1
 

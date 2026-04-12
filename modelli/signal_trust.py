@@ -119,7 +119,9 @@ def _safe_corr(x: np.ndarray, y: np.ndarray) -> float:
     x_, y_ = x[mask], y[mask]
     if x_.std() < 1e-10 or y_.std() < 1e-10:
         return 0.0
-    return float(np.corrcoef(x_, y_)[0, 1])
+    with np.errstate(divide='ignore', invalid='ignore'):
+        c_matrix = np.corrcoef(x_, y_)
+        return float(c_matrix[0, 1]) if not np.isnan(c_matrix[0, 1]) else 0.0
 
 
 def _sanitize(s: pd.Series, fill: float = 0.0) -> pd.Series:

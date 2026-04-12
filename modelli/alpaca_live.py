@@ -315,39 +315,27 @@ def _build_state(bars_scaled: np.ndarray, pred_scaled: np.ndarray,
                  initial_equity: float) -> np.ndarray:
     """
     Costruisce il vettore di stato IDENTICO a TradingEnv._get_state():
-
-      [prices_real(F) | prices_pred(F) | holdings_ratio(ALL_T) |
-       cash_ratio(1)  | portfolio_ratio(1) | thermo(7)]
-
-    IMPORTANTE: holdings_ratio usa TUTTI i ticker del training (all_tickers),
-    non solo quelli tradabili su Alpaca. I ticker non tradabili hanno holdings=0.
-    Questo è fondamentale per la compatibilità con il checkpoint DDPG addestrato
-    su tutti i 51 ticker.
+    [obs(F) | port_state(2) | thermo_state(N)]
     """
-    row_real = bars_scaled[-1].astype(np.float32)
-    row_pred = pred_scaled[0].astype(np.float32) if pred_scaled is not None \
-               else np.zeros(num_features, np.float32)
+    obs = bars_scaled[-1].astype(np.float32)
 
     eq  = account["equity"]
     pos = account["positions"]
+    cash = account["cash"]
 
-    # Holdings su TUTTI i ticker del training (non solo tradeable)
-    hold_ratio = np.array([
-        pos.get(t, {}).get("market_value", 0.0)
-        for t in all_tickers
-    ], np.float32) / (eq + 1e-8)
+    # holdings_val
+    holdings_val = sum(pos.get(t, {}).get("market_value", 0.0) for t in tradeable)
 
-    cash_ratio = account["cash"] / (eq + 1e-8)
-    port_ratio = eq / (initial_equity + 1e-8)
+    port_state = np.array([
+        cash / (initial_equity + 1e-8),
+        holdings_val / (initial_equity + 1e-8),
+    ], dtype=np.float32)
 
-    thm_cols = [c for c in thermo_df.columns if c.startswith("Thm_")]
-    thermo   = thermo_df[thm_cols].iloc[-1].values.astype(np.float32) \
-               if not thermo_df.empty and thm_cols else np.zeros(7, np.float32)
+    thermo_state = thermo_df.iloc[-1].values.astype(np.float32) \
+                   if not thermo_df.empty else np.array([], dtype=np.float32)
 
     return np.concatenate([
-        row_real, row_pred, hold_ratio,
-        np.array([cash_ratio, port_ratio], np.float32),
-        thermo,
+        obs, port_state, thermo_state
     ]).astype(np.float32)
 
 
@@ -508,17 +496,23 @@ def run_alpaca(cfg) -> None:
     # ── Carica modelli ─────────────────────────────────────────────────────
     predictor, scaler, num_features, device = _load_predictor(cfg, log)
 
-    N_THERMO  = 7  # colonne canoniche ThermoStateBuilder
-    # state_dim identico a TradingEnv: usa TUTTI i ticker del training
-    state_dim = 2 * num_features + len(all_tickers) + 2 + N_THERMO
-    log.info(f"state_dim={state_dim} (F={num_features} ALL_T={len(all_tickers)} tradeable={len(tradeable)} thm={N_THERMO})")
+    from modelli.thermo_state_builder import ThermoStateBuilder
+    thermo_builder = ThermoStateBuilder(interval=freq)
+
+    dummy_bars = pd.DataFrame(index=[datetime.datetime.now()], columns=all_tickers).fillna(1.0)
+    try:
+        dummy_thermo = thermo_builder.build(dummy_bars, all_tickers)
+        N_THERMO = len(dummy_thermo.columns) if dummy_thermo is not None else 0
+    except Exception:
+        N_THERMO = 37  # fallback
+
+    # state_dim identico a TradingEnv:
+    state_dim = num_features + 2 + N_THERMO
+    log.info(f"state_dim={state_dim} (F={num_features} port=2 thm={N_THERMO})")
 
     agent, normalizer, tradeable_indices = _load_agent(
         cfg, state_dim, all_tickers, tradeable, device, log
     )
-
-    from modelli.thermo_state_builder import ThermoStateBuilder
-    thermo_builder = ThermoStateBuilder(interval=freq)
 
 
     # ── Connessione ────────────────────────────────────────────────────────
@@ -879,15 +873,21 @@ def run_alpaca_replay(cfg) -> None:
     # ── Carica modelli ─────────────────────────────────────────────────────
     predictor, scaler, num_features, device = _load_predictor(cfg, log)
 
-    N_THERMO  = 7
-    state_dim = 2 * num_features + len(all_tickers) + 2 + N_THERMO
-    log.info(f"state_dim={state_dim} (F={num_features} ALL_T={len(all_tickers)} tradeable={len(tradeable)} thm={N_THERMO})")
+    from modelli.thermo_state_builder import ThermoStateBuilder
+    thermo_builder = ThermoStateBuilder(interval=freq)
+
+    dummy_bars = pd.DataFrame(index=[datetime.datetime.now()], columns=all_tickers).fillna(1.0)
+    try:
+        dummy_thermo = thermo_builder.build(dummy_bars, all_tickers)
+        N_THERMO = len(dummy_thermo.columns) if dummy_thermo is not None else 0
+    except Exception:
+        N_THERMO = 37  # fallback
+
+    state_dim = num_features + 2 + N_THERMO
+    log.info(f"state_dim={state_dim} (F={num_features} port=2 thm={N_THERMO})")
     agent, normalizer, tradeable_indices = _load_agent(
         cfg, state_dim, all_tickers, tradeable, device, log
     )
-
-    from modelli.thermo_state_builder import ThermoStateBuilder
-    thermo_builder = ThermoStateBuilder(interval=freq)
 
     # ── Connessione Alpaca ─────────────────────────────────────────────────
     tc, dc = _init_alpaca(log)

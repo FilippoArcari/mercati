@@ -1,0 +1,6 @@
+- step=buyer
+- frequency=minute
+- buyer.n_episodes=2
+- training=minute
+- prediction=minute
+- buyer=minute

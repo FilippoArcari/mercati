@@ -1,22 +1,14 @@
-"""
-modelli/obs_normalizer.py — Normalizzazione online dello stato per DDPG con Training Adattivo
-"""
-
-from __future__ import annotations
-
 import numpy as np
 import os
+import gymnasium as gym
 from typing import Optional
 
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.vec_env import DummyVecEnv
 
 # ─── Running Mean / Variance (Welford online algorithm) ───────────────────────
 
 class RunningMeanStd:
-    """
-    Stima incrementale di media e varianza con l'algoritmo di Welford.
-    Numericamente stabile, aggiornabile un campione (o un batch) alla volta.
-    """
-
     def __init__(self, shape: int | tuple, epsilon: float = 1e-4):
         self.shape = (shape,) if isinstance(shape, int) else shape
         self.mean  = np.zeros(self.shape, dtype=np.float64)
@@ -24,7 +16,6 @@ class RunningMeanStd:
         self.count = epsilon
 
     def update(self, x: np.ndarray):
-        """Aggiorna le statistiche con un nuovo campione o batch x."""
         batch_mean  = np.mean(x, axis=0)
         batch_var   = np.var(x,  axis=0)
         batch_count = x.shape[0] if x.ndim > 1 else 1
@@ -44,18 +35,13 @@ class RunningMeanStd:
 
 
 class ObsNormalizer:
-    """
-    Normalizzatore di osservazioni per DDPG.
-    Sottrae la media e divide per la deviazione standard in modo incrementale.
-    """
-
     def __init__(self, shape: int, clip: float = 10.0):
         self.rms  = RunningMeanStd(shape=shape)
         self.clip = clip
 
     def normalize(self, obs: np.ndarray, update: bool = True) -> np.ndarray:
         if update:
-            self.rms.update(obs)
+             self.rms.update(np.expand_dims(obs, axis=0) if obs.ndim == 1 else obs)
 
         std      = np.sqrt(self.rms.var + 1e-8)
         norm_obs = (obs - self.rms.mean) / std
@@ -75,7 +61,98 @@ class ObsNormalizer:
         self.rms.count = data["count"]
 
 
-# ─── Training Loop con Normalizzazione e Integrazione Termodinamica ───────────
+class ObsNormalizerWrapper(gym.ObservationWrapper):
+    def __init__(self, env, normalizer: ObsNormalizer):
+        super().__init__(env)
+        self.normalizer = normalizer
+
+    def observation(self, observation):
+        # In Gymnasium, self.observation(obs) riceve solo l'array observation
+        obs = observation
+        # L'update avviene durante l'esplorazione step() tramite il Wrapper in train mode
+        return self.normalizer.normalize(obs, update=True)
+
+
+class HistoryAndDecayCallback(BaseCallback):
+    """
+    Callback per replicare il comportamento di history e log del vecchio DDPG,
+    compatibile con l'early stopping in trade.py.
+    """
+    def __init__(self, agent_wrapper, n_episodes: int, norm_path: str, ckpt_path: str, log_every: int, es_patience: int, noise_decay: float, noise_floor: float, verbose=0):
+        super().__init__(verbose)
+        self.agent_wrapper = agent_wrapper
+        self.history = []
+        self.best_sharpe = -np.inf
+        self.no_improve = 0
+        self.n_episodes = n_episodes
+        self.norm_path = norm_path
+        self.ckpt_path = ckpt_path
+        self.log_every = log_every
+        self.es_patience = es_patience
+        self.noise_decay = noise_decay
+        self.noise_floor = noise_floor
+
+        self.ep = 0
+        self.ep_reward = 0.0
+
+    def _on_step(self) -> bool:
+        self.ep_reward += self.locals.get("rewards")[0]
+
+        if self.locals.get("dones")[0]:
+            self.ep += 1
+            e = self.training_env.envs[0].unwrapped
+            sharpe = e.sharpe_ratio()
+            portfolio = e.portfolio_history()[-1]
+            max_dd = e.max_drawdown()
+
+            # Decadimento rumore
+            self.agent_wrapper.decay_noise(factor=self.noise_decay, floor=self.noise_floor)
+
+            ep_info = {
+                "episode":         self.ep,
+                "total_reward":    self.ep_reward,
+                "portfolio_value": portfolio,
+                "sharpe":          sharpe,
+                "max_drawdown":    max_dd,
+                "noise_sigma":     self.agent_wrapper.noise.sigma,
+                "critic_loss":     0.0, # SB3 logs are tricky to grab directly per episode without hacking logger
+                "actor_loss":      0.0,
+            }
+            self.history.append(ep_info)
+            self.ep_reward = 0.0
+
+            # Early Stopping / Saving
+            if sharpe > self.best_sharpe:
+                self.best_sharpe = sharpe
+                self.no_improve = 0
+                if self.norm_path:
+                    # Riferimento al wrapper custom
+                    self.training_env.envs[0].normalizer.save(self.norm_path)
+                if self.ckpt_path:
+                    self.agent_wrapper.save(self.ckpt_path, tag=f"BEST Ep {self.ep}")
+            else:
+                self.no_improve += 1
+
+            if self.ep % self.log_every == 0:
+                best_tag = " ★" if self.no_improve == 0 else f" ({self.no_improve}/{self.es_patience})"
+                print(
+                    f"Ep {self.ep:4d}/{self.n_episodes} | "
+                    f"Reward: {ep_info['total_reward']:+.4f} | "
+                    f"Portfolio: ${portfolio:,.0f} | "
+                    f"Sharpe: {sharpe:.3f} | "
+                    f"MaxDD: {max_dd:.3f} | "
+                    f"σ: {self.agent_wrapper.noise.sigma:.3f}"
+                    f"{best_tag}"
+                )
+
+            if self.no_improve >= self.es_patience or self.ep >= self.n_episodes:
+                if self.no_improve >= self.es_patience:
+                    print(f"Early stopping triggerato all'episodio {self.ep}")
+                # Ferma il training (SB3)
+                return False
+
+        return True
+
 
 def train_ddpg_normalized(
     env,
@@ -89,175 +166,36 @@ def train_ddpg_normalized(
     noise_decay: float                  = 0.995,
     noise_floor: float                  = 0.02,
 ) -> list[dict]:
-    """
-    Loop di training con normalizzazione online dello stato.
-
-    Restituisce la history degli episodi (list[dict]), coerente con
-    run_trade / run_walk_forward che iterano su di essa.
-
-    Bug corretti rispetto alla versione precedente
-    ─────────────────────────────────────────────
-    FIX 1  agent.replay_buffer.push()  →  agent.store()
-           (l'attributo si chiama 'buffer', il metodo pubblico è store()
-            che aggiorna anche l'episodic_buffer in un colpo solo)
-
-    FIX 2  agent.get_last_train_info() →  raccolta losses da agent.update()
-           (il metodo non esiste su DDPGAgent; update() restituisce già il dict)
-
-    FIX 3  env._get_portfolio_value()  →  env.portfolio_history()[-1]
-           (il metodo privato non esiste nell'env)
-
-    FIX 4  return normalizer           →  return history
-           (trade.py assegna il risultato a 'history' e la itera)
-
-    FIX 5  Aggiunto agent.decay_noise() dopo ogni episodio (era assente)
-
-    FIX 6  Aggiunta gestione episodic_buffer.start_episode() / end_episode()
-           (necessaria per il curriculum replay)
-
-    FIX 7  Gestione API gymnasium vs gym:
-           - reset() → (obs, info) in gymnasium, obs in gym
-           - step()  → (obs, r, terminated, truncated, info) in gymnasium
-                        (obs, r, done, info) in gym
-           Senza questo fix, raw_state è una tupla e np.mean() crasha
-           con ValueError: inhomogeneous shape.
-    """
+    
     if normalizer is None:
         normalizer = ObsNormalizer(shape=env.observation_space.shape[0])
 
-    # ── Rileva API: gymnasium (5-tuple step) vs gym (4-tuple step) ───────────
-    _gymnasium_api = False
-    try:
-        import gymnasium  # noqa: F401
-        _gymnasium_api = True
-    except ImportError:
-        pass
-
-    def _reset_env():
-        """Spacchetta reset() per gymnasium (obs, info) e gym (obs)."""
-        result = env.reset()
-        if _gymnasium_api and isinstance(result, tuple):
-            return result[0]           # estrai solo obs
-        return result
-
-    def _step_env(action):
-        """Spacchetta step() per gymnasium (obs,r,term,trunc,info) e gym (obs,r,done,info)."""
-        result = env.step(action)
-        if _gymnasium_api and len(result) == 5:
-            obs, reward, terminated, truncated, info = result
-            done = terminated or truncated
-            return obs, reward, done, info
-        # gym classico: (obs, reward, done, info)
-        return result
-
-    history     : list[dict] = []
-    best_sharpe : float      = -np.inf
-    no_improve  : int        = 0
-
-    for ep in range(1, n_episodes + 1):
-        raw_state = _reset_env()                              # FIX 7
-        state     = normalizer.normalize(raw_state, update=True)
-
-        # FIX 6 — notifica inizio episodio al buffer episodico
-        if agent.episodic_buffer is not None:
-            agent.episodic_buffer.start_episode()
-
-        agent.reset_noise()
-
-        ep_reward     : float      = 0.0
-        critic_losses : list[float] = []
-        actor_losses  : list[float] = []
-        done          : bool        = False
-
-        while not done:
-            # Regime termodinamico per scalare il rumore (0 = neutro se assente)
-            current_regime: float = (
-                env.get_current_regime()
-                if hasattr(env, "get_current_regime")
-                else 0.0
-            )
-
-            action = agent.act(state, explore=True, current_regime=current_regime)
-
-            next_raw_state, reward, done, info = _step_env(action)  # FIX 7
-            next_state = normalizer.normalize(next_raw_state, update=True)
-
-            # FIX 1 — agent.store() scrive su buffer + episodic_buffer insieme
-            agent.store(state, action, reward, next_state, done)
-
-            # FIX 2 — losses dal valore di ritorno di update(), non da un metodo inesistente
-            losses = agent.update()
-            if losses:
-                critic_losses.append(losses["critic_loss"])
-                actor_losses.append(losses["actor_loss"])
-
-            state      = next_state
-            ep_reward += reward
-
-        # FIX 5 — decadimento rumore dopo ogni episodio
-        agent.decay_noise(factor=noise_decay, floor=noise_floor)
-
-        # Metriche di fine episodio
-        sharpe    = env.sharpe_ratio()
-        # FIX 3 — portfolio_history()[-1] invece di _get_portfolio_value()
-        portfolio = env.portfolio_history()[-1]
-        max_dd    = env.max_drawdown()
-
-        # FIX 6 — notifica fine episodio al buffer episodico
-        if agent.episodic_buffer is not None:
-            agent.episodic_buffer.end_episode(sharpe=sharpe)
-
-        ep_info: dict = {
-            "episode":         ep,
-            "total_reward":    ep_reward,
-            "portfolio_value": portfolio,
-            "sharpe":          sharpe,
-            "max_drawdown":    max_dd,
-            "noise_sigma":     agent.noise.sigma,
-            "critic_loss":     float(np.mean(critic_losses)) if critic_losses else None,
-            "actor_loss":      float(np.mean(actor_losses))  if actor_losses  else None,
-        }
-        history.append(ep_info)
-
-        # Early Stopping / Saving Logic
-        if sharpe > best_sharpe:
-            best_sharpe = sharpe
-            no_improve  = 0
-            if norm_path:
-                normalizer.save(norm_path)
-            if ckpt_path and hasattr(agent, "save"):
-                agent.save(ckpt_path, tag=f"BEST Ep {ep}")
-        else:
-            no_improve += 1
-
-        if ep % log_every == 0:
-            cl       = f"{ep_info['critic_loss']:.5f}" if ep_info["critic_loss"] else "n/a"
-            al       = f"{ep_info['actor_loss']:.5f}"  if ep_info["actor_loss"]  else "n/a"
-            best_tag = " ★" if no_improve == 0 else f" ({no_improve}/{es_patience})"
-
-            ep_buf_str = ""
-            if agent.episodic_buffer is not None:
-                ep_buf_str = (
-                    f" | EpBuf: {agent.episodic_buffer.n_episodes}/"
-                    f"{agent.episodic_buffer.max_episodes}"
-                    f" best={agent.episodic_buffer.best_sharpe:.2f}"
-                )
-
-            print(
-                f"Ep {ep:4d}/{n_episodes} | "
-                f"Reward: {ep_reward:+.4f} | "
-                f"Portfolio: ${portfolio:,.0f} | "
-                f"Sharpe: {sharpe:.3f} | "
-                f"MaxDD: {max_dd:.3f} | "
-                f"σ: {agent.noise.sigma:.3f} | "
-                f"C: {cl} | A: {al}"
-                f"{ep_buf_str}"
-                f"{best_tag}"
-            )
-
-        if no_improve >= es_patience:
-            print(f"Early stopping triggerato all'episodio {ep}")
-            break
-
-    # FIX 4 — restituisce history (atteso da trade.py), non normalizer
-    return history
+    wrapped_env = ObsNormalizerWrapper(env, normalizer)
+    vec_env = DummyVecEnv([lambda: wrapped_env])
+    
+    agent.set_env(vec_env)
+    
+    callback = HistoryAndDecayCallback(
+        agent_wrapper=agent,
+        n_episodes=n_episodes,
+        norm_path=norm_path,
+        ckpt_path=ckpt_path,
+        log_every=log_every,
+        es_patience=es_patience,
+        noise_decay=noise_decay,
+        noise_floor=noise_floor,
+    )
+    
+    # Optional: ThermoNoiseCallback for phase-aware noise
+    from modelli.ddpg import ThermoNoiseCallback
+    thermo_callback = ThermoNoiseCallback(base_sigma=agent.noise.sigma)
+    
+    from stable_baselines3.common.callbacks import CallbackList
+    callbacks = CallbackList([callback, thermo_callback])
+    
+    # 1 episode = length of env dataframe
+    total_timesteps = n_episodes * len(env.df)
+    
+    agent.model.learn(total_timesteps, callback=callbacks)
+    
+    return callback.history

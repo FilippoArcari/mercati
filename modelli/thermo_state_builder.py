@@ -529,8 +529,11 @@ class ThermoStateBuilder:
         corrs = []
         for lag in range(self.max_lag + 1):
             if lag < len(r):
-                c = np.corrcoef(p[lag:], r[:len(r) - lag])[0, 1]
-                corrs.append(abs(c) if np.isfinite(c) else 0.0)
+                # Protezione contro varianza zero per evitare RuntimeWarning: invalid value in divide
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    c_matrix = np.corrcoef(p[lag:], r[:len(r) - lag])
+                    c = c_matrix[0, 1] if not np.isnan(c_matrix[0, 1]) else 0.0
+                corrs.append(abs(c))
             else:
                 corrs.append(0.0)
         return int(np.argmax(corrs))

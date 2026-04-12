@@ -114,7 +114,8 @@ class AdaptiveLagEstimator:
                 correlations.append(0.0)
                 continue
             
-            corr = aligned.corr(shifted)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                corr = aligned.corr(shifted)
             correlations.append(corr if not np.isnan(corr) else 0.0)
         
         max_idx = np.argmax(np.abs(correlations))

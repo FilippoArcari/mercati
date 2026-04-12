@@ -1,10 +1,8 @@
-from __future__ import annotations
 import torch
 from torch import nn
 import torch.nn.functional as F
+import pytorch_lightning as pl
 from typing import Optional
-
-from modelli.device_setup import wrap_model_for_backend, xla_mark_step
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -164,26 +162,10 @@ class TabularPositionalEncoding(nn.Module):
 # ---------------------------------------------------------------------------
 # Pred — CNN-Trans-SPP ibrido (CNN locale + Transformer globale)
 # ---------------------------------------------------------------------------
-class Pred(nn.Module):
+class Pred(pl.LightningModule):
     """
     Modello ibrido CNN + Transformer per predizione di serie finanziarie.
-
-    Architettura ispirata a CNN-Trans-SPP (Li et al., ERA 2024):
-      1. Blocco CNN dilated  -> feature locali e pattern di breve termine
-      2. Proiezione lineare  -> porta le feature a dimensione d_model
-      3. Tabular PE          -> informazione di posizione assoluta in [0,1]
-      4. Transformer Encoder -> dipendenze temporali globali (self-attention)
-      5. Transformer Decoder -> SOLO per multi-step; query learnable per step
-      6. Head lineare        -> predizione finale
-
-    Parametri ottimali da ablation study del paper (Section 4.3.5):
-      nhead=8, num_encoder_layers=3, d_model=512
-
-    Gestione multi-step:
-      - prediction_steps=1 -> output (B, F)
-      - prediction_steps>1 -> output (B, steps, F)
-      Se il DataLoader fornisce target (B, F), MrELoss._align supervisiona
-      automaticamente solo lo step 0.
+    Integrato con PyTorch Lightning per training multi-backend.
     """
 
     def __init__(
@@ -202,10 +184,14 @@ class Pred(nn.Module):
         dim_feedforward:    int   = 256,
         dropout:            float = 0.1,
         prediction_steps:   int   = 1,
-        # Gradient clipping (0 = disabilitato)
-        max_grad_norm:      float = 1.0,
+        training_cfg:       dict  = None,
+        prior_mean:         Optional[torch.Tensor] = None,
+        prior_std:          Optional[torch.Tensor] = None,
+        moment_target:      Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
+        self.save_hyperparameters(ignore=["prior_mean", "prior_std", "moment_target"])
+        self.training_cfg = training_cfg or {}
         if dimension is None:
             dimension = [64, 32, 16]
         if dilations is None:
@@ -215,8 +201,18 @@ class Pred(nn.Module):
 
         self.prediction_steps = prediction_steps
         self.num_features     = num_features
-        self.max_grad_norm    = max_grad_norm
         act_fn                = ACTIVATIONS.get(activation, nn.LeakyReLU)
+        
+        # Criterion
+        mre = self.training_cfg.get("mre", {})
+        if mre and mre.get("enabled", False):
+            self.criterion = MrELoss(mre.get("lambda_entropy", 0.1), mre.get("lambda_moment", 0.1))
+        else:
+            self.criterion = MrELoss(0.0, 0.0)
+            
+        self.register_buffer("prior_mean", prior_mean)
+        self.register_buffer("prior_std", prior_std)
+        self.register_buffer("moment_target", moment_target)
 
         # 1. CNN Embedding Block
         cnn_layers: list[nn.Module] = []
@@ -290,122 +286,39 @@ class Pred(nn.Module):
         else:
             return self.fc(memory[:, -1, :])                      # (B, F)
 
-    def _run_phase(
-        self,
-        train_loader,
-        training_cfg,
-        criterion:     MrELoss,
-        prior_mean:    Optional[torch.Tensor],
-        prior_std:     Optional[torch.Tensor],
-        moment_target: Optional[torch.Tensor],
-        data_weight:   float = 1.0,
-        label:         str   = "",
-        epochs:        Optional[int] = None,
-    ) -> None:
-        n_epochs  = epochs or training_cfg.epochs
-        optimizer = OPTIMIZERS.get(training_cfg.optimizer, torch.optim.Adam)(
+    def configure_optimizers(self):
+        opt_class = OPTIMIZERS.get(self.training_cfg.get("optimizer", "adam"), torch.optim.Adam)
+        return opt_class(
             self.parameters(),
-            lr=training_cfg.learning_rate,
-            weight_decay=training_cfg.weight_decay,
+            lr=self.training_cfg.get("learning_rate", 1e-3),
+            weight_decay=self.training_cfg.get("weight_decay", 0.0),
         )
-        self.train()
-        device = next(self.parameters()).device
 
-        # ── Parallelismo device-aware ───────────────────────────────────
-        # • CUDA 2×T4 / 2×GPU  → DataParallel (divide il batch tra le GPU)
-        # • CUDA 1×P100         → nessun wrapper
-        # • XLA / TPU v5e-8     → nessun wrapper (lazy graph, no DataParallel)
-        # • CPU                 → nessun wrapper
-        model = wrap_model_for_backend(self)
-        if model is not self and not getattr(self, "_multigpu_logged", False):
-            self._multigpu_logged = True
-
-        if prior_mean    is not None: prior_mean    = prior_mean.to(device)
-        if prior_std     is not None: prior_std     = prior_std.to(device)
-        if moment_target is not None: moment_target = moment_target.to(device)
-
-        for epoch in range(n_epochs):
-            total_l      = 0.0
-            total_data_l = 0.0
-            nan_batches  = 0
-
-            for bx, by in train_loader:
-                # pin_memory=True nel DataLoader rende questo trasferimento asincrono
-                bx = bx.to(device, non_blocking=True)
-                by = by.to(device, non_blocking=True)
-                optimizer.zero_grad(set_to_none=True)
-                pred = model(bx)
-                loss, info = criterion(
-                    pred, by, prior_mean, prior_std, moment_target, data_weight
-                )
-
-                # Salta il batch se la loss è NaN/inf (difesa a strato finale)
-                if not torch.isfinite(loss):
-                    nan_batches += 1
-                    # Su XLA serve mark_step anche in caso di skip per scaricare il grafo
-                    xla_mark_step()
-                    continue
-
-                loss.backward()
-
-                # Gradient clipping — previene NaN da gradienti esplosi
-                if self.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.parameters(), max_norm=self.max_grad_norm
-                    )
-
-                optimizer.step()
-
-                # Su XLA (TPU) è necessario materializzare il grafo lazy
-                # dopo ogni step per evitare OOM e deadlock.
-                xla_mark_step()
-
-                total_l      += loss.item()
-                total_data_l += info.get("data", 0.0)
-
-            if (epoch + 1) % 10 == 0:
-                n = max(len(train_loader) - nan_batches, 1)
-                nan_msg = f" | NaN batch saltati: {nan_batches}" if nan_batches else ""
-                print(
-                    f"[{label}] Epoch {epoch+1}/{n_epochs} "
-                    f"| Tot Loss: {total_l/n:.6f} "
-                    f"| Data(MSE): {total_data_l/n:.6f}"
-                    f"{nan_msg}"
-                )
-
-    def fit(
-        self,
-        train_loader,
-        training_cfg,
-        moment_target: Optional[torch.Tensor] = None,
-    ) -> None:
-        mre_cfg = getattr(training_cfg, "mre", None)
-        if not mre_cfg or not mre_cfg.enabled:
-            self._run_phase(
-                train_loader, training_cfg,
-                MrELoss(0, 0), None, None, None, 1.0, "MSE",
-            )
-            return
-
-        criterion = MrELoss(mre_cfg.lambda_entropy, mre_cfg.lambda_moment)
-        prior     = PriorEstimator()
-        prior.fit(train_loader)
-
-        mode = getattr(mre_cfg, "update_mode", "simultaneous")
-        if mode == "sequential":
-            ep1 = getattr(mre_cfg, "epochs_phase1", training_cfg.epochs // 3)
-            self._run_phase(
-                train_loader, training_cfg, criterion,
-                prior.mean, prior.std, moment_target, 0.0, "SEQ-P1", ep1,
-            )
-            prior.fit(train_loader)
-            self._run_phase(
-                train_loader, training_cfg, criterion,
-                prior.mean, prior.std, None, 1.0, "SEQ-P2",
-                training_cfg.epochs - ep1,
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        pred = self(x)
+        
+        mre_cfg = self.training_cfg.get("mre", {})
+        if mre_cfg and mre_cfg.get("enabled", False):
+            mode = mre_cfg.get("update_mode", "simultaneous")
+            if mode == "sequential":
+                ep1 = mre_cfg.get("epochs_phase1", self.training_cfg.get("epochs", 100) // 3)
+                if self.current_epoch < ep1:
+                    data_w = 0.0
+                    mom_t  = self.moment_target
+                else:
+                    data_w = 1.0
+                    mom_t  = None
+            else:
+                data_w = 1.0
+                mom_t  = self.moment_target
+                
+            loss, info = self.criterion(
+                pred, y, self.prior_mean, self.prior_std, mom_t, data_weight=data_w
             )
         else:
-            self._run_phase(
-                train_loader, training_cfg, criterion,
-                prior.mean, prior.std, moment_target, 1.0, "SIMULT",
-            )
+            loss, info = self.criterion(pred, y, data_weight=1.0)
+            
+        self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log("train_mse", info.get("data", 0.0), on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        return loss

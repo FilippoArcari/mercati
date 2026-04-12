@@ -720,7 +720,9 @@ class QuantumThermodynamicProcessor:
         x_std += np.random.normal(0, 1e-8, x_std.shape)
         
         # Matrice di Correlazione
-        corr = np.corrcoef(x_std, rowvar=False)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            corr = np.corrcoef(x_std, rowvar=False)
+            corr = np.nan_to_num(corr)
         e_val, e_vec = np.linalg.eigh(corr)
         
         # Limite di Marchenko-Pastur (lambda_plus)
