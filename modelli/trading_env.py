@@ -2,12 +2,17 @@
 modelli/trading_env.py — Ambiente di trading per DDPG con Reward Gate Termodinamico
 =====================================================================================
 
+FIX (v4.1):
+  • episode metrics (portfolio_value, sharpe, max_drawdown) vengono inseriti
+    nell'info dict al momento del done=True, PRIMA che DummyVecEnv chiami
+    env.reset(). Il callback le legge da infos[0]["episode"] invece che
+    dall'env già resettato → risolve Portfolio=$100 / Sharpe=0.000 per tutti
+    gli episodi.
+
 Novità rispetto alla versione precedente:
   • Migrazione gym → gymnasium (risolve il warning NumPy 2.0)
-  • ThermodynamicRewardGate: la reward viene modulata dal regime fisico del mercato
-    (Z-score pressione) invece di essere shaping fisso. Risolve il bias 23 BUY / 3 SELL.
+  • ThermodynamicRewardGate: la reward viene modulata dal regime fisico del mercato.
   • Holding decay: penalità progressiva per posizioni tenute > N barre.
-    Forza l'agente a chiudere le posizioni invece di accumularle indefinitamente.
   • bars_in_position: tracciato per ticker, usato dal decay e dal gate.
 """
 
@@ -106,7 +111,10 @@ def should_sell_now(thermo_row: pd.Series) -> bool:
 
 class TradingEnv(gym.Env):
     """
-    Ambiente di trading multi-ticker per DDPG — v4.0 Thermodynamic Reward Gate.
+    Ambiente di trading multi-ticker per DDPG — v4.1 Thermodynamic Reward Gate.
+
+    FIX v4.1: episode metrics inseriti in info["episode"] al momento del done=True,
+    prima dell'auto-reset di DummyVecEnv, così il callback li legge correttamente.
     """
 
     metadata = {"render_modes": []}
@@ -120,23 +128,22 @@ class TradingEnv(gym.Env):
         fee_pct:             float = 0.001,
         prediction_window:   int   = 1,
         thermo_df:           Optional[pd.DataFrame] = None,
-        thermo_bonus_sell:   float = 0.5,    # legacy, assorbito dal gate
-        thermo_penalty_buy:  float = 0.1,    # legacy, assorbito dal gate
+        thermo_bonus_sell:   float = 0.5,
+        thermo_penalty_buy:  float = 0.1,
         thermo_reward_cfg:   Optional[ThermoRewardConfig] = None,
     ):
         super().__init__()
 
         self.df               = df.sort_index()
-        # ── Ottimizzazione NumPy (Collo di Bottiglia CPU) ────────────────────
         self._df_values       = self.df.values.astype(np.float32)
-        
+
         self.tickers          = tickers
         self.n_tickers        = len(tickers)
         self.initial_capital  = initial_capital
         self.max_position_pct = max_position_pct
         self.fee_pct          = fee_pct
         self.prediction_window = prediction_window
-        
+
         self.thermo_df        = thermo_df
         self._has_thermo      = self.thermo_df is not None and not self.thermo_df.empty
         if self._has_thermo:
@@ -148,7 +155,6 @@ class TradingEnv(gym.Env):
 
         self._reward_gate     = ThermodynamicRewardGate(thermo_reward_cfg)
 
-        # Mappa ticker → Indice array (velocissimo) invece di colonna stringa
         self._price_col_idx: dict[str, int] = {}
         df_cols = list(self.df.columns)
         for t in tickers:
@@ -159,17 +165,15 @@ class TradingEnv(gym.Env):
             if t not in self._price_col_idx:
                 self._price_col_idx[t] = 0
 
-        # Barre per anno
+        # Barre per anno calcolate dai dati (non dalla config)
         diffs = self.df.index.to_series().diff().dt.total_seconds().dropna()
         avg_sec = diffs.median() if not diffs.empty else 120
         self.bars_per_year = max(1, int((252 * 6.5 * 3600) / avg_sec))
 
-        # Spazi gym
         self.action_space = spaces.Box(
             low=-1, high=1, shape=(self.n_tickers,), dtype=np.float32
         )
 
-        # Stato campione
         self.positions         = {t: 0.0 for t in self.tickers}
         self.balance           = self.initial_capital
         self._bars_in_position = {t: 0 for t in self.tickers}
@@ -188,7 +192,6 @@ class TradingEnv(gym.Env):
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _price(self, step: int, ticker: str) -> float:
-        # Costo: O(1) puro C-level, aggirando il .iloc di pandas
         return float(self._df_values[step, self._price_col_idx[ticker]])
 
     def _thermo_val(self, col: str, default: float = 0.0) -> float:
@@ -219,7 +222,6 @@ class TradingEnv(gym.Env):
         return obs, {}
 
     def _get_state(self, step: int) -> np.ndarray:
-        # Slice Numpy nativa (copia memoria non necessaria per forward)
         obs = self._df_values[step]
 
         holdings_val = sum(
@@ -279,7 +281,6 @@ class TradingEnv(gym.Env):
             else:
                 action_types[ticker] = "hold"
 
-        # Aggiorna contatore holding per ticker in posizione aperta
         for t in self.tickers:
             if self.positions[t] > 0 and action_types.get(t) == "hold":
                 self._bars_in_position[t] += 1
@@ -293,7 +294,20 @@ class TradingEnv(gym.Env):
 
         reward = self._calculate_reward(prev_value, new_value, action_types)
         obs    = self._get_state(self.current_step)
-        info   = {"step": self.current_step}
+
+        # ── FIX v4.1 ─────────────────────────────────────────────────────────
+        # Inserisci le metriche di episodio nell'info dict quando done=True,
+        # PRIMA che DummyVecEnv chiami env.reset(). Il callback legge da qui.
+        # Senza questo fix, il callback leggeva portfolio_history() = [100.0]
+        # perché l'env era già stato resettato → Sharpe=0.000 per tutti gli ep.
+        info = {"step": self.current_step}
+        if self.done:
+            info["episode"] = {
+                "portfolio_value": new_value,
+                "sharpe":          self.sharpe_ratio(),
+                "max_drawdown":    self.max_drawdown(),
+                "n_trades":        len(self._trades),
+            }
 
         return obs, reward, self.done, False, info
 

@@ -1,3 +1,16 @@
+"""
+modelli/ddpg.py — DDPG Agent Wrapper (Stable-Baselines3)
+
+FIX (v2.1):
+  • ThermoNoiseCallback ora prende agent_wrapper invece di base_sigma fisso.
+    Usa agent_wrapper.noise.sigma (il valore già decaduto) come base per lo
+    scaling di regime → il decay funziona correttamente (sigma decresce nel
+    tempo invece di restare fisso a 0.149 per tutti gli episodi).
+  • decay_noise ora aggiorna SOLO agent.noise.sigma (valore canonico del decay),
+    senza leggere da action_noise._sigma (che ThermoNoiseCallback scala per
+    regime ogni step). Questo evita interferenze tra i due meccanismi.
+"""
+
 import os
 import numpy as np
 import pandas as pd
@@ -25,23 +38,34 @@ def get_phase_aware_noise_scale(current_regime: float, base_sigma: float = 0.2) 
     multiplier = phase_multipliers.get(regime, 1.0)
     return base_sigma * multiplier
 
+
 class ThermoNoiseCallback(BaseCallback):
     """
-    Legge il current_regime dall'environment e scala l'action noise on-the-fly,
-    adattando il sigma del processo OrnsteinUhlenbeck di Stable Baselines3.
+    Legge il current_regime dall'environment e scala l'action noise on-the-fly.
+
+    FIX v2.1: riceve agent_wrapper invece di base_sigma fisso.
+    Usa agent_wrapper.noise.sigma (aggiornato da decay_noise ad ogni episodio)
+    come base per il calcolo del sigma scalato per regime.
+    In questo modo il sigma effettivo decresce nel tempo (decay) e varia per
+    regime (phase scaling), senza che i due meccanismi si sovrascrivano.
     """
-    def __init__(self, base_sigma: float, verbose=0):
+    def __init__(self, agent_wrapper, verbose=0):
         super().__init__(verbose)
-        self.base_sigma = base_sigma
+        self.agent_wrapper = agent_wrapper
 
     def _on_step(self) -> bool:
         env_unwrapped = self.training_env.envs[0].unwrapped
+        regime = 0.0
         if hasattr(env_unwrapped, "get_current_regime"):
             regime = env_unwrapped.get_current_regime()
-            new_sigma = get_phase_aware_noise_scale(regime, self.base_sigma)
-            noise = getattr(self.model, "action_noise", None)
-            if isinstance(noise, OrnsteinUhlenbeckActionNoise):
-                noise._sigma = new_sigma * np.ones_like(noise._sigma)
+
+        noise = getattr(self.model, "action_noise", None)
+        if isinstance(noise, OrnsteinUhlenbeckActionNoise):
+            # Usa il sigma canonico già decaduto come base per lo scaling di regime.
+            # agent_wrapper.noise.sigma viene aggiornato da decay_noise() a fine episodio.
+            decayed_sigma = self.agent_wrapper.noise.sigma
+            new_sigma     = get_phase_aware_noise_scale(regime, decayed_sigma)
+            noise._sigma  = new_sigma * np.ones_like(noise._sigma)
         return True
 
 
@@ -80,22 +104,23 @@ class DDPGAgent:
         self.tau          = tau
         self.gamma        = gamma
         self.update_every = update_every
-        
+
         self.action_noise_kwargs = dict(
             mean=np.zeros(action_dim),
             sigma=noise_sigma * np.ones(action_dim)
         )
-        
+
         self.policy_kwargs = dict(
             net_arch=dict(
                 pi=list(self.actor_hidden),
                 qf=list(self.critic_hidden)
             )
         )
-        
+
         self.model = None
-        
-        # Simuliamo noise per compatibilità con l'attesa logica (agent.noise.sigma)
+
+        # noise.sigma = valore canonico del decay (aggiornato da decay_noise).
+        # ThermoNoiseCallback legge da qui per scalare il sigma effettivo per regime.
         class DummyNoise:
             def __init__(self, s):
                 self.sigma = s
@@ -127,21 +152,23 @@ class DDPGAgent:
             self.model.action_noise.reset()
 
     def decay_noise(self, factor=0.995, floor=0.02):
-        if isinstance(self.model.action_noise, OrnsteinUhlenbeckActionNoise):
-            current = self.model.action_noise._sigma[0]
-            new_sigma = max(floor, current * factor)
-            self.model.action_noise._sigma = new_sigma * np.ones_like(self.model.action_noise._sigma)
-            self.noise.sigma = new_sigma
+        """
+        FIX v2.1: aggiorna SOLO self.noise.sigma (valore canonico).
+        Non scrive in action_noise._sigma direttamente: ThermoNoiseCallback
+        lo aggiorna ogni step usando self.noise.sigma come base.
+        Questo evita che i due meccanismi (decay + regime scaling) si sovrascrivano.
+        """
+        self.noise.sigma = max(floor, self.noise.sigma * factor)
 
     def act(self, state: np.ndarray, explore=True, current_regime: float = 0.0) -> np.ndarray:
         action, _ = self.model.predict(state, deterministic=not explore)
         return action
-        
+
     def store(self, state, action, reward, next_state, done):
-        pass # Non più usato nel loop esterno (gestito da SB3 env)
-        
+        pass  # Gestito da SB3 internamente
+
     def update(self):
-        return None # Non più usato nel loop esterno
+        return None  # Gestito da SB3 internamente
 
     def load(self, path: str) -> bool:
         if path.endswith(".pth"):
@@ -176,18 +203,18 @@ class ThermoEnsemble:
                 f"ThermoEnsemble: numero agenti ({len(agents)}) != "
                 f"numero profili ({len(fold_profiles)})"
             )
-        
+
         profile_shapes = [p.shape for p in fold_profiles]
-        unique_shapes = set(profile_shapes)
-        
+        unique_shapes  = set(profile_shapes)
+
         if len(unique_shapes) > 1:
-            print(f"⚠️  WARNING: Profili termodinamici hanno dimensioni diverse!")
-            min_dim = min(p.shape[0] for p in fold_profiles)
+            print(f"WARNING: Profili termodinamici hanno dimensioni diverse!")
+            min_dim      = min(p.shape[0] for p in fold_profiles)
             fold_profiles = [p[:min_dim] for p in fold_profiles]
             self._expected_dim = min_dim
         else:
             self._expected_dim = fold_profiles[0].shape[0]
-        
+
         self.agents        = agents
         self.fold_profiles = [np.asarray(p, dtype=np.float32) for p in fold_profiles]
         self.temperature   = temperature
@@ -200,15 +227,15 @@ class ThermoEnsemble:
                 x = x[:self._expected_dim]
             else:
                 x = np.pad(x, (0, self._expected_dim - x.shape[0]), 'constant')
-        
+
         distances = np.array([
             np.linalg.norm(x - p) for p in self.fold_profiles
         ], dtype=np.float32)
-        
+
         logits = -distances / (self.temperature + 1e-8)
         logits = logits - logits.max()
         exp    = np.exp(logits)
-        
+
         weights = exp / (exp.sum() + 1e-8)
         self._last_weights = weights
         return weights

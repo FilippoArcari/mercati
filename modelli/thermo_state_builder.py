@@ -51,6 +51,7 @@ import pandas as pd
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from typing import Optional
 from modelli.thermo_innovations import compute_advanced_thermo_features, STANDARD_THERMO_FEATURES
+from modelli.thermo_statistics import ThermoStatisticsEngine, STAT_COLS
 
 
 
@@ -76,6 +77,13 @@ CANONICAL_COLS = [
 EXTENDED_THERMO_COLS = [
     "Thm_GibbsEnergy",   # G = H - T·S  (G<0 = processo spontaneo → trade favorevole)
     "Thm_StressAccel",   # d²(Stress)/dt²  (stress sta accelerando → sell anticipato)
+    # ── ThermoStatistics (thermo_statistics.py) ────────────────────────────
+    "Thm_Zmarket",       # Z = PV/nRT  (>1 trend, <1 mean-revert)
+    "Thm_CarnotEff",     # η = 1 - T_cold/T_hot  (efficienza massima del motore)
+    "Thm_EntropyProd",   # dS/dt  (<0 = auto-organizzazione pre-breakout)
+    "Thm_MPRI",          # Monetary Pressure Resonance Index
+    "Thm_Helmholtz",     # ΔF = Δ(U - T·S)  (<0 = trade spontaneo)
+    "Thm_Quality",       # dW / (T·dS)  (rapporto lavoro/calore dissipato)
 ]
 
 # Finestre adattive per frequenza
@@ -473,6 +481,29 @@ class ThermoStateBuilder:
         except Exception as e:
             print(f"[ThermoBuilder] ⚠️  Errore in thermo innovations (continuo senza): {e}")
         
+        # ── ThermoStatistics Engine (Z_market, Carnot, EntropyProd, MPRI, Helmholtz, Quality) ──
+        try:
+            rates_col_stat  = _find_rates_col(df_raw)
+            rates_series    = df_raw[rates_col_stat].ffill().bfill() if rates_col_stat else None
+            log_vol         = np.log1p(volume.clip(lower=1.0))
+
+            ts_engine = ThermoStatisticsEngine(
+                is_intraday = not self.is_daily,
+                n_particles = float(max(len(tickers), 1)),
+            )
+            stats_df = ts_engine.compute(
+                pressure    = result["Thm_Pressure"],
+                temperature = result["Thm_Temperature"],
+                entropy     = result["Thm_Entropy"],
+                work_cum    = result["Thm_Work"],
+                log_volume  = log_vol,
+                rates       = rates_series,
+            )
+            result = pd.concat([result, stats_df], axis=1)
+            print(f"[ThermoBuilder] ✅ ThermoStatistics integrate: {STAT_COLS}")
+        except Exception as e:
+            print(f"[ThermoBuilder] ⚠️  ThermoStatistics skip: {e}")
+
         # Assicurati che tutto sia sanitizzato
         result = result.ffill().bfill().fillna(0.0)
 

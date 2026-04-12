@@ -1,3 +1,16 @@
+"""
+modelli/obs_normalizer.py
+
+FIX (v2.1):
+  • HistoryAndDecayCallback legge le metriche da infos[0]["episode"] invece
+    che dall'env già resettato da DummyVecEnv. Questo risolve il bug per cui
+    Portfolio=$100 e Sharpe=0.000 per tutti gli episodi (perché l'env veniva
+    auto-resettato da DummyVecEnv prima che il callback leggesse i dati).
+  • ThermoNoiseCallback riceve agent_wrapper (non base_sigma fisso) per far
+    funzionare correttamente il decay del sigma nel tempo.
+  • Normalizer salvato solo quando il checkpoint è salvato (stesso criterio).
+"""
+
 import numpy as np
 import os
 import gymnasium as gym
@@ -67,9 +80,7 @@ class ObsNormalizerWrapper(gym.ObservationWrapper):
         self.normalizer = normalizer
 
     def observation(self, observation):
-        # In Gymnasium, self.observation(obs) riceve solo l'array observation
         obs = observation
-        # L'update avviene durante l'esplorazione step() tramite il Wrapper in train mode
         return self.normalizer.normalize(obs, update=True)
 
 
@@ -77,22 +88,37 @@ class HistoryAndDecayCallback(BaseCallback):
     """
     Callback per replicare il comportamento di history e log del vecchio DDPG,
     compatibile con l'early stopping in trade.py.
+
+    FIX v2.1: legge le metriche di episodio da infos[0]["episode"] (inserite
+    da TradingEnv.step quando done=True) invece che dall'env già resettato.
+    Questo risolve Portfolio=$100 / Sharpe=0.000 fissi per tutti gli episodi.
     """
-    def __init__(self, agent_wrapper, n_episodes: int, norm_path: str, ckpt_path: str, log_every: int, es_patience: int, noise_decay: float, noise_floor: float, verbose=0):
+    def __init__(
+        self,
+        agent_wrapper,
+        n_episodes:  int,
+        norm_path:   str,
+        ckpt_path:   str,
+        log_every:   int,
+        es_patience: int,
+        noise_decay: float,
+        noise_floor: float,
+        verbose=0,
+    ):
         super().__init__(verbose)
         self.agent_wrapper = agent_wrapper
-        self.history = []
-        self.best_sharpe = -np.inf
-        self.no_improve = 0
-        self.n_episodes = n_episodes
-        self.norm_path = norm_path
-        self.ckpt_path = ckpt_path
-        self.log_every = log_every
-        self.es_patience = es_patience
-        self.noise_decay = noise_decay
-        self.noise_floor = noise_floor
+        self.history       = []
+        self.best_sharpe   = -np.inf
+        self.no_improve    = 0
+        self.n_episodes    = n_episodes
+        self.norm_path     = norm_path
+        self.ckpt_path     = ckpt_path
+        self.log_every     = log_every
+        self.es_patience   = es_patience
+        self.noise_decay   = noise_decay
+        self.noise_floor   = noise_floor
 
-        self.ep = 0
+        self.ep        = 0
         self.ep_reward = 0.0
 
     def _on_step(self) -> bool:
@@ -100,13 +126,29 @@ class HistoryAndDecayCallback(BaseCallback):
 
         if self.locals.get("dones")[0]:
             self.ep += 1
-            e = self.training_env.envs[0].unwrapped
-            sharpe = e.sharpe_ratio()
-            portfolio = e.portfolio_history()[-1]
-            max_dd = e.max_drawdown()
 
-            # Decadimento rumore
-            self.agent_wrapper.decay_noise(factor=self.noise_decay, floor=self.noise_floor)
+            # ── FIX v2.1 ───────────────────────────────────────────────────
+            # DummyVecEnv chiama env.reset() PRIMA che il callback venga
+            # invocato. Leggere da env.portfolio_history() restituisce [100.0]
+            # perché l'env è già stato resettato.
+            # La soluzione: TradingEnv.step inserisce le metriche finali in
+            # info["episode"] nel momento del done=True (prima del reset).
+            # Le leggiamo da self.locals["infos"][0]["episode"].
+            infos    = self.locals.get("infos", [{}])
+            ep_data  = (infos[0] if infos else {}).get("episode", {})
+
+            # Fallback all'env per retrocompatibilità (es. env custom senza fix)
+            e = self.training_env.envs[0].unwrapped
+            portfolio = ep_data.get("portfolio_value",
+                                    e.portfolio_history()[-1] if hasattr(e, "portfolio_history") else e.initial_capital)
+            sharpe    = ep_data.get("sharpe",       0.0)
+            max_dd    = ep_data.get("max_drawdown", 0.0)
+
+            # Noise decay a fine episodio (aggiorna solo agent.noise.sigma)
+            self.agent_wrapper.decay_noise(
+                factor=self.noise_decay,
+                floor=self.noise_floor,
+            )
 
             ep_info = {
                 "episode":         self.ep,
@@ -115,7 +157,7 @@ class HistoryAndDecayCallback(BaseCallback):
                 "sharpe":          sharpe,
                 "max_drawdown":    max_dd,
                 "noise_sigma":     self.agent_wrapper.noise.sigma,
-                "critic_loss":     0.0, # SB3 logs are tricky to grab directly per episode without hacking logger
+                "critic_loss":     0.0,
                 "actor_loss":      0.0,
             }
             self.history.append(ep_info)
@@ -124,9 +166,8 @@ class HistoryAndDecayCallback(BaseCallback):
             # Early Stopping / Saving
             if sharpe > self.best_sharpe:
                 self.best_sharpe = sharpe
-                self.no_improve = 0
+                self.no_improve  = 0
                 if self.norm_path:
-                    # Riferimento al wrapper custom
                     self.training_env.envs[0].normalizer.save(self.norm_path)
                 if self.ckpt_path:
                     self.agent_wrapper.save(self.ckpt_path, tag=f"BEST Ep {self.ep}")
@@ -138,7 +179,7 @@ class HistoryAndDecayCallback(BaseCallback):
                 print(
                     f"Ep {self.ep:4d}/{self.n_episodes} | "
                     f"Reward: {ep_info['total_reward']:+.4f} | "
-                    f"Portfolio: ${portfolio:,.0f} | "
+                    f"Portfolio: ${portfolio:,.2f} | "
                     f"Sharpe: {sharpe:.3f} | "
                     f"MaxDD: {max_dd:.3f} | "
                     f"σ: {self.agent_wrapper.noise.sigma:.3f}"
@@ -148,7 +189,6 @@ class HistoryAndDecayCallback(BaseCallback):
             if self.no_improve >= self.es_patience or self.ep >= self.n_episodes:
                 if self.no_improve >= self.es_patience:
                     print(f"Early stopping triggerato all'episodio {self.ep}")
-                # Ferma il training (SB3)
                 return False
 
         return True
@@ -166,15 +206,15 @@ def train_ddpg_normalized(
     noise_decay: float                  = 0.995,
     noise_floor: float                  = 0.02,
 ) -> list[dict]:
-    
+
     if normalizer is None:
         normalizer = ObsNormalizer(shape=env.observation_space.shape[0])
 
     wrapped_env = ObsNormalizerWrapper(env, normalizer)
-    vec_env = DummyVecEnv([lambda: wrapped_env])
-    
+    vec_env     = DummyVecEnv([lambda: wrapped_env])
+
     agent.set_env(vec_env)
-    
+
     callback = HistoryAndDecayCallback(
         agent_wrapper=agent,
         n_episodes=n_episodes,
@@ -185,17 +225,17 @@ def train_ddpg_normalized(
         noise_decay=noise_decay,
         noise_floor=noise_floor,
     )
-    
-    # Optional: ThermoNoiseCallback for phase-aware noise
+
+    # FIX v2.1: ThermoNoiseCallback riceve agent_wrapper invece di base_sigma fisso.
     from modelli.ddpg import ThermoNoiseCallback
-    thermo_callback = ThermoNoiseCallback(base_sigma=agent.noise.sigma)
-    
+    thermo_callback = ThermoNoiseCallback(agent_wrapper=agent)
+
     from stable_baselines3.common.callbacks import CallbackList
     callbacks = CallbackList([callback, thermo_callback])
-    
-    # 1 episode = length of env dataframe
+
+    # 1 episode = lunghezza dell'env dataframe
     total_timesteps = n_episodes * len(env.df)
-    
+
     agent.model.learn(total_timesteps, callback=callbacks)
-    
+
     return callback.history

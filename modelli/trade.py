@@ -261,6 +261,263 @@ def _plot_trades(env, results_dir, freq):
     print(f"  action_distribution_{freq}.png")
 
 
+def _plot_walk_forward_summary(report, results_dir: str, freq: str) -> None:
+    """
+    Grafico riepilogativo cross-fold dopo il walk-forward.
+
+    Quattro pannelli:
+      1. Sharpe per fold (bar, colorati verde/rosso)
+      2. Return % per fold
+      3. MaxDD per fold
+      4. Thm✅% per fold (qualità segnali termodinamici)
+
+    Evidenzia il best fold (★) e worst fold (✗).
+    """
+    if not report.folds:
+        return
+
+    folds      = [f.fold            for f in report.folds]
+    sharpes    = [f.sharpe          for f in report.folds]
+    returns    = [f.total_return_pct for f in report.folds]
+    maxdds     = [f.max_drawdown    for f in report.folds]
+    thermo_ok  = [f.thermo_sell_ok_pct for f in report.folds]
+
+    best_sharpe  = max(sharpes)
+    worst_sharpe = min(sharpes)
+
+    fig, axes = plt.subplots(4, 1, figsize=(12, 14),
+                             facecolor="#0d1117", gridspec_kw={"hspace": 0.55})
+    fig.suptitle(f"Walk-Forward Summary — {len(folds)} fold | freq={freq}",
+                 fontsize=13, color="white", fontweight="bold", y=0.98)
+
+    labels = [f"F{f}" for f in folds]
+    tags   = []
+    for s in sharpes:
+        if s == best_sharpe:  tags.append("★")
+        elif s == worst_sharpe: tags.append("✗")
+        else: tags.append("")
+
+    def _bar_panel(ax, values, ylabel, title, threshold=None,
+                   pos_color="#4fc3f7", neg_color="#ef5350"):
+        colors = [pos_color if v >= 0 else neg_color for v in values]
+        bars = ax.bar(labels, values, color=colors, edgecolor="#30363d", linewidth=0.8)
+        if threshold is not None:
+            ax.axhline(threshold, color="#ffd54f", lw=1.2, linestyle="--",
+                       label=f"soglia {threshold}")
+            ax.legend(fontsize=7, labelcolor="white")
+        ax.axhline(0, color="#555", lw=0.6)
+        for bar, val, tag in zip(bars, values, tags):
+            offset = max(abs(v) for v in values) * 0.04 if values else 0.1
+            ypos = val + offset if val >= 0 else val - offset * 2
+            ax.text(bar.get_x() + bar.get_width()/2, ypos,
+                    f"{val:.2f}{tag}", ha="center", va="bottom",
+                    fontsize=8, color="white", fontweight="bold")
+        ax.set_ylabel(ylabel, color="white", fontsize=9)
+        ax.set_title(title, color="gray", fontsize=8, loc="left")
+        ax.set_facecolor("#161b22")
+        ax.tick_params(colors="gray", labelsize=8)
+        ax.spines[:].set_color("#30363d")
+
+        # Media cross-fold
+        mean_val = sum(values) / len(values)
+        ax.axhline(mean_val, color="#80cbc4", lw=1.0, linestyle=":",
+                   alpha=0.8, label=f"media {mean_val:.2f}")
+        ax.legend(fontsize=7, labelcolor="white")
+
+    _bar_panel(axes[0], sharpes, "Sharpe",
+               "Sharpe per fold  —  ★ best  |  ✗ worst  |  linea tratteggiata = soglia 0.5",
+               threshold=0.5)
+
+    _bar_panel(axes[1], returns, "Return (%)",
+               "Rendimento % per fold sul test set",
+               threshold=0.0)
+
+    _bar_panel(axes[2], maxdds, "Max Drawdown",
+               "Max Drawdown per fold  (peggiore = più negativo)",
+               threshold=-0.20, pos_color="#ef5350", neg_color="#4fc3f7")
+
+    # Thm✅% — usa palette diversa (sempre positivo)
+    thm_colors = ["#81c784" if v > 50 else "#ffb74d" if v > 25 else "#ef5350"
+                  for v in thermo_ok]
+    bars = axes[3].bar(labels, thermo_ok, color=thm_colors,
+                       edgecolor="#30363d", linewidth=0.8)
+    axes[3].axhline(50, color="#ffd54f", lw=1.2, linestyle="--",
+                    label="soglia 50%")
+    for bar, val, tag in zip(bars, thermo_ok, tags):
+        axes[3].text(bar.get_x() + bar.get_width()/2,
+                     val + max(thermo_ok)*0.03 + 0.5,
+                     f"{val:.1f}%{tag}", ha="center", va="bottom",
+                     fontsize=8, color="white", fontweight="bold")
+    axes[3].set_ylabel("Thm✅ SELL (%)", color="white", fontsize=9)
+    axes[3].set_title(
+        "Thm✅% — % di SELL effettuate in zona stress termodinamico  "
+        "(verde>50% = agente allineato ai segnali)",
+        color="gray", fontsize=8, loc="left")
+    axes[3].set_facecolor("#161b22")
+    axes[3].tick_params(colors="gray", labelsize=8)
+    axes[3].spines[:].set_color("#30363d")
+    axes[3].legend(fontsize=7, labelcolor="white")
+
+    # Box statistiche in alto a destra
+    stats_txt = (
+        f"Sharpe medio: {report.mean_sharpe:.3f}\n"
+        f"Std Sharpe:   {report.std_sharpe:.3f}\n"
+        f"Return medio: {report.mean_return:.2f}%\n"
+        f"MaxDD medio:  {report.mean_max_drawdown:.3f}\n"
+        f"Thm✅ medio:  {report.mean_thermo_sell_ok:.1f}%\n"
+        f"Pronto:       {'SÌ ✅' if report.production_ready else 'NO ❌'}"
+    )
+    fig.text(0.76, 0.935, stats_txt, fontsize=8, color="white",
+             va="top", ha="left",
+             bbox=dict(facecolor="#1c2128", edgecolor="#30363d",
+                       boxstyle="round,pad=0.5"))
+
+    out = os.path.join(results_dir, f"walk_forward_summary_{freq}.png")
+    plt.savefig(out, dpi=140, bbox_inches="tight", facecolor="#0d1117")
+    plt.close(fig)
+    print(f"  Walk-forward summary plot: {os.path.basename(out)}")
+
+
+def _plot_fold_portfolio(
+    env_test,
+    fold_n:      int,
+    sharpe:      float,
+    ret_pct:     float,
+    max_dd:      float,
+    th_test,
+    results_dir: str,
+    freq:        str,
+) -> None:
+    """
+    Grafico diagnostico per singolo fold: portfolio + thermo overlay.
+
+    Pannello 1 — Equity curve con BUY/SELL markers e drawdown shading.
+    Pannello 2 — Thm_Stress e Thm_Efficiency (se disponibili).
+    Pannello 3 — Nuovi indicatori: Thm_CarnotEff, Thm_EntropyProd, Thm_Quality.
+    """
+    portfolio = env_test.portfolio_history()
+    if len(portfolio) < 2:
+        return
+
+    trades   = env_test._trades
+    n_steps  = len(portfolio)
+    steps    = np.arange(n_steps)
+
+    # Scopri quanti pannelli termodinamici mostrare
+    has_thermo  = th_test is not None and not th_test.empty
+    has_stats   = has_thermo and any(
+        c in th_test.columns for c in ["Thm_CarnotEff","Thm_EntropyProd","Thm_Quality"]
+    )
+    n_panels = 1 + int(has_thermo) + int(has_stats)
+
+    fig_h = 5 + 3 * (n_panels - 1)
+    fig, axes = plt.subplots(
+        n_panels, 1, figsize=(15, fig_h),
+        facecolor="#0d1117",
+        gridspec_kw={"height_ratios": [3] + [2]*(n_panels-1), "hspace": 0.35}
+    )
+    if n_panels == 1:
+        axes = [axes]
+
+    # ── Pannello 1: Equity curve ───────────────────────────────────────────
+    ax = axes[0]
+    ax.set_facecolor("#161b22")
+    ax.plot(steps, portfolio, color="#4fc3f7", linewidth=1.4, zorder=3)
+
+    # Drawdown shading
+    peak = np.maximum.accumulate(portfolio)
+    dd   = (portfolio - peak) / (peak + 1e-8)
+    ax.fill_between(steps, portfolio, peak, where=(dd < 0),
+                    color="tomato", alpha=0.15, zorder=2)
+
+    # BUY / SELL markers
+    for tr in trades:
+        s = tr["step"]
+        if s >= n_steps:
+            continue
+        if tr["type"] == "BUY":
+            ax.axvline(s, color="#2ecc71", alpha=0.25, linewidth=0.7)
+        else:
+            ax.axvline(s, color="#e74c3c", alpha=0.25, linewidth=0.7)
+
+    ax.set_title(
+        f"Fold {fold_n} — Equity Curve  |  Sharpe: {sharpe:.3f}  |  "
+        f"Return: {ret_pct:+.2f}%  |  MaxDD: {max_dd:.3f}",
+        color="white", fontsize=10, fontweight="bold"
+    )
+    ax.set_ylabel("Portfolio ($)", color="white", fontsize=9)
+    ax.tick_params(colors="gray", labelsize=7)
+    ax.spines[:].set_color("#30363d")
+    # Legenda trades
+    from matplotlib.lines import Line2D
+    handles = [
+        Line2D([0],[0], color="#2ecc71", lw=1.5, alpha=0.6, label="BUY"),
+        Line2D([0],[0], color="#e74c3c", lw=1.5, alpha=0.6, label="SELL"),
+    ]
+    ax.legend(handles=handles, fontsize=7, labelcolor="white", loc="upper left")
+
+    # ── Pannello 2: Thm_Stress + Thm_Efficiency ───────────────────────────
+    if has_thermo and n_panels >= 2:
+        ax2 = axes[1]
+        ax2.set_facecolor("#161b22")
+        th_arr = th_test.reset_index(drop=True)
+        lim    = min(n_steps, len(th_arr))
+        t_idx  = np.arange(lim)
+
+        if "Thm_Stress" in th_arr.columns:
+            stress = th_arr["Thm_Stress"].values[:lim]
+            ax2.plot(t_idx, stress, color="#f06292", lw=1.2, label="Thm_Stress")
+            ax2.fill_between(t_idx, stress, 0,
+                             where=(stress > 0.5), color="#f06292", alpha=0.15)
+
+        if "Thm_Efficiency" in th_arr.columns:
+            eff = th_arr["Thm_Efficiency"].values[:lim]
+            ax2.plot(t_idx, eff, color="#ffb74d", lw=1.2, label="Thm_Efficiency")
+
+        ax2.axhline(0.5, color="#555", lw=0.7, linestyle="--")
+        ax2.axhline(0,   color="#444", lw=0.5)
+        ax2.set_ylabel("Stress / Efficiency", color="white", fontsize=9)
+        ax2.set_title("Thm_Stress (rosa) + Thm_Efficiency (arancio) — zona rossa = stress alto",
+                      color="gray", fontsize=8, loc="left")
+        ax2.tick_params(colors="gray", labelsize=7)
+        ax2.spines[:].set_color("#30363d")
+        ax2.legend(fontsize=7, labelcolor="white", loc="upper right")
+
+    # ── Pannello 3: ThermoStatistics nuovi indicatori ─────────────────────
+    if has_stats and n_panels >= 3:
+        ax3 = axes[2]
+        ax3.set_facecolor("#161b22")
+        th_arr = th_test.reset_index(drop=True)
+        lim    = min(n_steps, len(th_arr))
+        t_idx  = np.arange(lim)
+
+        stat_plot = [
+            ("Thm_CarnotEff",   "#81c784", "Carnot η"),
+            ("Thm_EntropyProd", "#ce93d8", "σ EntrProd"),
+            ("Thm_Quality",     "#80cbc4", "Q Quality"),
+        ]
+        for col, color, label in stat_plot:
+            if col in th_arr.columns:
+                ax3.plot(t_idx, th_arr[col].values[:lim],
+                         color=color, lw=1.0, label=label)
+
+        ax3.axhline(0, color="#444", lw=0.5)
+        ax3.set_ylabel("ThermoStats", color="white", fontsize=9)
+        ax3.set_title("Carnot η | σ EntropyProd | Q Quality  —  nuovi indicatori",
+                      color="gray", fontsize=8, loc="left")
+        ax3.tick_params(colors="gray", labelsize=7)
+        ax3.spines[:].set_color("#30363d")
+        ax3.legend(fontsize=7, labelcolor="white", loc="upper right")
+
+    fig.text(0.5, 0.01, f"Freq: {freq} | Fold {fold_n}",
+             ha="center", fontsize=7, color="#555")
+
+    out = os.path.join(results_dir, f"fold_{fold_n}_portfolio_{freq}.png")
+    plt.savefig(out, dpi=130, bbox_inches="tight", facecolor="#0d1117")
+    plt.close(fig)
+    print(f"  [Fold {fold_n}] Grafico salvato: {os.path.basename(out)}")
+
+
 # ─── entry point ──────────────────────────────────────────────────────────────
 
 def run_trade(
@@ -628,12 +885,16 @@ def run_walk_forward(
         # FIX A — stress_fn rimossa: il regime termodinamico è letto direttamente
         #          dall'env dentro train_ddpg_normalized via env.get_current_regime()
         # FIX B/C — keyword args espliciti e es_patience aggiunto
+        # FIX D — ckpt_path=fold_best: senza, il best checkpoint non veniva mai
+        #          salvato nel loop walk-forward → agent.load(fold_best) era
+        #          sempre no-op → veniva valutato l'ultimo episodio, non il migliore.
         history = train_ddpg_normalized(
             env         = env_train,
             agent       = agent,
             normalizer  = normalizer,
             n_episodes  = buyer_cfg.n_episodes,
             norm_path   = fold_norm,
+            ckpt_path   = fold_best,
             log_every   = max(1, buyer_cfg.log_every * 5),
             es_patience = es_patience,
         )
@@ -649,15 +910,35 @@ def run_walk_forward(
             raw_state = raw_state[0]
         state     = normalizer.normalize(raw_state, update=False)
         done      = False
+        sell_ok_count = 0
+        sell_total    = 0
         while not done:
-            action               = agent.act(state, explore=False)
-            step_result          = env_test.step(action)
+            action      = agent.act(state, explore=False)
+            step_result = env_test.step(action)
             if len(step_result) == 5:
-                raw_next, _, terminated, truncated, _ = step_result
+                raw_next, _, terminated, truncated, info = step_result
                 done = terminated or truncated
             else:
-                raw_next, _, done, _ = step_result
-            state                = normalizer.normalize(raw_next, update=False)
+                raw_next, _, done, info = step_result
+
+            # ── Thermo✅% — misura quante SELL avvengono in zona stress ────────
+            # Un sell è "termodinamicamente corretto" se Thm_Stress > 0.5
+            # oppure se Thm_SellSignal è attivo (da thermo_innovations).
+            step_idx = env_test.current_step - 1
+            if env_test._has_thermo and step_idx >= 0:
+                thm_z  = env_test._thermo_val("Thm_Stress", 0.0)
+                thm_sg = env_test._thermo_val("Thm_SellSignal", 0.0)
+                # Rileva se l'agente ha venduto qualcosa questo step
+                sells_this_step = sum(
+                    1 for t in env_test._trades
+                    if t.get("step") == step_idx and t["type"] == "SELL"
+                )
+                if sells_this_step > 0:
+                    sell_total += 1
+                    if thm_z > 0.5 or thm_sg > 0.5:
+                        sell_ok_count += 1
+
+            state = normalizer.normalize(raw_next, update=False)
 
         # ── Metriche fold ─────────────────────────────────────────────────────
         final_v = env_test.portfolio_history()[-1]
@@ -665,25 +946,48 @@ def run_walk_forward(
         sharpe  = env_test.sharpe_ratio()
         max_dd  = env_test.max_drawdown()
         best_ep = max(history, key=lambda h: h.get("sharpe", -999))
+        thermo_sell_ok = (sell_ok_count / max(sell_total, 1)) * 100.0
+
+        ts = env_test.trade_stats()
+        print(
+            f"  [Fold {fold_n}] Trade stats: BUY={ts['n_buy']} SELL={ts['n_sell']} "
+            f"ratio={ts['buy_sell_ratio']:.1f} | Thm✅: {thermo_sell_ok:.1f}%"
+        )
 
         from modelli.walk_forward import FoldResult
         fold_res = FoldResult(
-            fold             = fold_n,
-            train_bars       = tr_e - tr_s,
-            test_bars        = te_e - te_s,
-            train_start      = str(pr_train.index[0])[:16],
-            train_end        = str(pr_train.index[-1])[:16],
-            test_start       = str(pr_test.index[0])[:16],
-            test_end         = str(pr_test.index[-1])[:16],
-            sharpe           = sharpe,
-            total_return_pct = ret_pct,
-            max_drawdown     = max_dd,
-            n_episodes_run   = len(history),
-            best_episode     = best_ep["episode"],
+            fold                = fold_n,
+            train_bars          = tr_e - tr_s,
+            test_bars           = te_e - te_s,
+            train_start         = str(pr_train.index[0])[:16],
+            train_end           = str(pr_train.index[-1])[:16],
+            test_start          = str(pr_test.index[0])[:16],
+            test_end            = str(pr_test.index[-1])[:16],
+            sharpe              = sharpe,
+            total_return_pct    = ret_pct,
+            max_drawdown        = max_dd,
+            n_episodes_run      = len(history),
+            best_episode        = best_ep["episode"],
+            thermo_sell_ok_pct  = thermo_sell_ok,
         )
         report.folds.append(fold_res)
         prev_best_path = fold_best
         prev_thermo_df = th_train if (th_train is not None and not th_train.empty) else None
+
+        # ── Grafico portfolio fold ─────────────────────────────────────────────
+        try:
+            _plot_fold_portfolio(
+                env_test   = env_test,
+                fold_n     = fold_n,
+                sharpe     = sharpe,
+                ret_pct    = ret_pct,
+                max_dd     = max_dd,
+                th_test    = th_test,
+                results_dir= results_dir,
+                freq       = freq,
+            )
+        except Exception as _pe:
+            print(f"  [Fold {fold_n}] Grafico skip: {_pe}")
 
         print(
             f"  ✔ Fold {fold_n} — Sharpe: {sharpe:.3f} | "
@@ -703,6 +1007,12 @@ def run_walk_forward(
     # ── 4. Report finale ──────────────────────────────────────────────────────
     report.print_summary()
     report.save(os.path.join(results_dir, f"walk_forward_{freq}.csv"))
+
+    # ── 4c. Grafico riepilogativo cross-fold ──────────────────────────────────
+    try:
+        _plot_walk_forward_summary(report, results_dir, freq)
+    except Exception as _we:
+        print(f"  [WF Summary Plot] Skip: {_we}")
 
     # ── 4b. FIX Bug #1: copia normalizer del fold migliore → normalizer_best_{freq}.npz
     # alpaca_live cerca "normalizer_best_{freq}.npz" ma la walk-forward salva solo

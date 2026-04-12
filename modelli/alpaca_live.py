@@ -202,7 +202,14 @@ def _load_predictor(cfg, log: logging.Logger):
         activation       = mc.get("activation",       cfg.model.activation),
         prediction_steps = mc.get("prediction_steps", cfg.model.prediction_steps),
     ).to(device)
-    model.load_state_dict(ck["model_state_dict"])
+    # strict=False: tollera chiavi extra nel checkpoint (es. prior_mean, prior_std,
+    # moment_target salvate da versioni precedenti del modello MRE). Senza questo
+    # il caricamento crashava con RuntimeError su state_dict mismatch.
+    missing, unexpected = model.load_state_dict(ck["model_state_dict"], strict=False)
+    if unexpected:
+        log.warning(f"CNN state_dict: {len(unexpected)} chiavi ignorate: {unexpected[:5]}")
+    if missing:
+        log.warning(f"CNN state_dict: {len(missing)} chiavi mancanti: {missing[:5]}")
     model.eval()
     log.info(f"CNN: {os.path.basename(path)} | features={nf}")
     return model, ck["scaler"], nf, device

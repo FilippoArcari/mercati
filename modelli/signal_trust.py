@@ -84,6 +84,13 @@ INDICATOR_POLARITY = {
     # TIXI
     "Thm_TIXI":        "negative",   # alta irreversibilità → pre-correzione
     "Thm_TIXI_Z":      "negative",
+    # ThermoStatistics (thermo_statistics.py)
+    "Thm_Zmarket":     "positive",   # Z>1 → repulsivo → trend continuation
+    "Thm_CarnotEff":   "positive",   # η alta → gradiente termico → carburante disponibile
+    "Thm_EntropyProd": "negative",   # σ alta → sistema brucia energia → sell
+    "Thm_MPRI":        "positive",   # risonanza costruttiva con FED → bull
+    "Thm_Helmholtz":   "negative",   # ΔF negativo → processo spontaneo → BUY favorevole
+    "Thm_Quality":     "positive",   # alta qualità → energia→prezzo efficiente
     # Indicatori esistenti (backward compatibility)
     "Energy_Divergence":    "negative",
     "Energy_Efficiency":    "negative",
