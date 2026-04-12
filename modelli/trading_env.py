@@ -302,7 +302,7 @@ class TradingEnv(gym.Env):
         # perché l'env era già stato resettato → Sharpe=0.000 per tutti gli ep.
         info = {"step": self.current_step}
         if self.done:
-            info["episode"] = {
+            info["episode_metrics"] = {
                 "portfolio_value": new_value,
                 "sharpe":          self.sharpe_ratio(),
                 "max_drawdown":    self.max_drawdown(),

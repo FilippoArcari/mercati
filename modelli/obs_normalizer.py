@@ -133,9 +133,10 @@ class HistoryAndDecayCallback(BaseCallback):
             # perché l'env è già stato resettato.
             # La soluzione: TradingEnv.step inserisce le metriche finali in
             # info["episode"] nel momento del done=True (prima del reset).
-            # Le leggiamo da self.locals["infos"][0]["episode"].
+            # Le leggiamo da self.locals["infos"][0]["episode_metrics"].
             infos    = self.locals.get("infos", [{}])
-            ep_data  = (infos[0] if infos else {}).get("episode", {})
+            info     = infos[0] if infos else {}
+            ep_data  = info.get("episode_metrics", info.get("episode", {}))
 
             # Fallback all'env per retrocompatibilità (es. env custom senza fix)
             e = self.training_env.envs[0].unwrapped
