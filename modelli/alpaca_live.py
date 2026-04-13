@@ -58,6 +58,74 @@ def _filter_tradeable(tickers: list[str]) -> list[str]:
 
 # ─── Naming checkpoint (speculare a main.py) ──────────────────────────────────
 
+
+# ─── [Fix SK] Wrapper numpy puro per MinMaxScaler ────────────────────────────
+# Rimpiazza il MinMaxScaler sklearn con un oggetto che usa solo numpy,
+# eliminando la dipendenza dalla versione sklearn al momento del caricamento.
+# MinMaxScaler.transform: X_std = (X - X_min) / (X_max - X_min)
+#                         X_scaled = X_std * (max - min) + min  [feature_range]
+# Con feature_range=(0,1) si semplifica a: (X - data_min_) * scale_
+
+class _NumpyScaler:
+    """Replica MinMaxScaler.transform() usando solo numpy."""
+    def __init__(self, sklearn_scaler):
+        # Estrai gli array numerici dal scaler sklearn
+        self.min_   = np.array(sklearn_scaler.data_min_,   dtype=np.float32)
+        self.scale_ = np.array(sklearn_scaler.scale_,      dtype=np.float32)
+        # data_range_ può avere zeri su feature costanti → clip per sicurezza
+        data_range  = np.array(sklearn_scaler.data_range_,  dtype=np.float32)
+        self.range_ = np.where(data_range == 0, 1.0, data_range)
+
+    def transform(self, X) -> np.ndarray:
+        X = np.array(X, dtype=np.float32)
+        return (X - self.min_) / self.range_
+
+    def fit_transform(self, X) -> np.ndarray:
+        return self.transform(X)
+
+
+# ─── [Fix TH] RollingThermoBuffer ────────────────────────────────────────────
+# ThermoStateBuilder.build() viene chiamato a ogni barra nel replay/live loop.
+# Il problema: build() istanzia un nuovo SignalTrustEngine a ogni chiamata e lo
+# fa girare su window_raw (solo ws=15 barre), mentre trust_window=40. Con
+# meno barre della finestra il Trust è indeterminato → fisso a 0.500.
+# Soluzione: mantenere un buffer rolling che si accumula barra per barra.
+# La finestra passata a build() è sempre >= trust_window + ws barre.
+
+class _RollingThermoBuffer:
+    """
+    Accumula barre in un buffer rolling e chiama ThermoStateBuilder.build()
+    su una finestra abbastanza lunga da consentire al SignalTrustEngine di
+    convergere (trust_window + prediction_window barre minimo).
+
+    Utilizzo nel loop di replay:
+        buf = _RollingThermoBuffer(thermo_builder, min_bars=55)
+        for bar_i in range(ws, len(all_bars)):
+            bar = all_bars.iloc[[bar_i]]
+            thermo_df = buf.update(bar, tradeable)
+            # thermo_df ha una sola riga — l'ultima (quella corrente)
+    """
+    def __init__(self, builder, min_bars: int = 55):
+        self._builder  = builder
+        self._min_bars = min_bars
+        self._buffer   = pd.DataFrame()
+
+    def update(self, new_bar: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
+        """Aggiunge new_bar al buffer, chiama build() sulla finestra cumulativa,
+        e restituisce solo la riga corrispondente alla barra corrente."""
+        self._buffer = pd.concat([self._buffer, new_bar]).tail(self._min_bars)
+        if len(self._buffer) < 2:
+            return pd.DataFrame()
+        try:
+            full_thermo = self._builder.build(self._buffer, tickers)
+        except Exception:
+            return pd.DataFrame()
+        if full_thermo is None or full_thermo.empty:
+            return pd.DataFrame()
+        # Restituisce solo l'ultima riga (la barra corrente)
+        return full_thermo.iloc[[-1]]
+
+
 def _pred_ckpt(cfg) -> str:
     freq = cfg.frequency.interval
     ws   = cfg.prediction.window_size
@@ -205,14 +273,39 @@ def _load_predictor(cfg, log: logging.Logger):
     # strict=False: tollera chiavi extra nel checkpoint (es. prior_mean, prior_std,
     # moment_target salvate da versioni precedenti del modello MRE). Senza questo
     # il caricamento crashava con RuntimeError su state_dict mismatch.
-    missing, unexpected = model.load_state_dict(ck["model_state_dict"], strict=False)
+    # ── [Fix MRE] Caricamento state_dict con ripristino buffer MRE ──────────────
+    # prior_mean, prior_std, moment_target sono register_buffer(None) nel modello.
+    # load_state_dict(strict=False) li ignora se assenti nel checkpoint invece di
+    # inizializzarli a None — lasciandoli uninizializzati su versioni diverse di
+    # PyTorch. Li forziamo esplicitamente dopo il caricamento.
+    state_dict = ck["model_state_dict"]
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    # Inietta i buffer MRE mancanti come None (comportamento corretto per inferenza)
+    _mre_buffers = ["prior_mean", "prior_std", "moment_target"]
+    for buf_name in _mre_buffers:
+        if buf_name in missing:
+            setattr(model, buf_name, None)
+
+    actually_missing = [k for k in missing if k not in _mre_buffers]
     if unexpected:
         log.warning(f"CNN state_dict: {len(unexpected)} chiavi ignorate: {unexpected[:5]}")
-    if missing:
-        log.warning(f"CNN state_dict: {len(missing)} chiavi mancanti: {missing[:5]}")
+    if actually_missing:
+        log.warning(f"CNN state_dict: {len(actually_missing)} chiavi mancanti: {actually_missing[:5]}")
     model.eval()
     log.info(f"CNN: {os.path.basename(path)} | features={nf}")
-    return model, ck["scaler"], nf, device
+
+    # ── [Fix SK] Sklearn version mismatch ────────────────────────────────────
+    # Il MinMaxScaler nel checkpoint è stato serializzato con sklearn 1.8.0.
+    # Su sklearn 1.6.x (Kaggle) questo causa InconsistentVersionWarning e
+    # potenzialmente una normalizzazione errata (attributi interni cambiati).
+    # Soluzione: estrai min_ e scale_ e avvolgi in un oggetto numpy puro che
+    # non dipende dalla versione sklearn. Functionally identico a transform().
+    raw_scaler = ck["scaler"]
+    scaler = _NumpyScaler(raw_scaler)
+    log.info(f"Scaler convertito in NumpyScaler (min shape={scaler.min_.shape})")
+
+    return model, scaler, nf, device
 
 
 def _load_agent(cfg, state_dim: int, all_tickers: list[str],
@@ -536,6 +629,17 @@ def run_alpaca(cfg) -> None:
     step_n         = 0
 
     log.info(f"Equity iniziale: ${eq0:,.2f} | CB soglia: {p['circuit_breaker_dd']:.0%}")
+
+    # ── [Fix TH] Buffer rolling per thermo — evita Trust=0.500 fisso ──────────
+    # Il loop live riceve solo bar_buffer=60 barre a ogni step via _fetch_bars().
+    # trust_window=40 serve barre di storia: il buffer le accumula in modo rolling.
+    _live_trust_window = thermo_builder.trust_window
+    _ws_live           = cfg.prediction.window_size
+    thermo_buf         = _RollingThermoBuffer(
+        thermo_builder,
+        min_bars = _live_trust_window + _ws_live + 5,
+    )
+    log.info(f"RollingThermoBuffer: min_bars={_live_trust_window + _ws_live + 5}")
     log.info("Avvio loop...")
 
     # ── Loop principale ────────────────────────────────────────────────────
@@ -577,9 +681,17 @@ def run_alpaca(cfg) -> None:
                             "Thm_Stress","Thm_Efficiency","Thm_Entropy","Thm_Regime"]
             all_cols_58 = all_tickers + _THERMO_COLS
 
-            # 2a. Calcola thermo PRIMA dello scaling (serve per il frame)
+            # 2a. Calcola thermo con buffer rolling ─────────────────────────
+            # [Fix TH] bars contiene solo bar_buffer=60 barre: con ws=15 la finestra
+            # passata a SignalTrustEngine è troppo corta → Trust=0.500 costante.
+            # thermo_buf accumula storia rolling garantendo ≥ trust_window barre.
+            # Passiamo l'ultima barra disponibile; il buffer fa il resto.
             try:
-                thermo_df = thermo_builder.build(bars, tradeable)
+                _last_bar = bars.iloc[[-1]]
+                thermo_df = thermo_buf.update(_last_bar, tradeable)
+                if thermo_df.empty:
+                    # Fallback: usa bars direttamente finché il buffer si riempie
+                    thermo_df = thermo_builder.build(bars, tradeable)
             except Exception as e:
                 log.warning(f"Thermo: {e}")
                 thermo_df = pd.DataFrame()
@@ -908,6 +1020,14 @@ def run_alpaca_replay(cfg) -> None:
                   f"Aumenta days_back o usa una finestra più piccola.")
         return
 
+    # ── [Fix TH] RollingThermoBuffer ──────────────────────────────────────
+    # trust_window=40 richiede almeno 40 barre di storia per convergere.
+    # Passare solo window_raw (ws=15 barre) significa che il SignalTrustEngine
+    # non ha mai abbastanza dati → Trust medio fisso a 0.500 per tutto il replay.
+    # Il buffer accumula barre in modo rolling e garantisce min_bars di storia.
+    trust_window = thermo_builder.trust_window  # default 40
+    thermo_buf   = _RollingThermoBuffer(thermo_builder, min_bars=trust_window + ws + 5)
+
     # ── Portafoglio virtuale ───────────────────────────────────────────────
     initial_capital = float(cfg.buyer.initial_capital)
     positions: dict[str, float] = {}   # {ticker: shares}
@@ -942,9 +1062,12 @@ def run_alpaca_replay(cfg) -> None:
                         "Thm_Stress","Thm_Efficiency","Thm_Entropy","Thm_Regime"]
         all_cols_58 = all_tickers + _THERMO_COLS
 
-        # Calcola thermo PRIMA dello scaling (serve sia per il frame che per lo stato)
+        # ── [Fix TH] Usa il buffer rolling invece di rebuild per ogni barra ──
+        # window_raw ha solo ws=15 barre: troppo poco per SignalTrustEngine (window=40).
+        # thermo_buf accumula storia in modo rolling → Trust converge correttamente.
         try:
-            thermo_df = thermo_builder.build(window_raw, tradeable)
+            _current_bar = all_bars.iloc[[bar_i]]
+            thermo_df    = thermo_buf.update(_current_bar, tradeable)
         except Exception:
             thermo_df = pd.DataFrame()
 

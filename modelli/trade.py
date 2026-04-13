@@ -578,23 +578,40 @@ def run_trade(
     # ── 4. Ambienti ───────────────────────────────────────────────────────────
     buyer_cfg = cfg.buyer
 
+    # [Fix B1] Helper per estrarre tutti i parametri reward shaping dal config.
+    # In precedenza solo thermo_bonus_sell/thermo_penalty_buy venivano passati;
+    # lambda_inaction, lambda_concentration, sell_profit_bonus, max_holding_steps
+    # e forced_sell_cooldown erano nel YAML ma mai trasmessi all'env.
+    def _env_reward_kwargs(bcfg) -> dict:
+        return dict(
+            thermo_bonus_sell       = getattr(bcfg, "thermo_bonus_sell",       0.5),
+            thermo_penalty_buy      = getattr(bcfg, "thermo_penalty_buy",      0.1),
+            lambda_inaction         = getattr(bcfg, "lambda_inaction",         0.2),
+            lambda_concentration    = getattr(bcfg, "lambda_concentration",    0.6),
+            sell_profit_bonus       = getattr(bcfg, "sell_profit_bonus",       0.015),
+            max_holding_steps       = getattr(bcfg, "max_holding_steps",       60),
+            forced_sell_cooldown    = getattr(bcfg, "forced_sell_cooldown_steps", 10),
+            lambda_imbalance        = getattr(bcfg, "lambda_imbalance",        0.3),
+            imbalance_threshold     = getattr(bcfg, "imbalance_threshold",     2.0),
+            concentration_threshold = getattr(bcfg, "concentration_threshold", 0.4),
+            reward_clip             = getattr(bcfg, "reward_clip",             10.0),
+        )
+
     env_train = TradingEnv(
-        df                 = prices_real_train,
-        tickers            = tickers,
-        initial_capital    = buyer_cfg.initial_capital,
-        fee_pct            = buyer_cfg.transaction_cost,
-        thermo_df          = thermo_train,
-        thermo_bonus_sell  = getattr(buyer_cfg, "thermo_bonus_sell",  0.5),
-        thermo_penalty_buy = getattr(buyer_cfg, "thermo_penalty_buy", 0.1),
+        df              = prices_real_train,
+        tickers         = tickers,
+        initial_capital = buyer_cfg.initial_capital,
+        fee_pct         = buyer_cfg.transaction_cost,
+        thermo_df       = thermo_train,
+        **_env_reward_kwargs(buyer_cfg),
     )
     env_test = TradingEnv(
-        df                 = prices_real_test,
-        tickers            = tickers,
-        initial_capital    = buyer_cfg.initial_capital,
-        fee_pct            = buyer_cfg.transaction_cost,
-        thermo_df          = thermo_test,
-        thermo_bonus_sell  = getattr(buyer_cfg, "thermo_bonus_sell",  0.5),
-        thermo_penalty_buy = getattr(buyer_cfg, "thermo_penalty_buy", 0.1),
+        df              = prices_real_test,
+        tickers         = tickers,
+        initial_capital = buyer_cfg.initial_capital,
+        fee_pct         = buyer_cfg.transaction_cost,
+        thermo_df       = thermo_test,
+        **_env_reward_kwargs(buyer_cfg),
     )
 
     # ── 5. Agente DDPG ────────────────────────────────────────────────────────
@@ -781,12 +798,24 @@ def run_walk_forward(
     builder = ThermoStateBuilder(interval=freq)
     report  = WalkForwardReport(mode=mode)
 
+    # [Fix B1] _env_common ora include tutti i parametri reward shaping.
+    # In precedenza lambda_inaction, lambda_concentration, sell_profit_bonus,
+    # max_holding_steps e forced_sell_cooldown_steps non venivano trasmessi.
     _env_common = dict(
-        tickers            = tickers,
-        initial_capital    = buyer_cfg.initial_capital,
-        fee_pct            = buyer_cfg.transaction_cost,
-        thermo_bonus_sell  = getattr(buyer_cfg, "thermo_bonus_sell",  0.5),
-        thermo_penalty_buy = getattr(buyer_cfg, "thermo_penalty_buy", 0.1),
+        tickers                 = tickers,
+        initial_capital         = buyer_cfg.initial_capital,
+        fee_pct                 = buyer_cfg.transaction_cost,
+        thermo_bonus_sell       = getattr(buyer_cfg, "thermo_bonus_sell",       0.5),
+        thermo_penalty_buy      = getattr(buyer_cfg, "thermo_penalty_buy",      0.1),
+        lambda_inaction         = getattr(buyer_cfg, "lambda_inaction",         0.2),
+        lambda_concentration    = getattr(buyer_cfg, "lambda_concentration",    0.6),
+        sell_profit_bonus       = getattr(buyer_cfg, "sell_profit_bonus",       0.015),
+        max_holding_steps       = getattr(buyer_cfg, "max_holding_steps",       60),
+        forced_sell_cooldown    = getattr(buyer_cfg, "forced_sell_cooldown_steps", 10),
+        lambda_imbalance        = getattr(buyer_cfg, "lambda_imbalance",        0.3),
+        imbalance_threshold     = getattr(buyer_cfg, "imbalance_threshold",     2.0),
+        concentration_threshold = getattr(buyer_cfg, "concentration_threshold", 0.4),
+        reward_clip             = getattr(buyer_cfg, "reward_clip",             10.0),
     )
 
     prev_best_path:  str | None          = None

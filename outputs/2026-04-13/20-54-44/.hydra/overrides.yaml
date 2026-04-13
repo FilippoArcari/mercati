@@ -1,0 +1,6 @@
+- step=test
+- frequency=daily
+- data.inflation_series=[]
+- training=default
+- prediction=default
+- buyer=default

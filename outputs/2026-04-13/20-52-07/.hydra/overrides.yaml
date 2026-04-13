@@ -1,0 +1,6 @@
+- step=train
+- frequency=daily
+- training.epochs=5
+- training=default
+- prediction=default
+- buyer=default

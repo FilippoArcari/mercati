@@ -288,12 +288,14 @@ def load_data(
     end_date,
     fred_api_key,
     inflation_series,
-    interval:           str  = "1d",
-    cache_path:         str  = "./data.csv",
-    max_history_days:   int  = None,
-    add_thermodynamics: bool = True,
-    thermo_window:      int  = 20,
-    thermo_max_lag:     int  = 90,
+    interval:           str   = "1d",
+    cache_path:         str   = "./data.csv",
+    max_history_days:   int   = None,
+    add_thermodynamics: bool  = True,
+    thermo_window:      int   = 20,
+    thermo_max_lag:     int   = 90,
+    use_returns:        bool  = True,
+    split_ratio:        float = None,
 ):
     """
     Scarica prezzi + FRED, calcola feature termodinamiche e normalizza.
@@ -351,7 +353,9 @@ def load_data(
         if missing:
             print(f"[load_data] Ticker senza dati (rimossi): {missing}")
 
-        data = close[available].copy()
+        # Reindex per garantire che TUTTI i ticker richiesti siano presenti come colonne,
+        # anche se quelli mancanti saranno pieni di NaN (che gestiremo dopo).
+        data = close.reindex(columns=tickers).copy()
 
         if not volume.empty:
             for t in available:
@@ -411,17 +415,52 @@ def load_data(
 
     print(f"[load_data] NaN residui dopo sanificazione: {data.isna().any().any()}")
 
+    # ── Trasformazione in Rendimenti (facoltativa ma consigliata) ──────────────
+    if use_returns:
+        print("[load_data] Trasformazione in rendimenti logaritmici per colonne prezzo...")
+        for col in price_cols:
+            if col in data.columns:
+                # Log-return: r_t = log(P_t / P_{t-1})
+                # Più stabile del pct_change per l'addestramento e additivo
+                data[col] = np.log(data[col] / data[col].shift(1))
+        
+        # Mantieni le colonne ma riempile di zero se sono completamente vuote 
+        # (indispensabile per mantenere la dimensionalità attesa dai modelli pre-addestrati)
+        nan_cols = data.columns[data.isna().all()].tolist()
+        if nan_cols:
+            print(f"[load_data] ATTENZIONE: {len(nan_cols)} colonne sono vuote (es. delistate). Riempio con 0: {nan_cols}")
+            for col in nan_cols:
+                data[col] = 0.0
+            
+        # Il primo elemento è sempre NaN per le colonne dei prezzi dopo pct_change/log
+        # Usiamo how='any' per garantire che non ci siano NaN residui in nessuna feature
+        data = data.dropna(axis=0, how='any')
+        print(f"[load_data] Rimosse righe con NaN residui. Nuova lunghezza: {len(data)}")
+
+    # ── Split per normalizzazione (Prevenzione Data Leak) ─────────────────────
+    # Fit dello scaler SOLO sul training set.
+    # Se split_ratio non è passato, usiamo tutto il dataset (ma logghiamo avviso).
+    if split_ratio is not None:
+        n_train = int(len(data) * split_ratio)
+        train_slice = data.iloc[:n_train]
+        print(f"[load_data] Fitting scaler su train slice: {len(train_slice)} barre")
+    else:
+        train_slice = data
+        print("[load_data] AVVISO: split_ratio non fornito, fit scaler sull'intero dataset (potenziale leak).")
+
     # ── Normalizzazione MinMax ─────────────────────────────────────────────────
     scaler      = MinMaxScaler()
+    scaler.fit(train_slice)
+    
     data_scaled = pd.DataFrame(
-        scaler.fit_transform(data),
+        scaler.transform(data),
         columns=data.columns,
         index=data.index,
     )
 
     thermo_col_names = [
         c for c in data_scaled.columns
-        if c.startswith(("Market_", "Energy_", "Thermo_", "Volume_Delta"))
+        if c.startswith(("Market_", "Energy_", "Thermo_", "Volume_Delta", "Thm_"))
     ]
     print(
         f"[load_data] Dataset finale: {data_scaled.shape[1]} colonne × {len(data_scaled)} barre\n"
@@ -433,12 +472,16 @@ def load_data(
 
 # ─── Window creation ───────────────────────────────────────────────────────────
 
-def make_windows(data, window_size, stride):
+def make_windows(data, window_size, stride, prediction_steps: int = 1):
     X, Y = [], []
     data_array = data.values
-    for i in range(0, len(data_array) - window_size, stride):
-        X.append(data_array[i: i + window_size])
-        Y.append(data_array[i + window_size])
+    # Range limitato per permettere prediction_steps futuri
+    for i in range(0, len(data_array) - window_size - prediction_steps + 1, stride):
+        X.append(data_array[i : i + window_size])
+        if prediction_steps > 1:
+            Y.append(data_array[i + window_size : i + window_size + prediction_steps])
+        else:
+            Y.append(data_array[i + window_size])
 
     if not X:
         raise RuntimeError(

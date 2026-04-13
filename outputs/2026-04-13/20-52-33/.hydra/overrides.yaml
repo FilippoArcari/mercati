@@ -1,0 +1,7 @@
+- step=train
+- frequency=daily
+- training.epochs=5
+- data.inflation_series=[]
+- training=default
+- prediction=default
+- buyer=default

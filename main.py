@@ -176,6 +176,7 @@ def my_app(cfg: DictConfig) -> None:
         interval         = cfg.frequency.interval,
         cache_path       = cfg.frequency.cache_path,
         max_history_days = cfg.frequency.max_history_days,
+        split_ratio      = getattr(cfg.frequency, "split_ratio", None),
     )
 
     num_features = df.shape[1]
@@ -183,8 +184,8 @@ def my_app(cfg: DictConfig) -> None:
 
     train_df, test_df = split_dataframe(df, cfg)
 
-    X_train, Y_train = make_windows(train_df, cfg.prediction.window_size, cfg.prediction.stride)
-    X_test,  Y_test  = make_windows(test_df,  cfg.prediction.window_size, cfg.prediction.stride)
+    X_train, Y_train = make_windows(train_df, cfg.prediction.window_size, cfg.prediction.stride, prediction_steps=cfg.model.prediction_steps)
+    X_test,  Y_test  = make_windows(test_df,  cfg.prediction.window_size, cfg.prediction.stride, prediction_steps=cfg.model.prediction_steps)
 
     freq = cfg.frequency.interval
     print(
@@ -286,6 +287,12 @@ def my_app(cfg: DictConfig) -> None:
         with torch.no_grad():
             predictions_scaled = predictor(X_test_device).cpu().numpy()
             predictions_train  = predictor(X_train_device).cpu().numpy()
+
+        # [Fix] Se il modello è multi-step (3D), prendiamo solo il primo step per il test standard
+        if predictions_scaled.ndim == 3:
+            print(f"[Test] Modello multi-step rilevato ({predictions_scaled.shape}) -> uso step 0 per valutazione")
+            predictions_scaled = predictions_scaled[:, 0, :]
+            predictions_train  = predictions_train[:, 0, :]
 
         predictions       = scaler.inverse_transform(predictions_scaled)
         train_predictions = scaler.inverse_transform(predictions_train)

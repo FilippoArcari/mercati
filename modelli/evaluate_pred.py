@@ -26,11 +26,11 @@ def evaluate_predictions(predictions: pd.DataFrame, targets: pd.DataFrame, step:
         plt.figure(figsize=(12, 6))
         plt.plot(predictions.index, predictions[ticker], label='Predizioni', color='blue')
         plt.plot(targets.index, targets[ticker], label='Valori Reali', color='orange')
-        plt.title(f'Predizioni vs Valori Reali per {ticker}')
-        plt.text(0.02, 0.95, f'Max Error:{difference["mae"].max() :.2f}\n Mean Error:{difference["mae"].mean():.2f}\n Min Error:{difference["mae"].min():.2f}', 
+        plt.title(f'Predizioni vs Valori Reali per {ticker} ({step})')
+        plt.text(0.02, 0.95, f'Max Error:{difference["mae"].max() :.4f}\n Mean Error:{difference["mae"].mean():.4f}\n Min Error:{difference["mae"].min():.4f}', 
                  transform=plt.gca().transAxes, fontsize=10, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.5))
         plt.xlabel('Data')
-        plt.ylabel('Prezzo')
+        plt.ylabel('Rendimento / Valore')
         plt.legend()
         plt.grid()
         plt.savefig(f"{results_dir}/{step}/{ticker}.png")

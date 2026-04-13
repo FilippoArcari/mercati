@@ -1,0 +1,155 @@
+data:
+  tickers:
+  - AAPL
+  - MSFT
+  - AMZN
+  - GOOGL
+  - META
+  - NVDA
+  - T
+  - VSLA
+  - JPM
+  - MA
+  - UNH
+  - JNJ
+  - LDO.MI
+  - ENI.MI
+  - ENEL.MI
+  - ISP.MI
+  - RACE.MI
+  - ^GSPC
+  - ^IXIC
+  - FTSEMIB.MI
+  - SPY
+  - QQQ
+  - IVV
+  - EEM
+  - EFA
+  - XLF
+  - VNQ
+  - GC=F
+  - CL=F
+  - SI=F
+  - NG=F
+  - HG=F
+  - GLD
+  - SLV
+  - USO
+  - EURUSD=X
+  - USDJPY=X
+  - TLT
+  - BND
+  - IEF
+  - XLE
+  - BTC-USD
+  - ETH-USD
+  - XOM
+  - CVX
+  - WMT
+  - NFLX
+  - BA
+  - KO
+  - PFE
+  - SHOP
+  inflation_series: []
+  start_date: '2018-01-01'
+  end_date: '2026-12-31'
+  cache_path: ./data.csv
+  fred_api_key: ${oc.env:FRED_API_KEY}
+  split_date: '2023-01-01'
+model:
+  name: cnn
+  dimensions:
+  - 64
+  - 32
+  - 16
+  dilations:
+  - 1
+  - 2
+  - 4
+  kernel_size: 3
+  activation: leaky_relu
+  prediction_steps: 1
+training:
+  epochs: 5
+  learning_rate: 0.001
+  batch_size: 32
+  optimizer: adam
+  weight_decay: 1.0e-05
+  scheduler:
+    enabled: false
+    type: cosine
+    warmup_steps: 100
+  early_stopping:
+    enabled: true
+    patience: 50
+    min_delta: 1.0e-05
+  mre:
+    enabled: true
+    update_mode: simultaneous
+    lambda_entropy: 0.05
+    lambda_moment: 0.1
+    epochs_phase1: 30
+prediction:
+  window_size: 30
+  stride: 1
+buyer:
+  agent: ddpg
+  initial_capital: 100.0
+  transaction_cost: 0.001
+  buffer_capacity: 250000
+  batch_size: 256
+  n_episodes: 300
+  warmup: 5000
+  log_every: 10
+  es_patience: 40
+  es_metric: sharpe
+  lambda_concentration: 0.8
+  lambda_inaction: 0.3
+  action_threshold: 0.01
+  lambda_loss: 0.5
+  loss_threshold: -0.5
+  ddpg:
+    actor_hidden:
+    - 512
+    - 256
+    - 128
+    critic_hidden:
+    - 512
+    - 256
+    - 128
+    lr_actor: 0.0002
+    lr_critic: 0.0005
+    gamma: 0.99
+    tau: 0.005
+    update_every: 10
+    noise_sigma: 0.1
+    noise_decay: 0.99
+    noise_floor: 0.02
+  dqn:
+    n_actions: 5
+    hidden:
+    - 512
+    - 256
+    - 128
+    lr: 0.0003
+    gamma: 0.99
+    tau: 0.005
+    update_every: 4
+    target_update_every: 100
+    epsilon_start: 1.0
+    epsilon_end: 0.05
+    epsilon_decay: 0.992
+paths:
+  output_dir: ${hydra:runtime.output_dir}
+  results_dir: ./results
+  checkpoint_dir: ./checkpoints
+frequency:
+  interval: 1d
+  label: daily
+  bars_per_day: 1
+  bars_per_year: 252
+  cache_path: ./data_daily.csv
+  max_history_days: null
+  split_ratio: null
+step: train

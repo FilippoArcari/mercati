@@ -1,0 +1,5 @@
+- step=trade
+- frequency=minute
+- training=minute
+- prediction=minute
+- buyer=minute

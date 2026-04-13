@@ -1,22 +1,19 @@
-# config/buyer/intraday_override.yaml
+# config/buyer/minute.yaml (ex intraday_override)
 # ── BUYER INTRADAY OVERRIDE ───────────────────────────────────────────────────
-# Caricato SOLO quando frequency=minute (via _apply_frequency_defaults in main.py)
-# Sovrascrive config/buyer/default.yaml con parametri specifici per intraday.
+# Caricato SOLO quando frequency=minute.
 #
-# Fix applicati rispetto alla versione precedente:
-#   [Fix #1] reward_clip: 10.0 — impedisce esplosioni reward quando prev_value ≈ 0
-#            (causa degli ep 53/58 con portfolio da $48M/$64M)
-#   [Fix #2] forced_sell_cooldown_steps: 20 — impedisce rebuy immediato post-espulsione
-#   [Fix #3] sell_profit_bonus esplicito
-#   [Fix #4] new_value calcolato prima di _step += 1 (stesso frame di prezzi)
-#   [Fix #5] trust_min: 0.35 / trust_max: 0.65 — thermo finalmente attivo con trust medio 0.477
-#            Con i vecchi valori (0.40/0.80) → w ≈ 0.19 (thermo quasi spento)
-#            Con i nuovi valori (0.35/0.65) → w ≈ 0.42 (thermo a ~40% della forza massima)
-#   [Fix #6] bars_per_year passato all'env per Sharpe corretto su dati 2-min
-#   [Fix #7] inaction_threshold separato — più alto per evitare bypass con micro-segnali
-#   [Fix #8] next_state reale anche quando done (no zero-vector artificiale nel buffer)
-#   [Fix #9] Off-by-one thermo risolto via _thermo_at(step) — log e reward ora allineati
-#   [Fix #10] w_global ora moltiplicatore esterno su tutti i bonus/penalità thermo
+# FIX v5.0 — BUY/SELL IMBALANCE:
+#   [Fix B1] Tutti i parametri reward shaping ora vengono effettivamente passati
+#            a TradingEnv (prima erano nel YAML ma ignorati dal codice Python).
+#   [Fix B2] sell_mult_expansion portato a 1.2 nel ThermoRewardConfig (era 0.9,
+#            che penalizzava attivamente le vendite in regime espansivo).
+#   [Fix B3] max_holding_steps abbassato a 60 (2 ore su 2m) da 120 (4 ore):
+#            il forced sell ora si attiva il doppio delle volte.
+#   [Fix B4] lambda_imbalance e imbalance_threshold: nuovi parametri che
+#            introducono una penalità crescente quando buy/sell ratio > 2.0.
+#   [Fix B6] sell_profit_bonus portato a 0.015 da 0.002 (7.5x più alto):
+#            il bonus è proporzionale al gain realizzato, quindi vendere in
+#            profitto diventa significativamente più attraente.
 
 agent: ddpg
 initial_capital:  100.0
@@ -32,31 +29,41 @@ warmup:      5000
 es_patience: 75
 es_metric:   sharpe
 
-# ── Reward shaping ────────────────────────────────────────────────────────────
-lambda_concentration: 0.6
-lambda_inaction:      0.2
-action_threshold:     0.005
-inaction_threshold:   0.05   # [Fix #7] più alto di action_threshold per evitare bypass
+# ── Reward shaping (ora effettivamente usati in TradingEnv) ───────────────────
+lambda_concentration:    0.6
+lambda_inaction:         0.2
+action_threshold:        0.005
+inaction_threshold:      0.05
+reward_clip:             10.0
 
-# [Fix #1] Clip del base_reward per prevenire esplosioni numeriche.
-# Se prev_value ≈ 0 (portfolio azzerato), senza clip il reward può diventare +10k.
-# Il clip a ±10 è conservativo: il rendimento reale per step è nell'ordine di ±0.1%.
-reward_clip: 10.0
-
-# [Fix #3] Bonus per ogni vendita profittevole
-sell_profit_bonus: 0.002
+# [Fix B6] Portato da 0.002 a 0.015. Il bonus è proporzionale al gain %
+# (max 3x), quindi vendere a +1% genera un bonus di ~0.030. Con 0.002
+# era impercettibile rispetto alla reward base.
+sell_profit_bonus: 0.015
 
 # Penalità per perdite eccessive
 lambda_loss:    0.5
 loss_threshold: -0.5
 
 # ── Gestione posizioni ────────────────────────────────────────────────────────
-max_position_pct:           0.20
-max_holding_steps:          120
-forced_sell_cooldown_steps: 20   # [Fix #2] cooldown post-forced-sell
+max_position_pct:  0.20
+
+# [Fix B3] Abbassato da 120 a 60 barre (120 min → 60 min su 2m bars).
+# Il forced sell ora scatta dopo 2 ore invece di 4, forzando il turnover.
+max_holding_steps:          60
+forced_sell_cooldown_steps: 10   # abbassato da 20
+
+# ── [Fix B4] Parametri imbalance buy/sell (nuovi) ────────────────────────────
+# Penalità episodica quando cumulative_buys / cumulative_sells > imbalance_threshold.
+# Scala linearmente: a ratio=4.0 la penalità è piena (lambda_imbalance = 0.3).
+lambda_imbalance:    0.3
+imbalance_threshold: 2.0
+
+# Frazione di ticker che possono essere aperti contemporaneamente prima della
+# penalità concentrazione. Su 51 ticker: 0.35 → max ~18 posizioni aperte.
+concentration_threshold: 0.35
 
 # ── Sharpe corretto per intraday ─────────────────────────────────────────────
-# [Fix #6] Per 2-min: 390 barre/giorno × 252 giorni = 98280
 bars_per_year: 98280
 
 # ── DDPG ─────────────────────────────────────────────────────────────────────
@@ -81,25 +88,13 @@ thermo_bonus_sell:         0.002
 thermo_bonus_buy:          0.001
 thermo_penalty_buy:        0.003
 
-# [Fix #5] Trust continuo ridisegnato.
-#
-# PROBLEMA PRECEDENTE: trust_min=0.40, trust_max=0.80
-#   Con trust medio osservato = 0.477:
-#   w = (0.477 - 0.40) / (0.80 - 0.40) = 0.077 / 0.40 = 0.19
-#   Bonus effettivo = 0.002 * 0.19 = 0.00038 → trascurabile
-#
-# SOLUZIONE: abbassare trust_min e ridurre il range
-#   Con trust_min=0.35, trust_max=0.65:
+# ── Trust range ───────────────────────────────────────────────────────────────
+# Con trust medio 0.477:
 #   w = (0.477 - 0.35) / (0.65 - 0.35) = 0.127 / 0.30 = 0.42
-#   Bonus effettivo = 0.002 * 0.42 = 0.00084 → ~2x più impattante
-#
-# [Fix #10] w_global: con trust medio 0.477 → w_global = 0.42
-#   Prodotto w_stress * w_global = 0.42 * 0.42 = 0.18
-#   Thermo opera al 18% della forza massima — se vuoi più impatto,
-#   aumenta i bonus (thermo_bonus_sell, thermo_bonus_buy) invece di
-#   modificare trust_min/trust_max, per mantenere la calibrazione del rischio.
+# Thermo opera al ~42% della forza massima.
 trust_min: 0.35
 trust_max: 0.65
-episodic_episodes: 20        # default già impostato
-ensemble_temperature: 0.5   # quanto è selettivo il ThermoEnsemble (0=winner-take-all, 2=uniforme)
-warm_start_kl_threshold: 2.0 # già esistente  
+
+episodic_episodes:       20
+ensemble_temperature:    0.5
+warm_start_kl_threshold: 2.0
