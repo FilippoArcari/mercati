@@ -1,17 +1,35 @@
 """
 modelli/trade.py — Addestramento e valutazione dell'agente DDPG
 
-Bug corretti rispetto alla versione precedente
+Fix applicati rispetto alla versione precedente
 ──────────────────────────────────────────────
 FIX A  stress_fn costruita ma mai passata a train_ddpg_normalized
-       (il parametro non esiste nella firma) → rimossa da entrambi i siti
-       Il regime termodinamico viene già letto dentro train_ddpg_normalized
-       tramite env.get_current_regime().
+       rimossa da entrambi i siti.
 
-FIX B  norm_path passato con spaziatura errata e ordine argomenti incoerente
-       → uniformato con keyword args espliciti in entrambe le chiamate.
+FIX B  norm_path/keyword args uniformati.
 
-FIX C  es_patience non veniva passato a train_ddpg_normalized → aggiunto.
+FIX C  es_patience aggiunto a train_ddpg_normalized.
+
+FIX D  ckpt_path=fold_best nel loop walk-forward (senza, il best
+       checkpoint non veniva mai salvato → agent.load era un no-op).
+
+FIX E  [NUOVO] lambda_inaction default abbassato 0.2 → 0.005.
+       Con 0.2 l'agente imparava che stare fermo era più costoso di
+       tradare, causando overtrading sistematico (266 trade / 472 barre).
+
+FIX F  [NUOVO] reward_clip default abbassato 10.0 → 0.05.
+       Con clip=10 i gradienti degli episodi catastrofici destabilizzano
+       il critic. 0.05 equivale a max ±5% per step, già ampio per intraday.
+
+FIX G  [NUOVO] transaction_cost propagato esplicitamente al TradingEnv
+       via _env_reward_kwargs per garantire coerenza con alpaca_live.py.
+
+FIX H  [NUOVO] Integrazione thermo_vdw: compute_vdw_block chiamato dopo
+       builder.build() e concatenato al DataFrame termodinamico.
+       La funzione _build_thermo() centralizza la logica per train/test/fold.
+       NOTA: questa aggiunge 8 colonne → state_dim cambia → i checkpoint
+       DDPG esistenti sono incompatibili. Cancellare ddpg_*.pth e
+       normalizer_*.npz prima di riaddestrare.
 """
 
 from __future__ import annotations
@@ -58,6 +76,59 @@ def _predict_batched(predictor, X: torch.Tensor, batch_size: int = 256) -> np.nd
     return np.concatenate(results, axis=0)
 
 
+# ─── helper thermo + VdW ─────────────────────────────────────────────────────
+
+def _build_thermo(
+    builder,
+    raw_df: pd.DataFrame,
+    tickers: list[str],
+) -> pd.DataFrame | None:
+    """
+    [FIX H] Chiama ThermoStateBuilder.build() e concatena le feature
+    Van der Waals (compute_vdw_block) se il modulo è disponibile.
+
+    La funzione è centralizzata qui per garantire che train, test,
+    walk-forward e alpaca_replay abbiano lo stesso state_dim.
+    """
+    thermo = builder.build(raw_df, tickers)
+
+    try:
+        from modelli.thermo_vdw import compute_vdw_block
+
+        # Cerca la colonna prezzo e volume più probabile nel raw_df
+        price_candidates  = [c for c in raw_df.columns
+                             if any(k in c.lower() for k in ("close", "price", "adj"))]
+        volume_candidates = [c for c in raw_df.columns if "vol" in c.lower()]
+
+        price_col  = price_candidates[0]  if price_candidates  else raw_df.columns[0]
+        volume_col = volume_candidates[0] if volume_candidates else None
+
+        # Se i ticker sono nel df usa il primo ticker come proxy di prezzo
+        if tickers and tickers[0] in raw_df.columns:
+            price_col = tickers[0]
+
+        vdw = compute_vdw_block(
+            df=raw_df,
+            price_col=price_col,
+            volume_col=volume_col,
+            window=20,
+            lag_max=60,
+        )
+
+        if thermo is not None and not thermo.empty:
+            vdw_aligned = vdw.reindex(thermo.index)
+            thermo = pd.concat([thermo, vdw_aligned], axis=1)
+        else:
+            thermo = vdw
+
+    except ImportError:
+        pass  # thermo_vdw non ancora installato — continua senza
+    except Exception as e:
+        print(f"  [thermo_vdw] Integrazione VdW skippata: {e}")
+
+    return thermo
+
+
 # ─── helpers privati ──────────────────────────────────────────────────────────
 
 def _load_predictor(cfg, num_features, checkpoint):
@@ -96,15 +167,7 @@ def _build_price_dfs(pred_scaled, real_targets, scaler, dates, all_columns):
     )
 
 
-def _extract_psi(df: pd.DataFrame, tickers: list[str]):
-    psi_cols = [f"Psi_{t}" for t in tickers if f"Psi_{t}" in df.columns]
-    return df[psi_cols] if psi_cols else None
-
-
 def _build_portfolio_daily(env: TradingEnv, tickers: list[str]) -> pd.DataFrame:
-    """
-    Ricostruisce un DataFrame giornaliero dal portfolio_history dell'env.
-    """
     ph = env.portfolio_history()
     if len(ph) < 2:
         return pd.DataFrame()
@@ -262,24 +325,13 @@ def _plot_trades(env, results_dir, freq):
 
 
 def _plot_walk_forward_summary(report, results_dir: str, freq: str) -> None:
-    """
-    Grafico riepilogativo cross-fold dopo il walk-forward.
-
-    Quattro pannelli:
-      1. Sharpe per fold (bar, colorati verde/rosso)
-      2. Return % per fold
-      3. MaxDD per fold
-      4. Thm✅% per fold (qualità segnali termodinamici)
-
-    Evidenzia il best fold (★) e worst fold (✗).
-    """
     if not report.folds:
         return
 
-    folds      = [f.fold            for f in report.folds]
-    sharpes    = [f.sharpe          for f in report.folds]
+    folds      = [f.fold             for f in report.folds]
+    sharpes    = [f.sharpe           for f in report.folds]
     returns    = [f.total_return_pct for f in report.folds]
-    maxdds     = [f.max_drawdown    for f in report.folds]
+    maxdds     = [f.max_drawdown     for f in report.folds]
     thermo_ok  = [f.thermo_sell_ok_pct for f in report.folds]
 
     best_sharpe  = max(sharpes)
@@ -293,9 +345,9 @@ def _plot_walk_forward_summary(report, results_dir: str, freq: str) -> None:
     labels = [f"F{f}" for f in folds]
     tags   = []
     for s in sharpes:
-        if s == best_sharpe:  tags.append("★")
+        if s == best_sharpe:    tags.append("★")
         elif s == worst_sharpe: tags.append("✗")
-        else: tags.append("")
+        else:                   tags.append("")
 
     def _bar_panel(ax, values, ylabel, title, threshold=None,
                    pos_color="#4fc3f7", neg_color="#ef5350"):
@@ -309,7 +361,7 @@ def _plot_walk_forward_summary(report, results_dir: str, freq: str) -> None:
         for bar, val, tag in zip(bars, values, tags):
             offset = max(abs(v) for v in values) * 0.04 if values else 0.1
             ypos = val + offset if val >= 0 else val - offset * 2
-            ax.text(bar.get_x() + bar.get_width()/2, ypos,
+            ax.text(bar.get_x() + bar.get_width() / 2, ypos,
                     f"{val:.2f}{tag}", ha="center", va="bottom",
                     fontsize=8, color="white", fontweight="bold")
         ax.set_ylabel(ylabel, color="white", fontsize=9)
@@ -317,8 +369,6 @@ def _plot_walk_forward_summary(report, results_dir: str, freq: str) -> None:
         ax.set_facecolor("#161b22")
         ax.tick_params(colors="gray", labelsize=8)
         ax.spines[:].set_color("#30363d")
-
-        # Media cross-fold
         mean_val = sum(values) / len(values)
         ax.axhline(mean_val, color="#80cbc4", lw=1.0, linestyle=":",
                    alpha=0.8, label=f"media {mean_val:.2f}")
@@ -327,38 +377,31 @@ def _plot_walk_forward_summary(report, results_dir: str, freq: str) -> None:
     _bar_panel(axes[0], sharpes, "Sharpe",
                "Sharpe per fold  —  ★ best  |  ✗ worst  |  linea tratteggiata = soglia 0.5",
                threshold=0.5)
-
     _bar_panel(axes[1], returns, "Return (%)",
-               "Rendimento % per fold sul test set",
-               threshold=0.0)
-
+               "Rendimento % per fold sul test set", threshold=0.0)
     _bar_panel(axes[2], maxdds, "Max Drawdown",
                "Max Drawdown per fold  (peggiore = più negativo)",
                threshold=-0.20, pos_color="#ef5350", neg_color="#4fc3f7")
 
-    # Thm✅% — usa palette diversa (sempre positivo)
     thm_colors = ["#81c784" if v > 50 else "#ffb74d" if v > 25 else "#ef5350"
                   for v in thermo_ok]
     bars = axes[3].bar(labels, thermo_ok, color=thm_colors,
                        edgecolor="#30363d", linewidth=0.8)
-    axes[3].axhline(50, color="#ffd54f", lw=1.2, linestyle="--",
-                    label="soglia 50%")
+    axes[3].axhline(50, color="#ffd54f", lw=1.2, linestyle="--", label="soglia 50%")
     for bar, val, tag in zip(bars, thermo_ok, tags):
-        axes[3].text(bar.get_x() + bar.get_width()/2,
-                     val + max(thermo_ok)*0.03 + 0.5,
+        axes[3].text(bar.get_x() + bar.get_width() / 2,
+                     val + max(thermo_ok) * 0.03 + 0.5,
                      f"{val:.1f}%{tag}", ha="center", va="bottom",
                      fontsize=8, color="white", fontweight="bold")
     axes[3].set_ylabel("Thm✅ SELL (%)", color="white", fontsize=9)
     axes[3].set_title(
-        "Thm✅% — % di SELL effettuate in zona stress termodinamico  "
-        "(verde>50% = agente allineato ai segnali)",
+        "Thm✅% — % di SELL effettuate in zona stress termodinamico",
         color="gray", fontsize=8, loc="left")
     axes[3].set_facecolor("#161b22")
     axes[3].tick_params(colors="gray", labelsize=8)
     axes[3].spines[:].set_color("#30363d")
     axes[3].legend(fontsize=7, labelcolor="white")
 
-    # Box statistiche in alto a destra
     stats_txt = (
         f"Sharpe medio: {report.mean_sharpe:.3f}\n"
         f"Std Sharpe:   {report.std_sharpe:.3f}\n"
@@ -379,143 +422,136 @@ def _plot_walk_forward_summary(report, results_dir: str, freq: str) -> None:
 
 
 def _plot_fold_portfolio(
-    env_test,
-    fold_n:      int,
-    sharpe:      float,
-    ret_pct:     float,
-    max_dd:      float,
-    th_test,
-    results_dir: str,
-    freq:        str,
+    env_test, fold_n, sharpe, ret_pct, max_dd, th_test, results_dir, freq
 ) -> None:
-    """
-    Grafico diagnostico per singolo fold: portfolio + thermo overlay.
-
-    Pannello 1 — Equity curve con BUY/SELL markers e drawdown shading.
-    Pannello 2 — Thm_Stress e Thm_Efficiency (se disponibili).
-    Pannello 3 — Nuovi indicatori: Thm_CarnotEff, Thm_EntropyProd, Thm_Quality.
-    """
     portfolio = env_test.portfolio_history()
     if len(portfolio) < 2:
         return
 
-    trades   = env_test._trades
-    n_steps  = len(portfolio)
-    steps    = np.arange(n_steps)
+    trades  = env_test._trades
+    n_steps = len(portfolio)
+    steps   = np.arange(n_steps)
 
-    # Scopri quanti pannelli termodinamici mostrare
-    has_thermo  = th_test is not None and not th_test.empty
-    has_stats   = has_thermo and any(
-        c in th_test.columns for c in ["Thm_CarnotEff","Thm_EntropyProd","Thm_Quality"]
+    has_thermo = th_test is not None and not th_test.empty
+    has_stats  = has_thermo and any(
+        c in th_test.columns for c in ["Thm_CarnotEff", "Thm_EntropyProd", "Thm_Quality"]
     )
     n_panels = 1 + int(has_thermo) + int(has_stats)
 
     fig_h = 5 + 3 * (n_panels - 1)
     fig, axes = plt.subplots(
-        n_panels, 1, figsize=(15, fig_h),
-        facecolor="#0d1117",
-        gridspec_kw={"height_ratios": [3] + [2]*(n_panels-1), "hspace": 0.35}
+        n_panels, 1, figsize=(15, fig_h), facecolor="#0d1117",
+        gridspec_kw={"height_ratios": [3] + [2] * (n_panels - 1), "hspace": 0.35},
     )
     if n_panels == 1:
         axes = [axes]
 
-    # ── Pannello 1: Equity curve ───────────────────────────────────────────
     ax = axes[0]
     ax.set_facecolor("#161b22")
     ax.plot(steps, portfolio, color="#4fc3f7", linewidth=1.4, zorder=3)
-
-    # Drawdown shading
     peak = np.maximum.accumulate(portfolio)
     dd   = (portfolio - peak) / (peak + 1e-8)
     ax.fill_between(steps, portfolio, peak, where=(dd < 0),
                     color="tomato", alpha=0.15, zorder=2)
-
-    # BUY / SELL markers
     for tr in trades:
         s = tr["step"]
         if s >= n_steps:
             continue
-        if tr["type"] == "BUY":
-            ax.axvline(s, color="#2ecc71", alpha=0.25, linewidth=0.7)
-        else:
-            ax.axvline(s, color="#e74c3c", alpha=0.25, linewidth=0.7)
-
+        ax.axvline(s, color="#2ecc71" if tr["type"] == "BUY" else "#e74c3c",
+                   alpha=0.25, linewidth=0.7)
     ax.set_title(
         f"Fold {fold_n} — Equity Curve  |  Sharpe: {sharpe:.3f}  |  "
         f"Return: {ret_pct:+.2f}%  |  MaxDD: {max_dd:.3f}",
-        color="white", fontsize=10, fontweight="bold"
+        color="white", fontsize=10, fontweight="bold",
     )
     ax.set_ylabel("Portfolio ($)", color="white", fontsize=9)
     ax.tick_params(colors="gray", labelsize=7)
     ax.spines[:].set_color("#30363d")
-    # Legenda trades
     from matplotlib.lines import Line2D
-    handles = [
-        Line2D([0],[0], color="#2ecc71", lw=1.5, alpha=0.6, label="BUY"),
-        Line2D([0],[0], color="#e74c3c", lw=1.5, alpha=0.6, label="SELL"),
-    ]
-    ax.legend(handles=handles, fontsize=7, labelcolor="white", loc="upper left")
+    ax.legend(handles=[
+        Line2D([0], [0], color="#2ecc71", lw=1.5, alpha=0.6, label="BUY"),
+        Line2D([0], [0], color="#e74c3c", lw=1.5, alpha=0.6, label="SELL"),
+    ], fontsize=7, labelcolor="white", loc="upper left")
 
-    # ── Pannello 2: Thm_Stress + Thm_Efficiency ───────────────────────────
     if has_thermo and n_panels >= 2:
         ax2 = axes[1]
         ax2.set_facecolor("#161b22")
         th_arr = th_test.reset_index(drop=True)
         lim    = min(n_steps, len(th_arr))
         t_idx  = np.arange(lim)
-
         if "Thm_Stress" in th_arr.columns:
             stress = th_arr["Thm_Stress"].values[:lim]
             ax2.plot(t_idx, stress, color="#f06292", lw=1.2, label="Thm_Stress")
             ax2.fill_between(t_idx, stress, 0,
                              where=(stress > 0.5), color="#f06292", alpha=0.15)
-
         if "Thm_Efficiency" in th_arr.columns:
-            eff = th_arr["Thm_Efficiency"].values[:lim]
-            ax2.plot(t_idx, eff, color="#ffb74d", lw=1.2, label="Thm_Efficiency")
-
+            ax2.plot(t_idx, th_arr["Thm_Efficiency"].values[:lim],
+                     color="#ffb74d", lw=1.2, label="Thm_Efficiency")
         ax2.axhline(0.5, color="#555", lw=0.7, linestyle="--")
-        ax2.axhline(0,   color="#444", lw=0.5)
+        ax2.axhline(0, color="#444", lw=0.5)
         ax2.set_ylabel("Stress / Efficiency", color="white", fontsize=9)
-        ax2.set_title("Thm_Stress (rosa) + Thm_Efficiency (arancio) — zona rossa = stress alto",
-                      color="gray", fontsize=8, loc="left")
+        ax2.set_title("Thm_Stress + Thm_Efficiency", color="gray", fontsize=8, loc="left")
         ax2.tick_params(colors="gray", labelsize=7)
         ax2.spines[:].set_color("#30363d")
         ax2.legend(fontsize=7, labelcolor="white", loc="upper right")
 
-    # ── Pannello 3: ThermoStatistics nuovi indicatori ─────────────────────
     if has_stats and n_panels >= 3:
         ax3 = axes[2]
         ax3.set_facecolor("#161b22")
         th_arr = th_test.reset_index(drop=True)
         lim    = min(n_steps, len(th_arr))
         t_idx  = np.arange(lim)
-
-        stat_plot = [
+        for col, color, label in [
             ("Thm_CarnotEff",   "#81c784", "Carnot η"),
             ("Thm_EntropyProd", "#ce93d8", "σ EntrProd"),
             ("Thm_Quality",     "#80cbc4", "Q Quality"),
-        ]
-        for col, color, label in stat_plot:
+        ]:
             if col in th_arr.columns:
-                ax3.plot(t_idx, th_arr[col].values[:lim],
-                         color=color, lw=1.0, label=label)
-
+                ax3.plot(t_idx, th_arr[col].values[:lim], color=color, lw=1.0, label=label)
         ax3.axhline(0, color="#444", lw=0.5)
         ax3.set_ylabel("ThermoStats", color="white", fontsize=9)
-        ax3.set_title("Carnot η | σ EntropyProd | Q Quality  —  nuovi indicatori",
-                      color="gray", fontsize=8, loc="left")
+        ax3.set_title("Carnot η | σ EntropyProd | Q Quality", color="gray", fontsize=8, loc="left")
         ax3.tick_params(colors="gray", labelsize=7)
         ax3.spines[:].set_color("#30363d")
         ax3.legend(fontsize=7, labelcolor="white", loc="upper right")
 
     fig.text(0.5, 0.01, f"Freq: {freq} | Fold {fold_n}",
              ha="center", fontsize=7, color="#555")
-
     out = os.path.join(results_dir, f"fold_{fold_n}_portfolio_{freq}.png")
     plt.savefig(out, dpi=130, bbox_inches="tight", facecolor="#0d1117")
     plt.close(fig)
     print(f"  [Fold {fold_n}] Grafico salvato: {os.path.basename(out)}")
+
+
+# ─── reward kwargs ────────────────────────────────────────────────────────────
+
+def _env_reward_kwargs(bcfg) -> dict:
+    """
+    [FIX E] lambda_inaction default: 0.2 → 0.005
+            Con 0.2 l'agente imparava che non fare nulla era peggio di qualsiasi
+            trade, causando overtrading sistematico.
+
+    [FIX F] reward_clip default: 10.0 → 0.05
+            Con clip=10 i gradienti catastrofici destabilizzavano il critic.
+            0.05 = max ±5% per step, già abbondante per intraday 2m.
+
+    [FIX G] transaction_cost ora viene propagato esplicitamente dal YAML
+            così è garantito identico a quello usato in alpaca_live.py.
+    """
+    return dict(
+        thermo_bonus_sell       = getattr(bcfg, "thermo_bonus_sell",          0.5),
+        thermo_penalty_buy      = getattr(bcfg, "thermo_penalty_buy",         0.1),
+        lambda_inaction         = getattr(bcfg, "lambda_inaction",            0.005),  # FIX E
+        lambda_concentration    = getattr(bcfg, "lambda_concentration",       0.6),
+        sell_profit_bonus       = getattr(bcfg, "sell_profit_bonus",          0.015),
+        max_holding_steps       = getattr(bcfg, "max_holding_steps",          60),
+        forced_sell_cooldown    = getattr(bcfg, "forced_sell_cooldown_steps", 10),
+        lambda_imbalance        = getattr(bcfg, "lambda_imbalance",           0.3),
+        imbalance_threshold     = getattr(bcfg, "imbalance_threshold",        2.0),
+        concentration_threshold = getattr(bcfg, "concentration_threshold",    0.4),
+        reward_clip             = getattr(bcfg, "reward_clip",                0.05),  # FIX F
+        fee_pct                 = getattr(bcfg, "transaction_cost",           0.001), # FIX G
+    )
 
 
 # ─── entry point ──────────────────────────────────────────────────────────────
@@ -564,7 +600,7 @@ def run_trade(
     prices_real_test, prices_pred_test = _build_price_dfs(
         test_pred_scaled, Y_test, scaler, test_dates, all_columns)
 
-    # ── 3. Feature termodinamiche ─────────────────────────────────────────────
+    # ── 3. Feature termodinamiche + VdW ──────────────────────────────────────
     if df_raw is not None:
         raw_train_df, raw_test_df = _split_raw(df_raw, train_df.index, test_df.index)
     else:
@@ -572,46 +608,28 @@ def run_trade(
 
     from modelli.thermo_state_builder import ThermoStateBuilder
     builder      = ThermoStateBuilder(interval=cfg.frequency.interval)
-    thermo_train = builder.build(raw_train_df, tickers)
-    thermo_test  = builder.build(raw_test_df,  tickers)
+
+    # [FIX H] _build_thermo centralizza builder.build() + compute_vdw_block()
+    thermo_train = _build_thermo(builder, raw_train_df, tickers)
+    thermo_test  = _build_thermo(builder, raw_test_df,  tickers)
 
     # ── 4. Ambienti ───────────────────────────────────────────────────────────
     buyer_cfg = cfg.buyer
-
-    # [Fix B1] Helper per estrarre tutti i parametri reward shaping dal config.
-    # In precedenza solo thermo_bonus_sell/thermo_penalty_buy venivano passati;
-    # lambda_inaction, lambda_concentration, sell_profit_bonus, max_holding_steps
-    # e forced_sell_cooldown erano nel YAML ma mai trasmessi all'env.
-    def _env_reward_kwargs(bcfg) -> dict:
-        return dict(
-            thermo_bonus_sell       = getattr(bcfg, "thermo_bonus_sell",       0.5),
-            thermo_penalty_buy      = getattr(bcfg, "thermo_penalty_buy",      0.1),
-            lambda_inaction         = getattr(bcfg, "lambda_inaction",         0.2),
-            lambda_concentration    = getattr(bcfg, "lambda_concentration",    0.6),
-            sell_profit_bonus       = getattr(bcfg, "sell_profit_bonus",       0.015),
-            max_holding_steps       = getattr(bcfg, "max_holding_steps",       60),
-            forced_sell_cooldown    = getattr(bcfg, "forced_sell_cooldown_steps", 10),
-            lambda_imbalance        = getattr(bcfg, "lambda_imbalance",        0.3),
-            imbalance_threshold     = getattr(bcfg, "imbalance_threshold",     2.0),
-            concentration_threshold = getattr(bcfg, "concentration_threshold", 0.4),
-            reward_clip             = getattr(bcfg, "reward_clip",             10.0),
-        )
+    rw        = _env_reward_kwargs(buyer_cfg)
 
     env_train = TradingEnv(
         df              = prices_real_train,
         tickers         = tickers,
         initial_capital = buyer_cfg.initial_capital,
-        fee_pct         = buyer_cfg.transaction_cost,
         thermo_df       = thermo_train,
-        **_env_reward_kwargs(buyer_cfg),
+        **rw,
     )
     env_test = TradingEnv(
         df              = prices_real_test,
         tickers         = tickers,
         initial_capital = buyer_cfg.initial_capital,
-        fee_pct         = buyer_cfg.transaction_cost,
         thermo_df       = thermo_test,
-        **_env_reward_kwargs(buyer_cfg),
+        **rw,
     )
 
     # ── 5. Agente DDPG ────────────────────────────────────────────────────────
@@ -621,18 +639,18 @@ def run_trade(
     ddpg_cfg       = cfg.buyer.ddpg
 
     agent = DDPGAgent(
-        state_dim       = env_train.observation_space.shape[0],
-        action_dim      = env_train.action_space.shape[0],
-        actor_hidden    = list(ddpg_cfg.actor_hidden),
-        critic_hidden   = list(ddpg_cfg.critic_hidden),
-        lr_actor        = ddpg_cfg.lr_actor,
-        lr_critic       = ddpg_cfg.lr_critic,
-        gamma           = ddpg_cfg.gamma,
-        tau             = ddpg_cfg.tau,
-        buffer_capacity = buyer_cfg.buffer_capacity,
-        batch_size      = buyer_cfg.batch_size,
-        update_every    = ddpg_cfg.update_every,
-        noise_sigma     = ddpg_cfg.noise_sigma,
+        state_dim         = env_train.observation_space.shape[0],
+        action_dim        = env_train.action_space.shape[0],
+        actor_hidden      = list(ddpg_cfg.actor_hidden),
+        critic_hidden     = list(ddpg_cfg.critic_hidden),
+        lr_actor          = ddpg_cfg.lr_actor,
+        lr_critic         = ddpg_cfg.lr_critic,
+        gamma             = ddpg_cfg.gamma,
+        tau               = ddpg_cfg.tau,
+        buffer_capacity   = buyer_cfg.buffer_capacity,
+        batch_size        = buyer_cfg.batch_size,
+        update_every      = ddpg_cfg.update_every,
+        noise_sigma       = ddpg_cfg.noise_sigma,
         episodic_episodes = getattr(buyer_cfg, "episodic_episodes", 20),
     )
 
@@ -654,12 +672,10 @@ def run_trade(
         f"\nAddestramento DDPG [{freq}] — {buyer_cfg.n_episodes} episodi | "
         f"ES: {es_patience} ep su {es_metric} | "
         f"Thermo: {'attivo' if thermo_train is not None else 'no'} | "
-        f"obs_clip={norm_clip}"
+        f"obs_clip={norm_clip} | lambda_inaction={rw['lambda_inaction']} | "
+        f"reward_clip={rw['reward_clip']}"
     )
 
-    # FIX A — stress_fn rimossa: il regime viene letto dentro train_ddpg_normalized
-    #          tramite env.get_current_regime(); passarla qui era un no-op.
-    # FIX B/C — keyword args espliciti e es_patience aggiunto
     history = train_ddpg_normalized(
         env         = env_train,
         agent       = agent,
@@ -682,17 +698,17 @@ def run_trade(
     raw_state = env_test.reset()
     if isinstance(raw_state, tuple):
         raw_state = raw_state[0]
-    state     = normalizer.normalize(raw_state, update=False)
-    done      = False
+    state = normalizer.normalize(raw_state, update=False)
+    done  = False
     while not done:
-        action               = agent.act(state, explore=False)
-        step_result          = env_test.step(action)
+        action      = agent.act(state, explore=False)
+        step_result = env_test.step(action)
         if len(step_result) == 5:
             raw_next, _, terminated, truncated, _ = step_result
             done = terminated or truncated
         else:
             raw_next, _, done, _ = step_result
-        state                = normalizer.normalize(raw_next, update=False)
+        state = normalizer.normalize(raw_next, update=False)
 
     # ── 8. Output ─────────────────────────────────────────────────────────────
     daily   = _build_portfolio_daily(env_test, tickers)
@@ -709,6 +725,8 @@ def run_trade(
     print(f"  Sharpe ratio      : {env_test.sharpe_ratio():>10.3f}")
     print(f"  Max Drawdown      : {env_test.max_drawdown():>10.3f}")
     print(f"  Normalizer (n)    : {normalizer.rms.count:>10.0f} campioni")
+    ts = env_test.trade_stats()
+    print(f"  Trade BUY/SELL    : {ts['n_buy']}/{ts['n_sell']}")
     print(f"{'─'*54}")
 
     results_dir = cfg.paths.results_dir
@@ -737,9 +755,6 @@ def run_walk_forward(
     test_pct:      float = 0.12,
     warm_start:    bool  = True,
 ) -> "WalkForwardReport":
-    """
-    Walk-forward validation completa del sistema DDPG.
-    """
     import torch
     from modelli.walk_forward import make_folds, WalkForwardReport, FoldResult
     from modelli.ddpg import DDPGAgent, ThermoEnsemble, compute_thermo_profile
@@ -749,7 +764,7 @@ def run_walk_forward(
 
     freq = cfg.frequency.interval
 
-    # ── 1. Carica predittore e inferenza sull'intera serie ────────────────────
+    # ── 1. Carica predittore ──────────────────────────────────────────────────
     pred_path = _ckpt(cfg, "pred.pth")
     if not os.path.exists(pred_path):
         print(f"[WalkForward] Predittore non trovato: {pred_path}")
@@ -791,6 +806,7 @@ def run_walk_forward(
     checkpoint_dir = cfg.paths.checkpoint_dir
     results_dir    = cfg.paths.results_dir
     es_patience    = getattr(buyer_cfg, "es_patience", 20)
+    rw             = _env_reward_kwargs(buyer_cfg)  # [FIX E/F/G] centralizzato
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(results_dir,    exist_ok=True)
@@ -798,40 +814,19 @@ def run_walk_forward(
     builder = ThermoStateBuilder(interval=freq)
     report  = WalkForwardReport(mode=mode)
 
-    # [Fix B1] _env_common ora include tutti i parametri reward shaping.
-    # In precedenza lambda_inaction, lambda_concentration, sell_profit_bonus,
-    # max_holding_steps e forced_sell_cooldown_steps non venivano trasmessi.
-    _env_common = dict(
-        tickers                 = tickers,
-        initial_capital         = buyer_cfg.initial_capital,
-        fee_pct                 = buyer_cfg.transaction_cost,
-        thermo_bonus_sell       = getattr(buyer_cfg, "thermo_bonus_sell",       0.5),
-        thermo_penalty_buy      = getattr(buyer_cfg, "thermo_penalty_buy",      0.1),
-        lambda_inaction         = getattr(buyer_cfg, "lambda_inaction",         0.2),
-        lambda_concentration    = getattr(buyer_cfg, "lambda_concentration",    0.6),
-        sell_profit_bonus       = getattr(buyer_cfg, "sell_profit_bonus",       0.015),
-        max_holding_steps       = getattr(buyer_cfg, "max_holding_steps",       60),
-        forced_sell_cooldown    = getattr(buyer_cfg, "forced_sell_cooldown_steps", 10),
-        lambda_imbalance        = getattr(buyer_cfg, "lambda_imbalance",        0.3),
-        imbalance_threshold     = getattr(buyer_cfg, "imbalance_threshold",     2.0),
-        concentration_threshold = getattr(buyer_cfg, "concentration_threshold", 0.4),
-        reward_clip             = getattr(buyer_cfg, "reward_clip",             10.0),
-    )
+    # _env_common usa rw che già include fee_pct (FIX G)
+    _env_common = dict(tickers=tickers, initial_capital=buyer_cfg.initial_capital, **rw)
 
     prev_best_path:  str | None          = None
     prev_thermo_df:  pd.DataFrame | None = None
 
-    # ── Raccolta dati per ThermoEnsemble ──────────────────────────────────────
     ensemble_agents:   list[DDPGAgent]     = []
     ensemble_profiles: list[np.ndarray]   = []
     ensemble_norms:    list[ObsNormalizer] = []
 
-    # ── KL divergence termodinamica ───────────────────────────────────────────
     def _thermo_kl_div(df_prev: pd.DataFrame, df_curr: pd.DataFrame) -> float:
         from scipy.special import rel_entr
-        cols    = ["Thm_Stress", "Thm_Entropy"]
-        kl_sum  = 0.0
-        n_valid = 0
+        cols, kl_sum, n_valid = ["Thm_Stress", "Thm_Entropy"], 0.0, 0
         for col in cols:
             if col not in df_prev.columns or col not in df_curr.columns:
                 continue
@@ -839,13 +834,12 @@ def run_walk_forward(
             vals_c = df_curr[col].dropna().values
             if len(vals_p) < 20 or len(vals_c) < 20:
                 continue
-            lo   = min(vals_p.min(), vals_c.min())
-            hi   = max(vals_p.max(), vals_c.max())
-            bins = np.linspace(lo, hi, 21)
-            hp, _ = np.histogram(vals_p, bins=bins, density=True)
-            hc, _ = np.histogram(vals_c, bins=bins, density=True)
-            hp    = (hp + 1e-10) / (hp + 1e-10).sum()
-            hc    = (hc + 1e-10) / (hc + 1e-10).sum()
+            lo, hi = min(vals_p.min(), vals_c.min()), max(vals_p.max(), vals_c.max())
+            bins   = np.linspace(lo, hi, 21)
+            hp, _  = np.histogram(vals_p, bins=bins, density=True)
+            hc, _  = np.histogram(vals_c, bins=bins, density=True)
+            hp     = (hp + 1e-10) / (hp + 1e-10).sum()
+            hc     = (hc + 1e-10) / (hc + 1e-10).sum()
             kl_sum  += float(np.sum(rel_entr(hc, hp)))
             n_valid += 1
         return kl_sum / max(n_valid, 1)
@@ -854,24 +848,20 @@ def run_walk_forward(
     for fold_n, ((tr_s, tr_e), (te_s, te_e)) in enumerate(folds, 1):
         print(f"\n{'═'*62}")
         print(f"  FOLD {fold_n}/{len(folds)} | "
-              f"train [{tr_s:,}:{tr_e:,}] ({tr_e-tr_s:,} barre) | "
-              f"test [{te_s:,}:{te_e:,}] ({te_e-te_s:,} barre)")
+              f"train [{tr_s:,}:{tr_e:,}] | test [{te_s:,}:{te_e:,}]")
 
         pr_train = prices_real_all.iloc[tr_s:tr_e]
         pr_test  = prices_real_all.iloc[te_s:te_e]
 
-        print(f"  Train: {pr_train.index[0]} → {pr_train.index[-1]}")
-        print(f"  Test:  {pr_test.index[0]} → {pr_test.index[-1]}")
-
         raw_src  = df_raw if df_raw is not None else df
-        th_train = builder.build(raw_src.reindex(pr_train.index), tickers)
-        th_test  = builder.build(raw_src.reindex(pr_test.index),  tickers)
 
-        # ── Ambienti ──────────────────────────────────────────────────────────
+        # [FIX H] _build_thermo include VdW automaticamente
+        th_train = _build_thermo(builder, raw_src.reindex(pr_train.index), tickers)
+        th_test  = _build_thermo(builder, raw_src.reindex(pr_test.index),  tickers)
+
         env_train = TradingEnv(df=pr_train, thermo_df=th_train, **_env_common)
         env_test  = TradingEnv(df=pr_test,  thermo_df=th_test,  **_env_common)
 
-        # ── Agente ────────────────────────────────────────────────────────────
         agent = DDPGAgent(
             state_dim         = env_train.observation_space.shape[0],
             action_dim        = env_train.action_space.shape[0],
@@ -892,31 +882,22 @@ def run_walk_forward(
             clip  = getattr(buyer_cfg, "obs_clip", 5.0),
         )
 
-        # Warm start condizionale con check KL
         if warm_start and prev_best_path and os.path.exists(prev_best_path):
             use_warm = True
             kl_thr   = getattr(buyer_cfg, "warm_start_kl_threshold", 2.0)
             if prev_thermo_df is not None and th_train is not None and not th_train.empty:
                 kl = _thermo_kl_div(prev_thermo_df, th_train)
                 if kl > kl_thr:
-                    print(f"  [WarmStart] KL={kl:.3f} > {kl_thr} → regime diverso, skip warm start")
+                    print(f"  [WarmStart] KL={kl:.3f} > {kl_thr} → skip")
                     use_warm = False
                 else:
-                    print(f"  [WarmStart] KL={kl:.3f} ≤ {kl_thr} → warm start OK")
+                    print(f"  [WarmStart] KL={kl:.3f} ≤ {kl_thr} → OK")
             if use_warm:
                 agent.load(prev_best_path)
-                print(f"  Warm start da fold {fold_n - 1}: {os.path.basename(prev_best_path)}")
 
         fold_best = os.path.join(checkpoint_dir, f"ddpg_wf_fold{fold_n}_best_{freq}.pth")
         fold_norm = os.path.join(checkpoint_dir, f"normalizer_wf_fold{fold_n}_{freq}.npz")
 
-        # ── Training ──────────────────────────────────────────────────────────
-        # FIX A — stress_fn rimossa: il regime termodinamico è letto direttamente
-        #          dall'env dentro train_ddpg_normalized via env.get_current_regime()
-        # FIX B/C — keyword args espliciti e es_patience aggiunto
-        # FIX D — ckpt_path=fold_best: senza, il best checkpoint non veniva mai
-        #          salvato nel loop walk-forward → agent.load(fold_best) era
-        #          sempre no-op → veniva valutato l'ultimo episodio, non il migliore.
         history = train_ddpg_normalized(
             env         = env_train,
             agent       = agent,
@@ -928,7 +909,6 @@ def run_walk_forward(
             es_patience = es_patience,
         )
 
-        # ── Valutazione con best checkpoint ───────────────────────────────────
         if os.path.exists(fold_best):
             agent.load(fold_best)
         if os.path.exists(fold_norm):
@@ -937,10 +917,10 @@ def run_walk_forward(
         raw_state = env_test.reset()
         if isinstance(raw_state, tuple):
             raw_state = raw_state[0]
-        state     = normalizer.normalize(raw_state, update=False)
-        done      = False
-        sell_ok_count = 0
-        sell_total    = 0
+        state = normalizer.normalize(raw_state, update=False)
+        done  = False
+        sell_ok_count = sell_total = 0
+
         while not done:
             action      = agent.act(state, explore=False)
             step_result = env_test.step(action)
@@ -950,26 +930,19 @@ def run_walk_forward(
             else:
                 raw_next, _, done, info = step_result
 
-            # ── Thermo✅% — misura quante SELL avvengono in zona stress ────────
-            # Un sell è "termodinamicamente corretto" se Thm_Stress > 0.5
-            # oppure se Thm_SellSignal è attivo (da thermo_innovations).
             step_idx = env_test.current_step - 1
             if env_test._has_thermo and step_idx >= 0:
                 thm_z  = env_test._thermo_val("Thm_Stress", 0.0)
                 thm_sg = env_test._thermo_val("Thm_SellSignal", 0.0)
-                # Rileva se l'agente ha venduto qualcosa questo step
-                sells_this_step = sum(
-                    1 for t in env_test._trades
-                    if t.get("step") == step_idx and t["type"] == "SELL"
-                )
-                if sells_this_step > 0:
+                sells  = sum(1 for t in env_test._trades
+                             if t.get("step") == step_idx and t["type"] == "SELL")
+                if sells > 0:
                     sell_total += 1
                     if thm_z > 0.5 or thm_sg > 0.5:
                         sell_ok_count += 1
 
             state = normalizer.normalize(raw_next, update=False)
 
-        # ── Metriche fold ─────────────────────────────────────────────────────
         final_v = env_test.portfolio_history()[-1]
         ret_pct = (final_v - buyer_cfg.initial_capital) / buyer_cfg.initial_capital * 100
         sharpe  = env_test.sharpe_ratio()
@@ -979,51 +952,39 @@ def run_walk_forward(
 
         ts = env_test.trade_stats()
         print(
-            f"  [Fold {fold_n}] Trade stats: BUY={ts['n_buy']} SELL={ts['n_sell']} "
+            f"  [Fold {fold_n}] BUY={ts['n_buy']} SELL={ts['n_sell']} "
             f"ratio={ts['buy_sell_ratio']:.1f} | Thm✅: {thermo_sell_ok:.1f}%"
         )
 
         from modelli.walk_forward import FoldResult
         fold_res = FoldResult(
-            fold                = fold_n,
-            train_bars          = tr_e - tr_s,
-            test_bars           = te_e - te_s,
-            train_start         = str(pr_train.index[0])[:16],
-            train_end           = str(pr_train.index[-1])[:16],
-            test_start          = str(pr_test.index[0])[:16],
-            test_end            = str(pr_test.index[-1])[:16],
-            sharpe              = sharpe,
-            total_return_pct    = ret_pct,
-            max_drawdown        = max_dd,
-            n_episodes_run      = len(history),
-            best_episode        = best_ep["episode"],
-            thermo_sell_ok_pct  = thermo_sell_ok,
+            fold               = fold_n,
+            train_bars         = tr_e - tr_s,
+            test_bars          = te_e - te_s,
+            train_start        = str(pr_train.index[0])[:16],
+            train_end          = str(pr_train.index[-1])[:16],
+            test_start         = str(pr_test.index[0])[:16],
+            test_end           = str(pr_test.index[-1])[:16],
+            sharpe             = sharpe,
+            total_return_pct   = ret_pct,
+            max_drawdown       = max_dd,
+            n_episodes_run     = len(history),
+            best_episode       = best_ep["episode"],
+            thermo_sell_ok_pct = thermo_sell_ok,
         )
         report.folds.append(fold_res)
         prev_best_path = fold_best
         prev_thermo_df = th_train if (th_train is not None and not th_train.empty) else None
 
-        # ── Grafico portfolio fold ─────────────────────────────────────────────
         try:
-            _plot_fold_portfolio(
-                env_test   = env_test,
-                fold_n     = fold_n,
-                sharpe     = sharpe,
-                ret_pct    = ret_pct,
-                max_dd     = max_dd,
-                th_test    = th_test,
-                results_dir= results_dir,
-                freq       = freq,
-            )
+            _plot_fold_portfolio(env_test, fold_n, sharpe, ret_pct, max_dd,
+                                 th_test, results_dir, freq)
         except Exception as _pe:
             print(f"  [Fold {fold_n}] Grafico skip: {_pe}")
 
-        print(
-            f"  ✔ Fold {fold_n} — Sharpe: {sharpe:.3f} | "
-            f"Return: {ret_pct:+.2f}% | MaxDD: {max_dd:.3f} | ep: {len(history)}"
-        )
+        print(f"  ✔ Fold {fold_n} — Sharpe: {sharpe:.3f} | "
+              f"Return: {ret_pct:+.2f}% | MaxDD: {max_dd:.3f}")
 
-        # Accumula dati per ThermoEnsemble
         if th_train is not None and not th_train.empty:
             try:
                 profile = compute_thermo_profile(th_train, 0, len(th_train))
@@ -1031,21 +992,18 @@ def run_walk_forward(
                 ensemble_profiles.append(profile)
                 ensemble_norms.append(normalizer)
             except Exception as e:
-                print(f"  [Ensemble] Profilo fold {fold_n} non calcolabile: {e}")
+                print(f"  [Ensemble] Profilo fold {fold_n}: {e}")
 
     # ── 4. Report finale ──────────────────────────────────────────────────────
     report.print_summary()
     report.save(os.path.join(results_dir, f"walk_forward_{freq}.csv"))
 
-    # ── 4c. Grafico riepilogativo cross-fold ──────────────────────────────────
     try:
         _plot_walk_forward_summary(report, results_dir, freq)
     except Exception as _we:
         print(f"  [WF Summary Plot] Skip: {_we}")
 
-    # ── 4b. FIX Bug #1: copia normalizer del fold migliore → normalizer_best_{freq}.npz
-    # alpaca_live cerca "normalizer_best_{freq}.npz" ma la walk-forward salva solo
-    # "normalizer_wf_fold{N}_{freq}.npz". Questo blocco colma il gap.
+    # [FIX D] Copia normalizer del fold migliore
     if report.folds:
         import shutil
         best_fold_n   = max(report.folds, key=lambda f: f.sharpe).fold
@@ -1055,19 +1013,9 @@ def run_walk_forward(
         if os.path.exists(src_norm):
             shutil.copy2(src_norm, dst_norm_best)
             shutil.copy2(src_norm, dst_norm_gen)
-            print(
-                f"  [Fix #1] Normalizer fold {best_fold_n} (Sharpe={report.folds[best_fold_n-1].sharpe:.3f}) "
-                f"copiato in:\n"
-                f"    → {os.path.basename(dst_norm_best)}\n"
-                f"    → {os.path.basename(dst_norm_gen)}"
-            )
-        else:
-            print(
-                f"  [Fix #1] AVVISO: normalizer del fold {best_fold_n} non trovato in {src_norm}.\n"
-                f"  Verifica che norm_path venga passato correttamente a train_ddpg_normalized()."
-            )
+            print(f"  [Fix D] Normalizer fold {best_fold_n} → normalizer_best_{freq}.npz")
 
-    # ── 5. ThermoEnsemble — valutazione post walk-forward ────────────────────
+    # ── 5. ThermoEnsemble ────────────────────────────────────────────────────
     if len(ensemble_agents) >= 2 and folds:
         print(f"\n{'─'*62}")
         print(f"  THERMO ENSEMBLE — {len(ensemble_agents)} agenti")
@@ -1075,7 +1023,9 @@ def run_walk_forward(
         last_te_s, last_te_e = folds[-1][1]
         pr_test_last = prices_real_all.iloc[last_te_s:last_te_e]
         raw_src      = df_raw if df_raw is not None else df
-        th_test_last = builder.build(raw_src.reindex(pr_test_last.index), tickers)
+
+        # [FIX H] VdW anche nell'ensemble
+        th_test_last = _build_thermo(builder, raw_src.reindex(pr_test_last.index), tickers)
 
         env_ensemble = TradingEnv(df=pr_test_last, thermo_df=th_test_last, **_env_common)
 
@@ -1086,21 +1036,19 @@ def run_walk_forward(
             temperature   = getattr(buyer_cfg, "ensemble_temperature", 0.5),
         )
 
-        # FIX Bug #2: rimosso [:6] hardcoded che troncava le colonne Thm_ a 6
-        # lasciando 8 zeri di padding nel ThermoEnsemble (profili hanno 14 feature).
         thm_cols = (
             [c for c in th_test_last.columns if c.startswith("Thm_")]
             if th_test_last is not None and not th_test_last.empty
             else []
         )
 
-        raw_state  = env_ensemble.reset()
+        raw_state = env_ensemble.reset()
         if isinstance(raw_state, tuple):
             raw_state = raw_state[0]
-        last_norm  = ensemble_norms[-1]
-        state      = last_norm.normalize(raw_state, update=False)
-        done       = False
-        step_idx   = 0
+        last_norm = ensemble_norms[-1]
+        state     = last_norm.normalize(raw_state, update=False)
+        done      = False
+        step_idx  = 0
 
         while not done:
             if thm_cols and th_test_last is not None and step_idx < len(th_test_last):
@@ -1108,41 +1056,33 @@ def run_walk_forward(
             else:
                 current_thermo = np.zeros(len(ensemble_profiles[0]), dtype=np.float32)
 
-            action               = ensemble.act(state, current_thermo, explore=False)
-            step_result          = env_ensemble.step(action)
+            action      = ensemble.act(state, current_thermo, explore=False)
+            step_result = env_ensemble.step(action)
             if len(step_result) == 5:
                 raw_next, _, terminated, truncated, _ = step_result
                 done = terminated or truncated
             else:
                 raw_next, _, done, _ = step_result
-            state                = last_norm.normalize(raw_next, update=False)
-            step_idx            += 1
+            state    = last_norm.normalize(raw_next, update=False)
+            step_idx += 1
 
         ens_final  = env_ensemble.portfolio_history()[-1]
         ens_ret    = (ens_final - buyer_cfg.initial_capital) / buyer_cfg.initial_capital * 100
         ens_sharpe = env_ensemble.sharpe_ratio()
         ens_dd     = env_ensemble.max_drawdown()
 
-        print(f"  ThermoEnsemble (ultimo test set):")
-        print(f"    Sharpe: {ens_sharpe:.3f} | Return: {ens_ret:+.2f}% | MaxDD: {ens_dd:.3f}")
-        print(f"    Pesi finali: {ensemble.weights_summary()}")
+        print(f"  ThermoEnsemble → Sharpe: {ens_sharpe:.3f} | "
+              f"Return: {ens_ret:+.2f}% | MaxDD: {ens_dd:.3f}")
 
         best_fold = max(report.folds, key=lambda f: f.sharpe)
-        print(f"    Best fold singolo (fold {best_fold.fold}): Sharpe {best_fold.sharpe:.3f}")
-        if ens_sharpe > best_fold.sharpe:
-            print(f"    → Ensemble SUPERIORE al best fold (+{ens_sharpe - best_fold.sharpe:.3f})")
-        else:
-            print(f"    → Ensemble inferiore al best fold ({ens_sharpe - best_fold.sharpe:.3f})")
+        delta = ens_sharpe - best_fold.sharpe
+        print(f"  vs best fold (fold {best_fold.fold}): {delta:+.3f}")
 
-        ens_df = pd.DataFrame([{
-            "sharpe":      ens_sharpe,
-            "return_pct":  ens_ret,
-            "max_dd":      ens_dd,
-            "n_agents":    len(ensemble_agents),
+        pd.DataFrame([{
+            "sharpe": ens_sharpe, "return_pct": ens_ret, "max_dd": ens_dd,
+            "n_agents": len(ensemble_agents),
             "temperature": getattr(buyer_cfg, "ensemble_temperature", 0.5),
-        }])
-        ens_df.to_csv(os.path.join(results_dir, f"thermo_ensemble_{freq}.csv"), index=False)
-        print(f"  → CSV salvato: thermo_ensemble_{freq}.csv")
+        }]).to_csv(os.path.join(results_dir, f"thermo_ensemble_{freq}.csv"), index=False)
         print(f"{'─'*62}")
 
     return report

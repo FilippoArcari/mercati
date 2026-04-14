@@ -241,7 +241,8 @@ def my_app(cfg: DictConfig) -> None:
             accelerator="auto",
             devices="auto",
             gradient_clip_val=getattr(cfg.training, "max_grad_norm", 1.0),
-            enable_progress_bar=True,
+            enable_progress_bar=False,
+            enable_model_summary=False,
             logger=False,
         )
         trainer.fit(predictor, train_dataloaders=train_loader)

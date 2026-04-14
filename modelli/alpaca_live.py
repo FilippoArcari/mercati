@@ -13,18 +13,23 @@ SETUP
      ALPACA_BASE_URL=https://paper-api.alpaca.markets
 3. Installa SDK: uv add alpaca-py
 
-PARAMETRI CONFIG (opzionali in config.yaml)
-────────────────────────────────────────────
-alpaca:
-  max_position_pct:    0.05   # max % portafoglio per ticker
-  min_order_usd:       1.0    # ordine minimo in USD
-  action_threshold:    0.005  # soglia sotto cui ignorare il segnale DDPG
-  min_confidence:      0.10   # confidenza minima per tradare
-  circuit_breaker_dd: -0.15   # ferma tutto se drawdown supera 15%
-  max_daily_trades:    50     # limite ordini giornalieri
-  warmup_bars:         20     # barre prima del primo trade
-  bar_buffer:          200    # barre storiche in memoria
-  tradeable_tickers:   []     # lista esplicita ticker (default: auto da cfg.data.tickers)
+Fix applicati rispetto alla versione precedente
+──────────────────────────────────────────────
+FIX I  [NUOVO] transaction_cost aggiunto al dict `p` in ENTRAMBE le funzioni
+       run_alpaca e run_alpaca_replay.
+       Prima p.get("transaction_cost", 0.001) restituiva sempre il default 0.001
+       indipendentemente dal YAML, causando un mismatch con il training
+       (che usa buyer.transaction_cost). Ora p["transaction_cost"] viene letto
+       da cfg.buyer.transaction_cost e usato ovunque in modo consistente.
+
+FIX J  [NUOVO] Integrazione VdW in _build_thermo() (importata da trade.py).
+       Il state_dim nel live/replay è calcolato da dummy_thermo, quindi
+       include automaticamente le 8 colonne VdW aggiuntive — identico
+       al training. NOTA: richiede che trade.py sia già stato aggiornato.
+
+FIX K  [ESISTENTE] RollingThermoBuffer per evitare Trust=0.500 fisso.
+FIX L  [ESISTENTE] NumpyScaler per compatibilità sklearn cross-version.
+FIX M  [ESISTENTE] Normalizer derivato dal nome del checkpoint DDPG.
 """
 
 from __future__ import annotations
@@ -42,7 +47,6 @@ import torch
 
 
 # ─── Ticker non supportati da Alpaca ─────────────────────────────────────────
-# Futures, indici, forex, ETF europei vengono esclusi automaticamente.
 _INCOMPATIBLE = {
     "GC=F","CL=F","SI=F","NG=F","HG=F",
     "^GSPC","^IXIC","FTSEMIB.MI",
@@ -56,54 +60,28 @@ def _filter_tradeable(tickers: list[str]) -> list[str]:
     return [t for t in tickers if t not in _INCOMPATIBLE]
 
 
-# ─── Naming checkpoint (speculare a main.py) ──────────────────────────────────
-
-
-# ─── [Fix SK] Wrapper numpy puro per MinMaxScaler ────────────────────────────
-# Rimpiazza il MinMaxScaler sklearn con un oggetto che usa solo numpy,
-# eliminando la dipendenza dalla versione sklearn al momento del caricamento.
-# MinMaxScaler.transform: X_std = (X - X_min) / (X_max - X_min)
-#                         X_scaled = X_std * (max - min) + min  [feature_range]
-# Con feature_range=(0,1) si semplifica a: (X - data_min_) * scale_
-
+# ─── [FIX L] Wrapper numpy puro per MinMaxScaler ─────────────────────────────
 class _NumpyScaler:
-    """Replica MinMaxScaler.transform() usando solo numpy."""
+    """Replica MinMaxScaler.transform() senza dipendenza dalla versione sklearn."""
     def __init__(self, sklearn_scaler):
-        # Estrai gli array numerici dal scaler sklearn
-        self.min_   = np.array(sklearn_scaler.data_min_,   dtype=np.float32)
-        self.scale_ = np.array(sklearn_scaler.scale_,      dtype=np.float32)
-        # data_range_ può avere zeri su feature costanti → clip per sicurezza
-        data_range  = np.array(sklearn_scaler.data_range_,  dtype=np.float32)
+        self.min_   = np.array(sklearn_scaler.data_min_,  dtype=np.float32)
+        self.scale_ = np.array(sklearn_scaler.scale_,     dtype=np.float32)
+        data_range  = np.array(sklearn_scaler.data_range_, dtype=np.float32)
         self.range_ = np.where(data_range == 0, 1.0, data_range)
 
     def transform(self, X) -> np.ndarray:
-        X = np.array(X, dtype=np.float32)
-        return (X - self.min_) / self.range_
+        return (np.array(X, dtype=np.float32) - self.min_) / self.range_
 
     def fit_transform(self, X) -> np.ndarray:
         return self.transform(X)
 
 
-# ─── [Fix TH] RollingThermoBuffer ────────────────────────────────────────────
-# ThermoStateBuilder.build() viene chiamato a ogni barra nel replay/live loop.
-# Il problema: build() istanzia un nuovo SignalTrustEngine a ogni chiamata e lo
-# fa girare su window_raw (solo ws=15 barre), mentre trust_window=40. Con
-# meno barre della finestra il Trust è indeterminato → fisso a 0.500.
-# Soluzione: mantenere un buffer rolling che si accumula barra per barra.
-# La finestra passata a build() è sempre >= trust_window + ws barre.
-
+# ─── [FIX K] RollingThermoBuffer ─────────────────────────────────────────────
 class _RollingThermoBuffer:
     """
-    Accumula barre in un buffer rolling e chiama ThermoStateBuilder.build()
-    su una finestra abbastanza lunga da consentire al SignalTrustEngine di
-    convergere (trust_window + prediction_window barre minimo).
-
-    Utilizzo nel loop di replay:
-        buf = _RollingThermoBuffer(thermo_builder, min_bars=55)
-        for bar_i in range(ws, len(all_bars)):
-            bar = all_bars.iloc[[bar_i]]
-            thermo_df = buf.update(bar, tradeable)
-            # thermo_df ha una sola riga — l'ultima (quella corrente)
+    Accumula barre in un buffer rolling per garantire al SignalTrustEngine
+    abbastanza storia (≥ trust_window barre) prima di calcolare il Trust.
+    Senza questo, con ws=15 barre il Trust rimane fisso a 0.500 per tutto il replay.
     """
     def __init__(self, builder, min_bars: int = 55):
         self._builder  = builder
@@ -111,20 +89,56 @@ class _RollingThermoBuffer:
         self._buffer   = pd.DataFrame()
 
     def update(self, new_bar: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
-        """Aggiunge new_bar al buffer, chiama build() sulla finestra cumulativa,
-        e restituisce solo la riga corrispondente alla barra corrente."""
         self._buffer = pd.concat([self._buffer, new_bar]).tail(self._min_bars)
         if len(self._buffer) < 2:
             return pd.DataFrame()
         try:
-            full_thermo = self._builder.build(self._buffer, tickers)
+            full_thermo = _build_thermo_live(self._builder, self._buffer, tickers)
         except Exception:
             return pd.DataFrame()
         if full_thermo is None or full_thermo.empty:
             return pd.DataFrame()
-        # Restituisce solo l'ultima riga (la barra corrente)
         return full_thermo.iloc[[-1]]
 
+
+# ─── [FIX J] Integrazione VdW per live/replay ────────────────────────────────
+
+def _build_thermo_live(builder, raw_df: pd.DataFrame, tickers: list[str]) -> pd.DataFrame | None:
+    """
+    Versione live di _build_thermo() (da trade.py).
+    Chiama builder.build() e aggiunge le feature VdW se disponibili.
+    Mantenuta separata per evitare import circolare con trade.py.
+    """
+    thermo = builder.build(raw_df, tickers)
+
+    try:
+        from modelli.thermo_vdw import compute_vdw_block
+
+        price_candidates  = [c for c in raw_df.columns
+                             if any(k in c.lower() for k in ("close", "price", "adj"))]
+        volume_candidates = [c for c in raw_df.columns if "vol" in c.lower()]
+        price_col  = price_candidates[0]  if price_candidates  else raw_df.columns[0]
+        volume_col = volume_candidates[0] if volume_candidates else None
+        if tickers and tickers[0] in raw_df.columns:
+            price_col = tickers[0]
+
+        vdw = compute_vdw_block(df=raw_df, price_col=price_col,
+                                volume_col=volume_col, window=20, lag_max=60)
+
+        if thermo is not None and not thermo.empty:
+            thermo = pd.concat([thermo, vdw.reindex(thermo.index)], axis=1)
+        else:
+            thermo = vdw
+
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    return thermo
+
+
+# ─── Naming checkpoint ────────────────────────────────────────────────────────
 
 def _pred_ckpt(cfg) -> str:
     freq = cfg.frequency.interval
@@ -155,9 +169,7 @@ def _setup_logger(results_dir: str, freq: str) -> logging.Logger:
     return log
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CONNESSIONE ALPACA
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Connessione Alpaca ───────────────────────────────────────────────────────
 
 def _init_alpaca(log: logging.Logger):
     try:
@@ -174,25 +186,20 @@ def _init_alpaca(log: logging.Logger):
         raise RuntimeError(
             "Credenziali Alpaca mancanti nel .env:\n"
             "  ALPACA_API_KEY=PKxxxxxxxxxxxxxxxx\n"
-            "  ALPACA_API_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
-            "  ALPACA_BASE_URL=https://paper-api.alpaca.markets"
+            "  ALPACA_API_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
         )
 
     is_paper = "paper" in url.lower()
     log.info(f"Alpaca | paper={is_paper} | {url}")
 
-    tc = TradingClient(key, secret, paper=is_paper)
-    dc = StockHistoricalDataClient(key, secret)
-
+    tc  = TradingClient(key, secret, paper=is_paper)
+    dc  = StockHistoricalDataClient(key, secret)
     acc = tc.get_account()
     log.info(f"Account OK | status={acc.status} | equity=${float(acc.equity):,.2f}")
-
     return tc, dc
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DATI
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Dati ─────────────────────────────────────────────────────────────────────
 
 def _fetch_bars(dc, tickers: list[str], n_bars: int,
                 freq: str, log: logging.Logger) -> pd.DataFrame:
@@ -212,8 +219,7 @@ def _fetch_bars(dc, tickers: list[str], n_bars: int,
         bars = dc.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=tickers, timeframe=tf,
             start=end - datetime.timedelta(days=10), end=end,
-            adjustment="all",
-            feed="iex",   # IEX = gratuito; SIP richiede abbonamento a pagamento
+            adjustment="all", feed="iex",
         ))
         df = bars.df
     except Exception as e:
@@ -223,7 +229,6 @@ def _fetch_bars(dc, tickers: list[str], n_bars: int,
     if df.empty:
         return pd.DataFrame()
 
-    # MultiIndex (symbol, timestamp) → pivot
     df = df["close"].unstack(level=0) if isinstance(df.index, pd.MultiIndex) \
          else df[["close"]]
     df = df.reindex(columns=tickers).ffill().bfill()
@@ -242,9 +247,7 @@ def _fetch_account(tc) -> dict:
             "daily_pl": float(acc.equity) - float(acc.last_equity)}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MODELLI
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Modelli ──────────────────────────────────────────────────────────────────
 
 def _load_predictor(cfg, log: logging.Logger):
     from modelli.pred import Pred
@@ -252,10 +255,8 @@ def _load_predictor(cfg, log: logging.Logger):
 
     path = _pred_ckpt(cfg)
     if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"CNN non trovato: {path}\n"
-            f"Esegui: uv run main.py step=train frequency={cfg.frequency.interval}"
-        )
+        raise FileNotFoundError(f"CNN non trovato: {path}")
+
     device = get_device()
     ck     = torch.load(path, map_location=get_map_location(), weights_only=False)
     nf     = ck["num_features"]
@@ -270,55 +271,27 @@ def _load_predictor(cfg, log: logging.Logger):
         activation       = mc.get("activation",       cfg.model.activation),
         prediction_steps = mc.get("prediction_steps", cfg.model.prediction_steps),
     ).to(device)
-    # strict=False: tollera chiavi extra nel checkpoint (es. prior_mean, prior_std,
-    # moment_target salvate da versioni precedenti del modello MRE). Senza questo
-    # il caricamento crashava con RuntimeError su state_dict mismatch.
-    # ── [Fix MRE] Caricamento state_dict con ripristino buffer MRE ──────────────
-    # prior_mean, prior_std, moment_target sono register_buffer(None) nel modello.
-    # load_state_dict(strict=False) li ignora se assenti nel checkpoint invece di
-    # inizializzarli a None — lasciandoli uninizializzati su versioni diverse di
-    # PyTorch. Li forziamo esplicitamente dopo il caricamento.
+
     state_dict = ck["model_state_dict"]
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
-    # Inietta i buffer MRE mancanti come None (comportamento corretto per inferenza)
     _mre_buffers = ["prior_mean", "prior_std", "moment_target"]
     for buf_name in _mre_buffers:
         if buf_name in missing:
             setattr(model, buf_name, None)
 
-    actually_missing = [k for k in missing if k not in _mre_buffers]
     if unexpected:
-        log.warning(f"CNN state_dict: {len(unexpected)} chiavi ignorate: {unexpected[:5]}")
-    if actually_missing:
-        log.warning(f"CNN state_dict: {len(actually_missing)} chiavi mancanti: {actually_missing[:5]}")
+        log.warning(f"CNN: {len(unexpected)} chiavi ignorate: {unexpected[:5]}")
     model.eval()
+
+    # [FIX L] NumpyScaler
+    scaler = _NumpyScaler(ck["scaler"])
     log.info(f"CNN: {os.path.basename(path)} | features={nf}")
-
-    # ── [Fix SK] Sklearn version mismatch ────────────────────────────────────
-    # Il MinMaxScaler nel checkpoint è stato serializzato con sklearn 1.8.0.
-    # Su sklearn 1.6.x (Kaggle) questo causa InconsistentVersionWarning e
-    # potenzialmente una normalizzazione errata (attributi interni cambiati).
-    # Soluzione: estrai min_ e scale_ e avvolgi in un oggetto numpy puro che
-    # non dipende dalla versione sklearn. Functionally identico a transform().
-    raw_scaler = ck["scaler"]
-    scaler = _NumpyScaler(raw_scaler)
-    log.info(f"Scaler convertito in NumpyScaler (min shape={scaler.min_.shape})")
-
     return model, scaler, nf, device
 
 
 def _load_agent(cfg, state_dim: int, all_tickers: list[str],
-                tradeable: list[str], device: torch.device,
-                log: logging.Logger):
-    """
-    Carica DDPG e normalizer.
-
-    action_dim = len(all_tickers): identico al training dove l'agente
-    produceva un'azione per ogni ticker del portafoglio.
-    In produzione si eseguono solo le azioni per i ticker tradabili su Alpaca,
-    usando tradeable_indices per estrarre il sottoinsieme corretto.
-    """
+                tradeable: list[str], device, log: logging.Logger):
     from modelli.ddpg import DDPGAgent
     from modelli.obs_normalizer import ObsNormalizer
 
@@ -327,12 +300,8 @@ def _load_agent(cfg, state_dim: int, all_tickers: list[str],
     dc  = cfg.buyer.ddpg
 
     if not os.path.exists(dp):
-        raise FileNotFoundError(
-            f"DDPG non trovato: {dp}\n"
-            f"Esegui: uv run main.py step=trade frequency={cfg.frequency.interval}"
-        )
+        raise FileNotFoundError(f"DDPG non trovato: {dp}")
 
-    # action_dim = tutti i ticker del training, NON solo i tradeable
     action_dim = len(all_tickers)
 
     agent = DDPGAgent(
@@ -345,103 +314,60 @@ def _load_agent(cfg, state_dim: int, all_tickers: list[str],
     )
     loaded = agent.load(dp)
     if not loaded:
-        raise RuntimeError(
-            f"DDPG checkpoint incompatibile: {dp}\n"
-            "Verifica che state_dim e action_dim corrispondano al training."
-        )
+        raise RuntimeError(f"DDPG checkpoint incompatibile: {dp}")
     log.info(f"DDPG: {os.path.basename(dp)} | state={state_dim} action={action_dim}")
 
     norm = ObsNormalizer(shape=state_dim, clip=5.0)
-    
-    # ★ FIX: Deriva il path del normalizer dal modello DDPG caricato
-    # Esempio: ddpg_best_2m.pth → normalizer_best_2m.npz
-    #          ddpg_wf_fold4_2m.pth → normalizer_wf_fold4_2m.npz
-    ddpg_basename = os.path.basename(dp)  # es: "ddpg_best_2m.pth"
-    
-    # Estrai il suffisso tra "ddpg_" e ".pth"
+
+    # [FIX M] Normalizer derivato dal nome del checkpoint
+    ddpg_basename = os.path.basename(dp)
     if ddpg_basename.startswith("ddpg_") and ddpg_basename.endswith(".pth"):
-        suffix = ddpg_basename[5:-4]  # rimuove "ddpg_" e ".pth"
-        derived_norm_name = f"normalizer_{suffix}.npz"
-        derived_norm_path = os.path.join(cfg.paths.checkpoint_dir, derived_norm_name)
+        suffix            = ddpg_basename[5:-4]
+        derived_norm_path = os.path.join(cfg.paths.checkpoint_dir, f"normalizer_{suffix}.npz")
     else:
-        # Fallback: usa il path generico
         derived_norm_path = np_
-    
-    # Prova in ordine:
-    # 1. Normalizer derivato dal modello (es: normalizer_wf_fold4_2m.npz)
-    # 2. Normalizer generico (es: normalizer_2m.npz)
-    # 3. Normalizer generico con _final (es: normalizer_2m_final.npz)
-    norm_candidates = [
-        derived_norm_path,
-        np_,
-        np_.replace(".npz", "_final.npz")
-    ]
-    
-    # Rimuovi duplicati mantenendo l'ordine
-    norm_candidates = list(dict.fromkeys(norm_candidates))
-    
+
+    norm_candidates = list(dict.fromkeys([
+        derived_norm_path, np_, np_.replace(".npz", "_final.npz")
+    ]))
+
     loaded_norm = False
     for nc in norm_candidates:
         if os.path.exists(nc):
             norm.load(nc)
             loaded_norm = True
-            log.info(f"✅ Normalizer caricato: {os.path.basename(nc)}")
+            log.info(f"✅ Normalizer: {os.path.basename(nc)}")
             break
-    
+
     if not loaded_norm:
-        log.warning(
-            f"⚠️  Normalizer non trovato!\n"
-            f"   Provati: {[os.path.basename(nc) for nc in norm_candidates]}\n"
-            f"   Uso statistiche vuote — le predizioni potrebbero essere instabili"
-        )
- 
+        log.warning(f"⚠️  Normalizer non trovato. Provati: {[os.path.basename(nc) for nc in norm_candidates]}")
 
-    # Indici dei ticker tradabili all'interno di all_tickers
-    # Usati per estrarre le azioni corrette dal vettore completo
     tradeable_indices = [i for i, t in enumerate(all_tickers) if t in set(tradeable)]
-    log.info(f"Ticker tradabili: {len(tradeable)}/{len(all_tickers)} "
-             f"(indici {tradeable_indices[:3]}...)")
-
+    log.info(f"Tradeable: {len(tradeable)}/{len(all_tickers)}")
     return agent, norm, tradeable_indices
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STATO (identico a TradingEnv._get_state)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Stato ───────────────────────────────────────────────────────────────────
 
 def _build_state(bars_scaled: np.ndarray, pred_scaled: np.ndarray,
                  account: dict, all_tickers: list[str], tradeable: list[str],
                  thermo_df: pd.DataFrame, num_features: int,
                  initial_equity: float) -> np.ndarray:
-    """
-    Costruisce il vettore di stato IDENTICO a TradingEnv._get_state():
-    [obs(F) | port_state(2) | thermo_state(N)]
-    """
-    obs = bars_scaled[-1].astype(np.float32)
-
-    eq  = account["equity"]
-    pos = account["positions"]
-    cash = account["cash"]
-
-    # holdings_val
+    obs          = bars_scaled[-1].astype(np.float32)
+    eq           = account["equity"]
+    pos          = account["positions"]
+    cash         = account["cash"]
     holdings_val = sum(pos.get(t, {}).get("market_value", 0.0) for t in tradeable)
-
-    port_state = np.array([
-        cash / (initial_equity + 1e-8),
+    port_state   = np.array([
+        cash         / (initial_equity + 1e-8),
         holdings_val / (initial_equity + 1e-8),
     ], dtype=np.float32)
-
     thermo_state = thermo_df.iloc[-1].values.astype(np.float32) \
                    if not thermo_df.empty else np.array([], dtype=np.float32)
-
-    return np.concatenate([
-        obs, port_state, thermo_state
-    ]).astype(np.float32)
+    return np.concatenate([obs, port_state, thermo_state]).astype(np.float32)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ORDINI
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Ordini ───────────────────────────────────────────────────────────────────
 
 def _execute_orders(tc, actions: np.ndarray, tradeable: list[str],
                     account: dict, p: dict, n_today: int,
@@ -498,9 +424,7 @@ def _execute_orders(tc, actions: np.ndarray, tradeable: list[str],
     return orders, n_today
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CIRCUIT BREAKER
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Circuit Breaker ──────────────────────────────────────────────────────────
 
 class _CB:
     def __init__(self, eq0: float, thr: float):
@@ -522,21 +446,18 @@ class _CB:
         return self.on
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# LIVE LOGGER (CSV incrementale)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─── Live Log ─────────────────────────────────────────────────────────────────
 
 class _LiveLog:
     def __init__(self, path: str):
         self.path = path; self._rows: list[dict] = []; self._eq0: Optional[float] = None
 
-    def record(self, ts: datetime.datetime, acc: dict, actions: np.ndarray,
-               tradeable: list[str], thermo_df: pd.DataFrame, orders: list[dict]) -> None:
+    def record(self, ts, acc, actions, tradeable, thermo_df, orders) -> None:
         eq = acc["equity"]
         if self._eq0 is None:
             self._eq0 = eq
-        row = {"ts": ts.isoformat(), "equity": round(eq, 2),
-               "cash": round(acc["cash"], 2),
+        row = {"ts": ts if isinstance(ts, str) else ts.isoformat(),
+               "equity": round(eq, 2), "cash": round(acc["cash"], 2),
                "daily_pl": round(acc["daily_pl"], 2),
                "ret_pct": round((eq / self._eq0 - 1) * 100, 4),
                "n_orders": len(orders)}
@@ -544,7 +465,8 @@ class _LiveLog:
             row[f"a_{t}"] = round(float(actions[i]), 4) if i < len(actions) else 0.0
         for t in tradeable:
             row[f"pos_{t}"] = round(acc["positions"].get(t, {}).get("market_value", 0.0), 2)
-        for c in ["Thm_Stress","Thm_Efficiency","Thm_Regime","Thm_Pressure"]:
+        for c in ["Thm_Stress","Thm_Efficiency","Thm_Regime","Thm_Pressure",
+                  "Thm_VdW_P","Thm_Work","Thm_ZStress"]:
             if not thermo_df.empty and c in thermo_df.columns:
                 row[c] = round(float(thermo_df[c].iloc[-1]), 4)
         self._rows.append(row)
@@ -557,15 +479,10 @@ class _LiveLog:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
+# ENTRY POINT — LIVE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_alpaca(cfg) -> None:
-    """
-    Avvia il loop di paper trading su Alpaca.
-    Chiamato da main.py quando step=alpaca.
-    Non richiede load_data() — i dati arrivano da Alpaca in tempo reale.
-    """
     freq = cfg.frequency.interval
     os.makedirs(cfg.paths.results_dir, exist_ok=True)
     log = _setup_logger(cfg.paths.results_dir, freq)
@@ -574,10 +491,11 @@ def run_alpaca(cfg) -> None:
     log.info(f"  ALPACA PAPER TRADING | freq={freq} | window={cfg.prediction.window_size}")
     log.info("=" * 62)
 
-    # ── Parametri da cfg.alpaca (tutti con default safe) ─────────────────
     ac = getattr(cfg, "alpaca", None)
     def _g(k, d): return getattr(ac, k, d) if ac else d
 
+    # [FIX I] transaction_cost ora letto dal YAML (buyer.transaction_cost)
+    # invece di essere hardcoded a 0.001, garantendo coerenza con il training.
     p = {
         "max_position_pct":   _g("max_position_pct",   0.05),
         "min_order_usd":      _g("min_order_usd",       1.0),
@@ -587,26 +505,27 @@ def run_alpaca(cfg) -> None:
         "max_daily_trades":   _g("max_daily_trades",    50),
         "warmup_bars":        _g("warmup_bars",         cfg.prediction.window_size + 5),
         "bar_buffer":         _g("bar_buffer",          200),
+        "transaction_cost":   float(getattr(cfg.buyer, "transaction_cost", 0.001)),  # FIX I
     }
 
     all_tickers = list(cfg.data.tickers)
     tradeable   = list(_g("tradeable_tickers", None) or _filter_tradeable(all_tickers))
     log.info(f"Ticker: {len(tradeable)} tradabili / {len(all_tickers)} training")
+    log.info(f"transaction_cost={p['transaction_cost']:.4f} (dal YAML buyer.transaction_cost)")
 
-    # ── Carica modelli ─────────────────────────────────────────────────────
     predictor, scaler, num_features, device = _load_predictor(cfg, log)
 
     from modelli.thermo_state_builder import ThermoStateBuilder
     thermo_builder = ThermoStateBuilder(interval=freq)
 
+    # [FIX J] dummy_thermo include VdW → state_dim corretto
     dummy_bars = pd.DataFrame(index=[datetime.datetime.now()], columns=all_tickers).fillna(1.0)
     try:
-        dummy_thermo = thermo_builder.build(dummy_bars, all_tickers)
+        dummy_thermo = _build_thermo_live(thermo_builder, dummy_bars, all_tickers)
         N_THERMO = len(dummy_thermo.columns) if dummy_thermo is not None else 0
     except Exception:
-        N_THERMO = 37  # fallback
+        N_THERMO = 45  # fallback (37 base + 8 VdW)
 
-    # state_dim identico a TradingEnv:
     state_dim = num_features + 2 + N_THERMO
     log.info(f"state_dim={state_dim} (F={num_features} port=2 thm={N_THERMO})")
 
@@ -614,8 +533,6 @@ def run_alpaca(cfg) -> None:
         cfg, state_dim, all_tickers, tradeable, device, log
     )
 
-
-    # ── Connessione ────────────────────────────────────────────────────────
     tc, dc = _init_alpaca(log)
 
     account  = _fetch_account(tc)
@@ -623,37 +540,32 @@ def run_alpaca(cfg) -> None:
     cb       = _CB(eq0, p["circuit_breaker_dd"])
     live_log = _LiveLog(os.path.join(cfg.paths.results_dir, f"alpaca_live_log_{freq}.csv"))
 
-    interval_sec   = {"1m":60,"2m":120,"5m":300,"15m":900,"1h":3600,"1d":86400}.get(freq,120)
-    n_today        = 0
+    interval_sec = {"1m":60,"2m":120,"5m":300,"15m":900,"1h":3600,"1d":86400}.get(freq,120)
+    n_today      = 0
     last_date: Optional[datetime.date] = None
-    step_n         = 0
+    step_n       = 0
 
-    log.info(f"Equity iniziale: ${eq0:,.2f} | CB soglia: {p['circuit_breaker_dd']:.0%}")
-
-    # ── [Fix TH] Buffer rolling per thermo — evita Trust=0.500 fisso ──────────
-    # Il loop live riceve solo bar_buffer=60 barre a ogni step via _fetch_bars().
-    # trust_window=40 serve barre di storia: il buffer le accumula in modo rolling.
-    _live_trust_window = thermo_builder.trust_window
-    _ws_live           = cfg.prediction.window_size
-    thermo_buf         = _RollingThermoBuffer(
-        thermo_builder,
-        min_bars = _live_trust_window + _ws_live + 5,
-    )
-    log.info(f"RollingThermoBuffer: min_bars={_live_trust_window + _ws_live + 5}")
+    # [FIX K] Buffer rolling per thermo
+    trust_window = thermo_builder.trust_window
+    ws_live      = cfg.prediction.window_size
+    thermo_buf   = _RollingThermoBuffer(thermo_builder, min_bars=trust_window + ws_live + 5)
+    log.info(f"RollingThermoBuffer: min_bars={trust_window + ws_live + 5}")
+    log.info(f"Equity iniziale: ${eq0:,.2f} | CB: {p['circuit_breaker_dd']:.0%}")
     log.info("Avvio loop...")
 
-    # ── Loop principale ────────────────────────────────────────────────────
+    _THERMO_COLS = ["Thm_Pressure","Thm_Temperature","Thm_Work",
+                    "Thm_Stress","Thm_Efficiency","Thm_Entropy","Thm_Regime"]
+    all_cols_base = all_tickers + _THERMO_COLS
+
     while True:
         try:
             now   = datetime.datetime.now(datetime.timezone.utc)
             today = now.date()
 
-            # Reset giornaliero
             if last_date != today:
                 n_today = 0; last_date = today
                 log.info(f"Nuovo giorno: {today}")
 
-            # Orario di mercato
             try:
                 if not tc.get_clock().is_open:
                     log.info("Mercato chiuso — attendo 5 min")
@@ -661,7 +573,6 @@ def run_alpaca(cfg) -> None:
             except Exception:
                 pass
 
-            # Sincronizza con la barra
             elapsed = (now.minute * 60 + now.second) % interval_sec
             time.sleep(max(1.0, interval_sec - elapsed + 5))
 
@@ -669,45 +580,27 @@ def run_alpaca(cfg) -> None:
             log.info(f"\n{'─'*55}")
             log.info(f"  Step {step_n} | {datetime.datetime.now(datetime.timezone.utc).strftime('%H:%M:%S UTC')}")
 
-            # 1. Barre aggiornate
             bars = _fetch_bars(dc, tradeable, p["bar_buffer"], freq, log)
             if bars.empty or len(bars) < p["warmup_bars"]:
-                log.info(f"Warm-up: {len(bars)}/{p['warmup_bars']} barre"); continue
+                log.info(f"Warm-up: {len(bars)}/{p['warmup_bars']}"); continue
 
-            # 2. Frame completo a 58 colonne (51 ticker + 7 thermo)
-            # Il MinMaxScaler è stato fittato su 58 feature — le thermo
-            # devono essere incluse nello stesso ordine del training.
-            _THERMO_COLS = ["Thm_Pressure","Thm_Temperature","Thm_Work",
-                            "Thm_Stress","Thm_Efficiency","Thm_Entropy","Thm_Regime"]
-            all_cols_58 = all_tickers + _THERMO_COLS
-
-            # 2a. Calcola thermo con buffer rolling ─────────────────────────
-            # [Fix TH] bars contiene solo bar_buffer=60 barre: con ws=15 la finestra
-            # passata a SignalTrustEngine è troppo corta → Trust=0.500 costante.
-            # thermo_buf accumula storia rolling garantendo ≥ trust_window barre.
-            # Passiamo l'ultima barra disponibile; il buffer fa il resto.
             try:
-                _last_bar = bars.iloc[[-1]]
-                thermo_df = thermo_buf.update(_last_bar, tradeable)
+                thermo_df = thermo_buf.update(bars.iloc[[-1]], tradeable)
                 if thermo_df.empty:
-                    # Fallback: usa bars direttamente finché il buffer si riempie
-                    thermo_df = thermo_builder.build(bars, tradeable)
+                    thermo_df = _build_thermo_live(thermo_builder, bars, tradeable) or pd.DataFrame()
             except Exception as e:
                 log.warning(f"Thermo: {e}")
                 thermo_df = pd.DataFrame()
 
-            # 2b. Costruisce il frame con prezzi + thermo
-            full = pd.DataFrame(0.0, index=bars.index, columns=all_cols_58)
+            full = pd.DataFrame(0.0, index=bars.index, columns=all_cols_base)
             for t in tradeable:
                 if t in bars.columns and t in all_tickers:
                     full[t] = bars[t].values
             if not thermo_df.empty:
                 for col in _THERMO_COLS:
                     if col in thermo_df.columns:
-                        aligned = thermo_df[col].reindex(full.index).ffill().bfill().fillna(0.0)
-                        full[col] = aligned.values
+                        full[col] = thermo_df[col].reindex(full.index).ffill().bfill().fillna(0.0).values
 
-            # 3. Scaling
             try:
                 scaled = scaler.transform(full)
             except Exception as e:
@@ -717,7 +610,6 @@ def run_alpaca(cfg) -> None:
             if len(scaled) < ws:
                 log.warning(f"Barre insufficienti ({len(scaled)} < {ws})"); continue
 
-            # 4. CNN prediction
             with torch.no_grad():
                 win = torch.tensor(scaled[-ws:][np.newaxis], dtype=torch.float32).to(device)
                 out = predictor(win)
@@ -725,16 +617,10 @@ def run_alpaca(cfg) -> None:
                     out = out[:, 0, :]
                 pred = out.cpu().numpy()
 
-            # 5. thermo_df già calcolato al passo 2a — non ricalcolare
-
-            # 6. Portafoglio
             account = _fetch_account(tc)
-
-            # 7. Circuit breaker
             if cb.check(account["equity"], tc, log):
                 log.error("Circuit breaker — sospeso"); time.sleep(interval_sec); continue
 
-            # 8. Stato + azione DDPG
             state_raw = _build_state(scaled, pred, account, all_tickers, tradeable,
                                      thermo_df, num_features, eq0)
 
@@ -744,10 +630,8 @@ def run_alpaca(cfg) -> None:
                              if len(state_raw) < state_dim else state_raw[:state_dim])
 
             actions_full = agent.act(normalizer.normalize(state_raw, update=False), explore=False)
-            # Estrai solo le azioni per i ticker tradabili (sottoinsieme di all_tickers)
-            actions = actions_full[tradeable_indices]
+            actions      = actions_full[tradeable_indices]
 
-            # Log segnali
             sig = [(tradeable[i], float(a)) for i, a in enumerate(actions)
                    if abs(a) > p["action_threshold"]]
             if sig:
@@ -757,7 +641,6 @@ def run_alpaca(cfg) -> None:
             else:
                 log.info("HOLD")
 
-            # Log thermo
             if not thermo_df.empty:
                 s  = float(thermo_df.get("Thm_Stress",  pd.Series([0])).iloc[-1])
                 rg = int(thermo_df.get("Thm_Regime", pd.Series([0])).iloc[-1])
@@ -765,18 +648,13 @@ def run_alpaca(cfg) -> None:
                          3:"COMPRESSIONE",4:"RIMBALZO"}.get(rg,"?")
                 log.info(f"Thermo: stress={s:+.3f} | {rname}")
 
-            # 9. Ordini
             orders, n_today = _execute_orders(tc, actions, tradeable,
                                               account, p, n_today, log)
-
-            # 10. Registro
             live_log.record(now, account, actions, tradeable, thermo_df, orders)
 
             ret = (account["equity"] / eq0 - 1) * 100
-            log.info(
-                f"Portfolio: ${account['equity']:,.2f} ({ret:+.2f}%) | "
-                f"Cash: ${account['cash']:,.2f} | Ordini oggi: {n_today}"
-            )
+            log.info(f"Portfolio: ${account['equity']:,.2f} ({ret:+.2f}%) | "
+                     f"Cash: ${account['cash']:,.2f} | Ordini oggi: {n_today}")
 
         except KeyboardInterrupt:
             log.info("Interrotto (Ctrl+C)"); break
@@ -789,17 +667,10 @@ def run_alpaca(cfg) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# REPLAY AD ALTA VELOCITÀ
+# ENTRY POINT — REPLAY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _fetch_historical_bars(dc, tickers: list[str], freq: str,
-                           start: datetime.datetime, end: datetime.datetime,
-                           log: logging.Logger) -> pd.DataFrame:
-    """
-    Scarica barre storiche da Alpaca per un intervallo preciso.
-    Restituisce DataFrame con colonne=tickers, index=timestamp UTC,
-    ordinato cronologicamente — pronto per il replay.
-    """
+def _fetch_historical_bars(dc, tickers, freq, start, end, log) -> pd.DataFrame:
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
@@ -811,13 +682,11 @@ def _fetch_historical_bars(dc, tickers: list[str], freq: str,
            "1d": TimeFrame(1, TimeFrameUnit.Day)}
     tf = _tf.get(freq, TimeFrame(2, TimeFrameUnit.Minute))
 
-    log.info(f"Download storico Alpaca | {start.date()} → {end.date()} | freq={freq}")
-
+    log.info(f"Download storico | {start.date()} → {end.date()} | freq={freq}")
     try:
         bars = dc.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=tickers, timeframe=tf,
-            start=start, end=end, adjustment="all",
-            feed="iex",   # IEX = gratuito; SIP richiede abbonamento a pagamento
+            start=start, end=end, adjustment="all", feed="iex",
         ))
         df = bars.df
     except Exception as e:
@@ -829,30 +698,20 @@ def _fetch_historical_bars(dc, tickers: list[str], freq: str,
     df = df["close"].unstack(level=0) if isinstance(df.index, pd.MultiIndex) \
          else df[["close"]]
     df = df.reindex(columns=tickers).ffill().bfill().sort_index()
-
     log.info(f"Scaricate {len(df):,} barre ({df.index[0]} → {df.index[-1]})")
     return df
 
 
 def _simulate_account(positions: dict[str, float], cash: float,
                        current_prices: dict[str, float]) -> dict:
-    """
-    Calcola lo stato del portafoglio simulato senza chiamare Alpaca.
-    Usato nel replay per non dipendere dal paper account ad ogni step.
-    positions: {ticker: shares}
-    """
     holdings_val = {t: shares * current_prices.get(t, 0.0)
                     for t, shares in positions.items()}
     equity = cash + sum(holdings_val.values())
     return {
-        "equity": equity,
-        "cash":   cash,
-        "daily_pl": 0.0,  # calcolato alla fine
+        "equity": equity, "cash": cash, "daily_pl": 0.0,
         "positions": {
-            t: {"qty": shares,
-                "market_value": holdings_val[t],
-                "avg_cost": 0.0,
-                "unrealized_pl": 0.0}
+            t: {"qty": shares, "market_value": holdings_val[t],
+                "avg_cost": 0.0, "unrealized_pl": 0.0}
             for t, shares in positions.items() if shares > 0
         }
     }
@@ -862,13 +721,12 @@ def _replay_execute(actions: np.ndarray, tradeable: list[str],
                     positions: dict[str, float], cash: float,
                     prices: dict[str, float], p: dict) -> tuple[dict, float, list[dict]]:
     """
-    Simula l'esecuzione degli ordini localmente durante il replay.
-    Non chiama Alpaca — aggiorna posizioni e cash direttamente.
-
-    Restituisce (positions_aggiornate, cash_aggiornato, ordini_log).
+    [FIX I] tc_cost ora viene da p["transaction_cost"] (letto dal YAML),
+    non più dal default hardcoded 0.001.
     """
     equity  = cash + sum(positions.get(t, 0.0) * prices.get(t, 0.0) for t in tradeable)
     orders: list[dict] = []
+    tc_cost = p["transaction_cost"]  # FIX I — era p.get("transaction_cost", 0.001)
 
     for i, ticker in enumerate(tradeable):
         if i >= len(actions):
@@ -879,10 +737,9 @@ def _replay_execute(actions: np.ndarray, tradeable: list[str],
             continue
 
         cur_val = positions.get(ticker, 0.0) * price
-        tc_cost = p.get("transaction_cost", 0.001)
 
         if a > p["action_threshold"]:
-            max_pos = equity * p["max_position_pct"]
+            max_pos  = equity * p["max_position_pct"]
             notional = min(cash * a, max(0.0, max_pos - cur_val))
             if notional < p["min_order_usd"]:
                 continue
@@ -893,7 +750,7 @@ def _replay_execute(actions: np.ndarray, tradeable: list[str],
                            "notional": round(notional, 2), "action": a})
 
         elif a < -p["action_threshold"] and cur_val > p["min_order_usd"]:
-            notional  = cur_val * abs(a)
+            notional    = cur_val * abs(a)
             if notional < p["min_order_usd"]:
                 continue
             shares_sold = notional / price
@@ -906,31 +763,6 @@ def _replay_execute(actions: np.ndarray, tradeable: list[str],
 
 
 def run_alpaca_replay(cfg) -> None:
-    """
-    Replay ad alta velocità di barre storiche Alpaca.
-    Chiamato da main.py con step=alpaca_replay.
-
-    Differenze rispetto a run_alpaca (live):
-    - Scarica barre storiche Alpaca per un range di date configurabile
-    - Riproduce le barre sequenzialmente senza aspettare il tempo reale
-    - La velocità è controllata da alpaca_replay.bar_delay_sec (default 0.05s)
-    - Gli ordini vengono simulati localmente (portfolio virtuale) oppure
-      inviati al paper account Alpaca (alpaca_replay.submit_orders=true)
-    - Al termine stampa un report completo identico a run_trade
-
-    Config opzionale (config.yaml o CLI):
-      alpaca_replay:
-        days_back:       4       # quanti giorni di storia riprodurre
-        bar_delay_sec:   0.05   # pausa tra una barra e la prossima (secondi)
-        submit_orders:   false  # true = invia ordini reali al paper account
-        window_size:     null   # override window (default: cfg.prediction.window_size)
-        start_date:      null   # override data inizio (ISO format)
-        end_date:        null   # override data fine (ISO format)
-
-    Speedup tipico con bar_delay_sec=0.05:
-      4 giorni × 390 barre/giorno (2m) × 0.05s = ~78 secondi
-      rispetto a 4 giorni reali = 345.600 secondi → 4400x più veloce
-    """
     freq = cfg.frequency.interval
     os.makedirs(cfg.paths.results_dir, exist_ok=True)
     log = _setup_logger(cfg.paths.results_dir, f"replay_{freq}")
@@ -939,15 +771,13 @@ def run_alpaca_replay(cfg) -> None:
     log.info(f"  ALPACA REPLAY | freq={freq} | window={cfg.prediction.window_size}")
     log.info("=" * 62)
 
-    # ── Parametri replay ──────────────────────────────────────────────────
     rc = getattr(cfg, "alpaca_replay", None)
     def _r(k, d): return getattr(rc, k, d) if rc else d
 
-    days_back      = int(_r("days_back",      4))
-    bar_delay_sec  = float(_r("bar_delay_sec", 0.05))
-    submit_orders  = bool(_r("submit_orders",  False))
+    days_back     = int(_r("days_back",      4))
+    bar_delay_sec = float(_r("bar_delay_sec", 0.05))
+    submit_orders = bool(_r("submit_orders",  False))
 
-    # Date del replay
     now = datetime.datetime.now(datetime.timezone.utc)
     if _r("end_date", None):
         end_dt = datetime.datetime.fromisoformat(str(_r("end_date", None))).replace(
@@ -961,81 +791,70 @@ def run_alpaca_replay(cfg) -> None:
     else:
         start_dt = end_dt - datetime.timedelta(days=days_back)
 
-    # Parametri di rischio (stessi di run_alpaca)
     ac = getattr(cfg, "alpaca", None)
     def _g(k, d): return getattr(ac, k, d) if ac else d
 
+    # [FIX I] transaction_cost letto dal YAML — identico al training
     p = {
         "max_position_pct":  _g("max_position_pct",  0.05),
         "min_order_usd":     _g("min_order_usd",      1.0),
         "action_threshold":  _g("action_threshold",   0.005),
         "min_confidence":    _g("min_confidence",     0.10),
         "circuit_breaker_dd": _g("circuit_breaker_dd", -0.15),
-        "transaction_cost":  0.001,
+        "transaction_cost":  float(getattr(cfg.buyer, "transaction_cost", 0.001)),  # FIX I
     }
 
     all_tickers = list(cfg.data.tickers)
     tradeable   = list(_g("tradeable_tickers", None) or _filter_tradeable(all_tickers))
 
-    log.info(f"Range replay: {start_dt.date()} → {end_dt.date()} ({days_back} giorni)")
-    log.info(f"Ticker: {len(tradeable)} tradabili | bar_delay={bar_delay_sec}s | "
-             f"submit_orders={submit_orders}")
+    log.info(f"Range: {start_dt.date()} → {end_dt.date()} | bar_delay={bar_delay_sec}s")
+    log.info(f"transaction_cost={p['transaction_cost']:.4f} (dal YAML, identico al training)")
 
-    # Stima velocità
-    bars_per_day = {"1m": 390, "2m": 195, "5m": 78, "15m": 26,
-                    "1h": 7, "1d": 1}.get(freq, 195)
+    bars_per_day = {"1m":390,"2m":195,"5m":78,"15m":26,"1h":7,"1d":1}.get(freq, 195)
     est_bars    = days_back * bars_per_day
     est_seconds = est_bars * bar_delay_sec
     speedup     = (days_back * 86400) / max(est_seconds, 1)
-    log.info(f"Stima: ~{est_bars:,} barre | durata ~{est_seconds:.0f}s | {speedup:.0f}x speedup")
+    log.info(f"Stima: ~{est_bars:,} barre | ~{est_seconds:.0f}s | {speedup:.0f}x speedup")
 
-    # ── Carica modelli ─────────────────────────────────────────────────────
     predictor, scaler, num_features, device = _load_predictor(cfg, log)
 
     from modelli.thermo_state_builder import ThermoStateBuilder
     thermo_builder = ThermoStateBuilder(interval=freq)
 
+    # [FIX J] dummy_thermo include VdW per state_dim corretto
     dummy_bars = pd.DataFrame(index=[datetime.datetime.now()], columns=all_tickers).fillna(1.0)
     try:
-        dummy_thermo = thermo_builder.build(dummy_bars, all_tickers)
+        dummy_thermo = _build_thermo_live(thermo_builder, dummy_bars, all_tickers)
         N_THERMO = len(dummy_thermo.columns) if dummy_thermo is not None else 0
     except Exception:
-        N_THERMO = 37  # fallback
+        N_THERMO = 45
 
     state_dim = num_features + 2 + N_THERMO
     log.info(f"state_dim={state_dim} (F={num_features} port=2 thm={N_THERMO})")
+
     agent, normalizer, tradeable_indices = _load_agent(
         cfg, state_dim, all_tickers, tradeable, device, log
     )
 
-    # ── Connessione Alpaca ─────────────────────────────────────────────────
     tc, dc = _init_alpaca(log)
-
-    # ── Download barre storiche ────────────────────────────────────────────
     all_bars = _fetch_historical_bars(dc, tradeable, freq, start_dt, end_dt, log)
 
     ws = cfg.prediction.window_size
     if len(all_bars) < ws + 5:
-        log.error(f"Barre insufficienti: {len(all_bars)} < {ws + 5}. "
-                  f"Aumenta days_back o usa una finestra più piccola.")
+        log.error(f"Barre insufficienti: {len(all_bars)} < {ws + 5}")
         return
 
-    # ── [Fix TH] RollingThermoBuffer ──────────────────────────────────────
-    # trust_window=40 richiede almeno 40 barre di storia per convergere.
-    # Passare solo window_raw (ws=15 barre) significa che il SignalTrustEngine
-    # non ha mai abbastanza dati → Trust medio fisso a 0.500 per tutto il replay.
-    # Il buffer accumula barre in modo rolling e garantisce min_bars di storia.
-    trust_window = thermo_builder.trust_window  # default 40
+    # [FIX K] Buffer rolling
+    trust_window = thermo_builder.trust_window
     thermo_buf   = _RollingThermoBuffer(thermo_builder, min_bars=trust_window + ws + 5)
 
-    # ── Portafoglio virtuale ───────────────────────────────────────────────
     initial_capital = float(cfg.buyer.initial_capital)
-    positions: dict[str, float] = {}   # {ticker: shares}
+    positions: dict[str, float] = {}
     cash     = initial_capital
     eq0      = initial_capital
 
-    live_log      = _LiveLog(os.path.join(cfg.paths.results_dir,
-                                          f"alpaca_replay_log_{freq}.csv"))
+    live_log       = _LiveLog(os.path.join(cfg.paths.results_dir,
+                                           f"alpaca_replay_log_{freq}.csv"))
     portfolio_hist: list[float] = [initial_capital]
     trade_log_rows: list[dict]  = []
 
@@ -1043,54 +862,37 @@ def run_alpaca_replay(cfg) -> None:
     step_n = 0
     peak_eq = initial_capital
 
-    log.info(f"\nInizio replay — {len(all_bars):,} barre totali | "
-             f"capitale iniziale: ${initial_capital:,.2f}")
-    log.info("─" * 55)
+    _THERMO_COLS  = ["Thm_Pressure","Thm_Temperature","Thm_Work",
+                     "Thm_Stress","Thm_Efficiency","Thm_Entropy","Thm_Regime"]
+    all_cols_base = all_tickers + _THERMO_COLS
 
-    # ── Loop replay ───────────────────────────────────────────────────────
+    log.info(f"\nInizio replay — {len(all_bars):,} barre | capitale: ${initial_capital:,.2f}")
+
     for bar_i in range(ws, len(all_bars)):
-        step_n += 1
-
-        # Finestra di input per CNN
+        step_n    += 1
         window_raw = all_bars.iloc[bar_i - ws: bar_i]
         ts         = all_bars.index[bar_i]
 
-        # Frame completo a 58 colonne (51 ticker + 7 thermo)
-        # Il MinMaxScaler è fittato su 58 feature — le thermo devono
-        # essere incluse nello stesso ordine usato durante il training.
-        _THERMO_COLS = ["Thm_Pressure","Thm_Temperature","Thm_Work",
-                        "Thm_Stress","Thm_Efficiency","Thm_Entropy","Thm_Regime"]
-        all_cols_58 = all_tickers + _THERMO_COLS
-
-        # ── [Fix TH] Usa il buffer rolling invece di rebuild per ogni barra ──
-        # window_raw ha solo ws=15 barre: troppo poco per SignalTrustEngine (window=40).
-        # thermo_buf accumula storia in modo rolling → Trust converge correttamente.
+        # [FIX K] Buffer rolling per thermo
         try:
-            _current_bar = all_bars.iloc[[bar_i]]
-            thermo_df    = thermo_buf.update(_current_bar, tradeable)
+            thermo_df = thermo_buf.update(all_bars.iloc[[bar_i]], tradeable)
         except Exception:
             thermo_df = pd.DataFrame()
 
-        # Costruisce frame prezzi + thermo
-        full = pd.DataFrame(0.0, index=window_raw.index, columns=all_cols_58)
+        full = pd.DataFrame(0.0, index=window_raw.index, columns=all_cols_base)
         for t in tradeable:
             if t in window_raw.columns and t in all_tickers:
                 full[t] = window_raw[t].values
         if not thermo_df.empty:
             for col in _THERMO_COLS:
                 if col in thermo_df.columns:
-                    aligned = thermo_df[col].reindex(full.index).ffill().bfill().fillna(0.0)
-                    full[col] = aligned.values
+                    full[col] = thermo_df[col].reindex(full.index).ffill().bfill().fillna(0.0).values
 
-        # Scaling
         try:
-            
             scaled = scaler.transform(full)
         except Exception as e:
-            log.warning(f"Scaling step {step_n}: {e}")
-            continue
+            log.warning(f"Scaling step {step_n}: {e}"); continue
 
-        # CNN prediction
         with torch.no_grad():
             win_t = torch.tensor(scaled[np.newaxis], dtype=torch.float32).to(device)
             out   = predictor(win_t)
@@ -1098,26 +900,19 @@ def run_alpaca_replay(cfg) -> None:
                 out = out[:, 0, :]
             pred = out.cpu().numpy()
 
-        # thermo_df già calcolato sopra — non ricalcolare
-
-        # Prezzi correnti (ultima barra della finestra)
-        prices = {t: float(all_bars[t].iloc[bar_i])
-                  for t in tradeable if t in all_bars.columns}
-
-        # Stato portafoglio simulato
+        prices  = {t: float(all_bars[t].iloc[bar_i])
+                   for t in tradeable if t in all_bars.columns}
         account = _simulate_account(positions, cash, prices)
         equity  = account["equity"]
         portfolio_hist.append(equity)
 
-        # Circuit breaker
         if equity > peak_eq:
             peak_eq = equity
         dd = (equity - peak_eq) / (peak_eq + 1e-8)
         if dd < p["circuit_breaker_dd"]:
-            log.warning(f"⚠️  Circuit breaker a step {step_n} | dd={dd:.1%}")
+            log.warning(f"⚠️  Circuit breaker | dd={dd:.1%}")
             break
 
-        # Stato vettoriale
         state_raw = _build_state(scaled, pred, account, all_tickers, tradeable,
                                  thermo_df, num_features, eq0)
         if len(state_raw) != state_dim:
@@ -1125,22 +920,18 @@ def run_alpaca_replay(cfg) -> None:
                          if len(state_raw) < state_dim else state_raw[:state_dim])
 
         actions_full = agent.act(normalizer.normalize(state_raw, update=False), explore=False)
-        # Estrai solo le azioni per i ticker tradabili
-        actions = actions_full[tradeable_indices]
+        actions      = actions_full[tradeable_indices]
 
-        # Esegui ordini (simulati localmente)
+        # [FIX I] _replay_execute usa p["transaction_cost"] dal YAML
         positions, cash, orders = _replay_execute(
             actions, tradeable, positions, cash, prices, p
         )
         n_buys  += sum(1 for o in orders if o["side"] == "BUY")
         n_sells += sum(1 for o in orders if o["side"] == "SELL")
 
-        # Se richiesto, invia anche al paper account Alpaca
         if submit_orders and orders:
-            _, _ = _execute_orders(tc, actions, tradeable,
-                                   account, p, 0, log)
+            _execute_orders(tc, actions, tradeable, account, p, 0, log)
 
-        # Log ordini
         for o in orders:
             trade_log_rows.append({
                 "ts": ts, "ticker": o["ticker"], "side": o["side"],
@@ -1148,38 +939,30 @@ def run_alpaca_replay(cfg) -> None:
                 "equity": round(equity, 2), "cash": round(cash, 2),
             })
 
-        # Log CSV ogni 5 step
-        fake_account = _simulate_account(positions, cash, prices)
-        live_log.record(ts, fake_account, actions, tradeable, thermo_df, orders)
+        live_log.record(ts, _simulate_account(positions, cash, prices),
+                        actions, tradeable, thermo_df, orders)
 
-        # Progress ogni 100 step
         if step_n % 100 == 0:
             ret = (equity / eq0 - 1) * 100
-            log.info(
-                f"  Step {step_n:5d}/{len(all_bars)-ws} | "
-                f"{ts.strftime('%m-%d %H:%M')} | "
-                f"${equity:,.2f} ({ret:+.2f}%) | "
-                f"B:{n_buys} S:{n_sells}"
-            )
+            log.info(f"  Step {step_n:5d}/{len(all_bars)-ws} | "
+                     f"{ts.strftime('%m-%d %H:%M')} | "
+                     f"${equity:,.2f} ({ret:+.2f}%) | B:{n_buys} S:{n_sells}")
 
         time.sleep(bar_delay_sec)
 
-    # ── Report finale ──────────────────────────────────────────────────────
+    # ── Report finale ──────────────────────────────────────────────────────────
     live_log.close()
 
     hist    = np.array(portfolio_hist, dtype=np.float64)
     final_v = hist[-1]
     ret_pct = (final_v / initial_capital - 1) * 100
 
-    # Sharpe annualizzato
     bars_per_year = int(getattr(cfg.buyer, "bars_per_year", 98280))
     returns  = np.diff(hist) / (hist[:-1] + 1e-8)
     sharpe   = (float(returns.mean()) / (float(returns.std()) + 1e-8)
                 * np.sqrt(bars_per_year)) if len(returns) > 1 else 0.0
-
-    # Max drawdown
-    peak = np.maximum.accumulate(hist)
-    max_dd = float(((hist - peak) / (peak + 1e-8)).min())
+    peak     = np.maximum.accumulate(hist)
+    max_dd   = float(((hist - peak) / (peak + 1e-8)).min())
 
     sep = "─" * 58
     log.info(f"\n{sep}")
@@ -1196,15 +979,14 @@ def run_alpaca_replay(cfg) -> None:
     log.info(f"  Max Drawdown      : {max_dd:>10.3f}")
     log.info(f"  Operazioni BUY    : {n_buys:>10,}")
     log.info(f"  Operazioni SELL   : {n_sells:>10,}")
+    log.info(f"  Transaction cost  : {p['transaction_cost']:.4f} (dal YAML)")
     log.info(sep)
 
-    # Salva trade log
     if trade_log_rows:
-        tlog_path = os.path.join(cfg.paths.results_dir, f"alpaca_replay_trades_{freq}.csv")
-        pd.DataFrame(trade_log_rows).to_csv(tlog_path, index=False)
-        log.info(f"  Trade log: {tlog_path}")
+        tlog = os.path.join(cfg.paths.results_dir, f"alpaca_replay_trades_{freq}.csv")
+        pd.DataFrame(trade_log_rows).to_csv(tlog, index=False)
+        log.info(f"  Trade log: {tlog}")
 
-    # Salva curva portafoglio
     ph_path = os.path.join(cfg.paths.results_dir, f"alpaca_replay_portfolio_{freq}.csv")
     pd.Series(hist, name="equity").to_csv(ph_path)
     log.info(f"  Portfolio: {ph_path}")

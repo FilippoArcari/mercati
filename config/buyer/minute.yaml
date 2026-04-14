@@ -20,7 +20,7 @@ initial_capital:  100.0
 transaction_cost: 0.001
 
 buffer_capacity: 250000
-log_every:       1
+log_every:       50
 
 # ── Training ──────────────────────────────────────────────────────────────────
 n_episodes:  500

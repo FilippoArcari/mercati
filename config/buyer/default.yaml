@@ -7,7 +7,7 @@ buffer_capacity: 250000
 batch_size:      256
 n_episodes:      300           # ← Aumentato da 100 (più training)
 warmup:          5000          # ← Aumentato da 3000 (più esplorazione)
-log_every:       10
+log_every:       50
 es_patience:     40            # ← Aumentato da 20 (less aggressive stopping)
 es_metric:       sharpe        # "sharpe" | "portfolio" | "reward"
 
