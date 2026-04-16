@@ -171,13 +171,23 @@ class DDPGAgent:
         return None  # Gestito da SB3 internamente
 
     def load(self, path: str) -> bool:
-        if path.endswith(".pth"):
-            path = path.replace(".pth", "")
-        if os.path.exists(path + ".zip") or os.path.exists(path):
-            self.model = DDPG.load(path, device=get_map_location())
-            print(f"[SB3 DDPG] Checkpoint caricato: {path}")
+        """
+        Carica un checkpoint SB3. SB3 salva come <path>.zip oppure <path> (senza estensione).
+        Accetta sia path con .pth (per compatibilità naming convention del progetto)
+        sia path senza estensione / con .zip.
+        """
+        base = path.replace(".pth", "")
+        candidates = [base + ".zip", base, base + ".pth"]
+        found = next((c for c in candidates if os.path.exists(c)), None)
+        if found is None:
+            return False
+        try:
+            self.model = DDPG.load(found.replace(".zip", ""), device=get_map_location())
+            print(f"[SB3 DDPG] Checkpoint caricato: {found}")
             return True
-        return False
+        except Exception as e:
+            print(f"[SB3 DDPG] Errore caricamento {found}: {e}")
+            return False
 
     def save(self, path: str, tag: str = "") -> None:
         if path.endswith(".pth"):

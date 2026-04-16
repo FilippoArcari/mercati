@@ -206,6 +206,13 @@ class TradingEnv(gym.Env):
         diffs = self.df.index.to_series().diff().dt.total_seconds().dropna()
         avg_sec = diffs.median() if not diffs.empty else 120
         self.bars_per_year = max(1, int((252 * 6.5 * 3600) / avg_sec))
+        # Log di verifica: mostra il valore calcolato per individuare YAML errati
+        _expected_map = {60: 98280, 120: 49140, 300: 19656, 900: 6552, 3600: 1764, 86400: 252}
+        _nearest_expected = min(_expected_map, key=lambda k: abs(k - avg_sec))
+        print(
+            f"[TradingEnv] bars_per_year={self.bars_per_year} "
+            f"(avg_sec={avg_sec:.0f}s ≈ {_expected_map.get(_nearest_expected, '?')} atteso)"
+        )
 
         self.action_space = spaces.Box(
             low=-1, high=1, shape=(self.n_tickers,), dtype=np.float32

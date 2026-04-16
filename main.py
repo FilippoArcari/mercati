@@ -45,7 +45,51 @@ def _apply_frequency_defaults():
 _apply_frequency_defaults()
 
 
-# ─── Helpers ───────────────────────────────────────────────────────────────────
+# ─── Bars-per-year validation ──────────────────────────────────────────────────
+
+def _validate_bars_per_year(cfg) -> None:
+    """
+    Valida e corregge bars_per_day / bars_per_year in base all'intervallo reale.
+
+    Questa funzione è un guard contro YAML errati: se bars_per_year non corrisponde
+    a quello atteso dall'intervallo, stampa un warning esplicito con i valori corretti.
+    L'eventuale valore errato nel YAML non causa crash ma viene segnalato chiaramente.
+
+    Tabella di riferimento (sessione NYSE = 390 minuti):
+      1m  → 390  barre/giorno × 252 =  98.280
+      2m  → 195  barre/giorno × 252 =  49.140  ← più comune
+      5m  →  78  barre/giorno × 252 =  19.656
+      15m →  26  barre/giorno × 252 =   6.552
+      1h  →   7  barre/giorno × 252 =   1.764
+      1d  →   1  barra/giorno  × 252 =     252
+    """
+    _expected: dict[str, int] = {
+        "1m": 390, "2m": 195, "5m": 78, "15m": 26, "1h": 7, "1d": 1
+    }
+    interval = str(getattr(cfg.frequency, "interval", "1d"))
+    if interval not in _expected:
+        return
+
+    expected_bars_day  = _expected[interval]
+    expected_bars_year = expected_bars_day * 252
+
+    configured_bpy = int(getattr(cfg.frequency, "bars_per_year", expected_bars_year))
+    if configured_bpy != expected_bars_year:
+        print(
+            f"\n⚠️  [bars_per_year] ATTENZIONE — valore nel YAML ({configured_bpy}) "
+            f"non corrisponde all'intervallo '{interval}'.\n"
+            f"   Valore corretto: {expected_bars_year} "
+            f"({expected_bars_day} barre/giorno × 252 giorni)\n"
+            f"   Lo Sharpe annualizzato sarà gonfiato di un fattore "
+            f"√({configured_bpy}/{expected_bars_year}) = "
+            f"{(configured_bpy/expected_bars_year)**0.5:.3f}×\n"
+            f"   → Aggiorna config/frequency/{interval.replace('m','')}.yaml: "
+            f"bars_per_year: {expected_bars_year}\n"
+        )
+    else:
+        print(f"[bars_per_year] OK — {configured_bpy} ({interval} → {expected_bars_day} barre/giorno)")
+
+
 
 def checkpoint_name(cfg, name: str) -> str:
     """
@@ -147,6 +191,9 @@ def split_dataframe(df: pd.DataFrame, cfg) -> tuple[pd.DataFrame, pd.DataFrame]:
 @hydra.main(version_base=None, config_path="config", config_name="config")
 def my_app(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
+
+    # Valida bars_per_year prima di qualsiasi operazione
+    _validate_bars_per_year(cfg)
 
     # ── ALPACA — early exit prima di load_data (i dati arrivano live) ─────────
     if cfg.step == "alpaca":

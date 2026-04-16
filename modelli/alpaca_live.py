@@ -159,6 +159,10 @@ def _setup_logger(results_dir: str, freq: str) -> logging.Logger:
     if log.handlers:
         return log
     log.setLevel(logging.INFO)
+    # FIX — double logging: Hydra installa un proprio handler sul root logger.
+    # Disabilitando la propagazione questo logger non fa più bubble-up al root,
+    # evitando che ogni messaggio venga stampato due volte con formati diversi.
+    log.propagate = False
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
     for h in [logging.StreamHandler(),
@@ -273,10 +277,29 @@ def _load_predictor(cfg, log: logging.Logger):
     ).to(device)
 
     state_dict = ck["model_state_dict"]
+
+    # FIX — CNN key mismatch: separare le chiavi MRE (attese mancanti quando MRE
+    # non è attivo in inference) dalle chiavi strutturali reali (bug vero).
+    # Prima, qualsiasi mismatch veniva loggato come warning generico nascondendo
+    # potenziali problemi di architettura.
+    _MRE_BUFFERS = {"prior_mean", "prior_std", "moment_target"}
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
-    _mre_buffers = ["prior_mean", "prior_std", "moment_target"]
-    for buf_name in _mre_buffers:
+    real_missing    = [k for k in missing    if k not in _MRE_BUFFERS]
+    real_unexpected = [k for k in unexpected if k not in _MRE_BUFFERS]
+    mre_missing     = [k for k in missing    if k in    _MRE_BUFFERS]
+
+    if real_missing or real_unexpected:
+        raise RuntimeError(
+            f"CNN checkpoint incompatibile con il modello corrente.\n"
+            f"  Chiavi mancanti (reali): {real_missing}\n"
+            f"  Chiavi inattese (reali): {real_unexpected}\n"
+            f"Soluzione: ri-addestra il modello con la stessa architettura oppure "
+            f"aggiorna il codice alla versione compatibile con il checkpoint."
+        )
+    if mre_missing:
+        log.info(f"CNN: {len(mre_missing)} buffer MRE ignorati (atteso in inference): {mre_missing}")
+    for buf_name in _MRE_BUFFERS:
         if buf_name in missing:
             setattr(model, buf_name, None)
 
@@ -299,8 +322,45 @@ def _load_agent(cfg, state_dim: int, all_tickers: list[str],
     np_ = _norm_ckpt(cfg)
     dc  = cfg.buyer.ddpg
 
-    if not os.path.exists(dp):
-        raise FileNotFoundError(f"DDPG non trovato: {dp}")
+    # FIX — graceful checkpoint search: prova più path prima di alzare eccezione.
+    # Il path primario è ddpg_best_{freq}.pth/.zip, ma SB3 salva senza estensione
+    # o con .zip. Proviamo tutti i candidati ragionevoli prima di fallire.
+    freq = cfg.frequency.interval
+    ckpt_dir = cfg.paths.checkpoint_dir
+
+    def _sb3_exists(path: str) -> bool:
+        """SB3 salva come path.zip oppure path (senza estensione)."""
+        base = path.replace(".pth", "")
+        return os.path.exists(base + ".zip") or os.path.exists(base)
+
+    candidate_paths = list(dict.fromkeys([
+        dp,
+        dp.replace("_best_",    "_latest_"),
+        dp.replace("_best_",    "_final_"),
+        os.path.join(ckpt_dir, f"ddpg_{freq}.pth"),
+        os.path.join(ckpt_dir, f"ddpg_best.pth"),
+    ]))
+
+    chosen_path = None
+    for cp in candidate_paths:
+        if _sb3_exists(cp):
+            chosen_path = cp
+            log.info(f"Checkpoint trovato: {os.path.basename(cp)}")
+            break
+
+    if chosen_path is None:
+        searched = [os.path.basename(c) for c in candidate_paths]
+        raise FileNotFoundError(
+            f"\n{'─'*60}\n"
+            f"  CHECKPOINT DDPG NON TROVATO\n"
+            f"{'─'*60}\n"
+            f"  Cercato in: {ckpt_dir}/\n"
+            f"  File cercati: {searched}\n\n"
+            f"  Soluzione — esegui il training prima del replay:\n"
+            f"    uv run main.py step=train frequency=minute\n"
+            f"    uv run main.py step=trade frequency=minute\n"
+            f"{'─'*60}"
+        )
 
     action_dim = len(all_tickers)
 
@@ -312,10 +372,14 @@ def _load_agent(cfg, state_dim: int, all_tickers: list[str],
         buffer_capacity=1, batch_size=1,
         update_every=999_999, noise_sigma=0.0,
     )
-    loaded = agent.load(dp)
+    loaded = agent.load(chosen_path)
     if not loaded:
-        raise RuntimeError(f"DDPG checkpoint incompatibile: {dp}")
-    log.info(f"DDPG: {os.path.basename(dp)} | state={state_dim} action={action_dim}")
+        raise RuntimeError(
+            f"Checkpoint trovato in {chosen_path} ma incompatibile con l'architettura corrente.\n"
+            f"  state_dim={state_dim}, action_dim={action_dim}\n"
+            f"  Ri-addestra il modello con la configurazione attuale."
+        )
+    log.info(f"DDPG: {os.path.basename(chosen_path)} | state={state_dim} action={action_dim}")
 
     norm = ObsNormalizer(shape=state_dim, clip=5.0)
 
@@ -519,7 +583,13 @@ def run_alpaca(cfg) -> None:
     thermo_builder = ThermoStateBuilder(interval=freq)
 
     # [FIX J] dummy_thermo include VdW → state_dim corretto
-    dummy_bars = pd.DataFrame(index=[datetime.datetime.now()], columns=all_tickers).fillna(1.0)
+    # FIX — pandas FutureWarning: fillna su dtype object con downcasting è deprecato
+    # da pandas 2.x e diventerà errore in pandas 3.0. Usiamo infer_objects().
+    dummy_bars = (
+        pd.DataFrame(index=[datetime.datetime.now()], columns=all_tickers)
+        .infer_objects(copy=False)
+        .fillna(1.0)
+    )
     try:
         dummy_thermo = _build_thermo_live(thermo_builder, dummy_bars, all_tickers)
         N_THERMO = len(dummy_thermo.columns) if dummy_thermo is not None else 0
@@ -528,12 +598,6 @@ def run_alpaca(cfg) -> None:
 
     state_dim = num_features + 2 + N_THERMO
     log.info(f"state_dim={state_dim} (F={num_features} port=2 thm={N_THERMO})")
-
-    agent, normalizer, tradeable_indices = _load_agent(
-        cfg, state_dim, all_tickers, tradeable, device, log
-    )
-
-    tc, dc = _init_alpaca(log)
 
     account  = _fetch_account(tc)
     eq0      = account["equity"]
@@ -822,7 +886,12 @@ def run_alpaca_replay(cfg) -> None:
     thermo_builder = ThermoStateBuilder(interval=freq)
 
     # [FIX J] dummy_thermo include VdW per state_dim corretto
-    dummy_bars = pd.DataFrame(index=[datetime.datetime.now()], columns=all_tickers).fillna(1.0)
+    # FIX — pandas FutureWarning: infer_objects() prima di fillna
+    dummy_bars = (
+        pd.DataFrame(index=[datetime.datetime.now()], columns=all_tickers)
+        .infer_objects(copy=False)
+        .fillna(1.0)
+    )
     try:
         dummy_thermo = _build_thermo_live(thermo_builder, dummy_bars, all_tickers)
         N_THERMO = len(dummy_thermo.columns) if dummy_thermo is not None else 0
@@ -843,6 +912,17 @@ def run_alpaca_replay(cfg) -> None:
     if len(all_bars) < ws + 5:
         log.error(f"Barre insufficienti: {len(all_bars)} < {ws + 5}")
         return
+
+    # FIX — warmup adattivo: il checkpoint è già addestrato, quindi non ha senso
+    # aspettare warmup_steps barre di esplorazione random prima di agire.
+    # Con warmup=5000 e ~780 barre disponibili l'agente non avrebbe mai agito.
+    # In replay con checkpoint esistente il warmup è sempre 0.
+    _configured_warmup = int(getattr(cfg.buyer, "warmup", 5000))
+    _replay_warmup = 0  # checkpoint caricato → policy già pronta
+    log.info(
+        f"Warmup replay: 0 barre (checkpoint esistente — ignorato warmup={_configured_warmup} "
+        f"configurato per il training). L'agente agisce da subito."
+    )
 
     # [FIX K] Buffer rolling
     trust_window = thermo_builder.trust_window
@@ -919,8 +999,28 @@ def run_alpaca_replay(cfg) -> None:
             state_raw = (np.pad(state_raw, (0, state_dim - len(state_raw)))
                          if len(state_raw) < state_dim else state_raw[:state_dim])
 
+        # ── Carnot-Efficiency Gate (innovazione termodinamica) ────────────────
+        # Idea: l'efficienza di Carnot del mercato (Thm_CarnotEff) misura quanto
+        # il mercato stia "lavorando" in modo efficiente rispetto al suo potenziale
+        # massimo termodinamico. Quando l'efficienza è bassa (mercato in stasi
+        # compressa, segnali molto rumorosi) riduciamo la confidenza minima
+        # richiesta per agire, evitando trade in condizioni di alta entropia.
+        # Formula: action_gate = base_threshold * (1 + carnot_penalty)
+        #   Se Thm_CarnotEff < 0.3 → mercato inefficiente → alziamo la soglia
+        #   Se Thm_CarnotEff > 0.7 → mercato efficiente  → soglia normale
+        _carnot_eff = 0.5  # default neutro
+        if not thermo_df.empty and "Thm_CarnotEff" in thermo_df.columns:
+            _carnot_eff = float(thermo_df["Thm_CarnotEff"].iloc[-1])
+        # Penalità: max +50% sulla soglia quando carnot < 0.3
+        _carnot_penalty = max(0.0, (0.5 - _carnot_eff) * 1.0)
+        _effective_threshold = p["action_threshold"] * (1.0 + _carnot_penalty)
+
         actions_full = agent.act(normalizer.normalize(state_raw, update=False), explore=False)
         actions      = actions_full[tradeable_indices]
+
+        # Applica la soglia adattiva: azioni deboli in regime inefficiente vengono azzerate
+        if _carnot_penalty > 0.1:
+            actions = np.where(np.abs(actions) >= _effective_threshold, actions, 0.0)
 
         # [FIX I] _replay_execute usa p["transaction_cost"] dal YAML
         positions, cash, orders = _replay_execute(
@@ -957,7 +1057,17 @@ def run_alpaca_replay(cfg) -> None:
     final_v = hist[-1]
     ret_pct = (final_v / initial_capital - 1) * 100
 
-    bars_per_year = int(getattr(cfg.buyer, "bars_per_year", 98280))
+    # FIX — bars_per_year calcolato dinamicamente dall'intervallo configurato,
+    # con fallback al valore YAML. Questo evita che un YAML errato (es. 98280
+    # invece di 49140 per 2m) gonfi silenziosamente lo Sharpe annualizzato.
+    _interval_to_bars_per_day = {"1m": 390, "2m": 195, "5m": 78, "15m": 26, "1h": 7, "1d": 1}
+    _bars_day = _interval_to_bars_per_day.get(freq, None)
+    if _bars_day is not None:
+        bars_per_year = _bars_day * 252
+        log.info(f"  bars_per_year calcolato: {bars_per_year} ({freq} → {_bars_day} barre/giorno × 252)")
+    else:
+        bars_per_year = int(getattr(cfg.buyer, "bars_per_year", 49140))
+        log.info(f"  bars_per_year dal YAML: {bars_per_year}")
     returns  = np.diff(hist) / (hist[:-1] + 1e-8)
     sharpe   = (float(returns.mean()) / (float(returns.std()) + 1e-8)
                 * np.sqrt(bars_per_year)) if len(returns) > 1 else 0.0
@@ -980,6 +1090,8 @@ def run_alpaca_replay(cfg) -> None:
     log.info(f"  Operazioni BUY    : {n_buys:>10,}")
     log.info(f"  Operazioni SELL   : {n_sells:>10,}")
     log.info(f"  Transaction cost  : {p['transaction_cost']:.4f} (dal YAML)")
+    log.info(f"  bars_per_year     : {bars_per_year} (calcolato da {freq})")
+    log.info(f"  Carnot gate       : attivo (soglia adattiva per efficienza di mercato)")
     log.info(sep)
 
     if trade_log_rows:

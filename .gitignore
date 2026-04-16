@@ -1,17 +1,44 @@
-# Python-generated files
+# Python
 __pycache__/
 *.py[oc]
 build/
 dist/
 wheels/
 *.egg-info
+
+# Environment
 .env
+.venv
+
+# ── SICUREZZA — mai committare questi file ────────────────────────────────────
+# Se presenti in repo, revoca i token su:
+#   https://myaccount.google.com/permissions
+#   https://console.cloud.google.com/apis/credentials
+credentials.json
+token.json
+*.pem
+*.key
+secrets/
+
+# ── Dati di mercato — rigenerati automaticamente al boot ─────────────────────
+data_minute.csv
+data_daily.csv
+*.csv
+
+# ── Checkpoint modelli — usa Git LFS o upload_to_drive.py ───────────────────
+# I .zip sono i checkpoint SB3 (stable-baselines3 salva in questo formato)
+checkpoints/*.pth
+checkpoints/*.zip
+checkpoints/*.npz
+checkpoints/*.ckpt
+
+# ── Output e log ─────────────────────────────────────────────────────────────
+outputs/
+results/
+*.log
 *.png
 *.jpg
 *.jpeg
-*.log
 
-# Virtual environments
-.venv
-
-checkpoints/*.ckpt
+# ── Hydra ────────────────────────────────────────────────────────────────────
+.hydra/

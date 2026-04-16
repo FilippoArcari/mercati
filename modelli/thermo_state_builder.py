@@ -84,6 +84,10 @@ EXTENDED_THERMO_COLS = [
     "Thm_MPRI",          # Monetary Pressure Resonance Index
     "Thm_Helmholtz",     # ΔF = Δ(U - T·S)  (<0 = trade spontaneo)
     "Thm_Quality",       # dW / (T·dS)  (rapporto lavoro/calore dissipato)
+    # ── ThermoNewFeatures (thermo_new_features.py) — v3.1 ─────────────────
+    "Thm_CSI",           # Compressive Stasis Index: Z(P)/|Z(ΔW)| — stasi pre-correzione
+    "Thm_IIR",           # Information Injection Rate: freq(dS/dt<0) — breakout imminente
+    "Thm_LDI",           # Lag Drift Index: Δ(lag_ottimale) — efficienza vs policy monetaria
 ]
 
 # Finestre adattive per frequenza
@@ -320,48 +324,78 @@ class ThermoStateBuilder:
         tickers: list[str],
     ) -> pd.DataFrame:
         """
-        Calcola tutte le feature termodinamiche canoniche.
+        Costruisce il DataFrame termodinamico canonico seguendo una pipeline
+        ordinata a stadi. Ogni stadio dipende solo dall'output degli stadi
+        precedenti, evitando forward-reference e doppioni.
 
-        Input:
-          df_raw  — DataFrame raw con colonne prezzo/volume e opzionalmente tassi.
-          tickers — Lista dei ticker da usare per costruire il portafoglio aggregato.
+        Pipeline
+        ---------
+          1. Aggregazione portafoglio  -> close, volume
+          2. Fisica VdW base           -> raw_pressure, raw_temperature,
+                                          raw_entropy, raw_work
+          3. Segnali monetari          -> baseline, best_lag  [solo daily]
+          4. Segnali derivati          -> stress, efficiency, ent_norm, regime
+          5. Colonne canoniche         -> CANONICAL_COLS
+          6. Colonne extended base     -> GibbsEnergy, StressAccel
+          7. Resilienza Psi            -> Thm_Psi_{t}  [solo daily]
+          8. ThermoStatistics          -> Zmarket, CarnotEff, EntropyProd,
+                                          MPRI, Helmholtz, Quality
+          9. ThermoInnovations         -> Phase, MonetaryLag, SellSignal,
+                                          StressZScore  [solo daily]
+         10. ThermoNewFeatures         -> CSI, IIR, LDI
+                                          (IIR usa Thm_EntropyProd da stadio 8)
+         11. Trust scores              -> Trust_{col}
+         12. Sanitizzazione finale e log
 
-        Output:
-          DataFrame con colonne CANONICAL_COLS + eventualmente Thm_Psi_{ticker}.
-          Stesso indice di df_raw, nessun NaN.
+        Output
+        -------
+          DataFrame con lo stesso indice di df_raw, zero NaN, colonne
+          CANONICAL_COLS + EXTENDED_THERMO_COLS + Psi + Trust.
         """
+
+        # ======================================================================
+        # STADIO 1 -- Aggregazione portafoglio
+        # ======================================================================
         close, volume = self._aggregate_portfolio(df_raw, tickers)
-        base          = _compute_pressure_temperature_work(
+
+        # ======================================================================
+        # STADIO 2 -- Fisica Van der Waals base
+        # ======================================================================
+        base = _compute_pressure_temperature_work(
             close, volume, self.windows,
             self.a_attraction, self.b_excluded,
         )
 
-        # ── Baseline pressione attesa (solo daily) ──────────────────────────
-        baseline = None
-        if self.is_daily:
-            rates_col = _find_rates_col(df_raw)
-            if rates_col:
-                rates     = df_raw[rates_col].ffill().bfill()
-                best_lag  = self._find_best_lag(base["raw_pressure"], rates)
-                self._best_lag = best_lag
-                baseline  = (1.0 / (rates.shift(best_lag) + 1e-5))
-                print(f"[ThermoBuilder] Lag monetario ottimale: {best_lag}gg")
+        # ======================================================================
+        # STADIO 3 -- Segnali monetari (solo daily)
+        # ======================================================================
+        rates_col = _find_rates_col(df_raw)
+        rates     = df_raw[rates_col].ffill().bfill() if rates_col else None
+        baseline  = None
 
-        # ── Calcolo segnali derivati ────────────────────────────────────────
+        if self.is_daily and rates is not None:
+            best_lag       = self._find_best_lag(base["raw_pressure"], rates)
+            self._best_lag = best_lag
+            baseline       = 1.0 / (rates.shift(best_lag) + 1e-5)
+            print(f"[ThermoBuilder] Lag monetario ottimale: {best_lag}gg")
+
+        # ======================================================================
+        # STADIO 4 -- Segnali derivati
+        # ======================================================================
         w_s = self.windows["stress"]
         w_e = self.windows["efficiency"]
 
         stress     = _compute_stress(base["raw_pressure"], baseline, w_s)
         efficiency = _compute_efficiency(base["raw_work"], close, w_e)
 
-        # Entropia normalizzata [0, 1]
-        ent_raw    = base["raw_entropy"]
-        ent_lo, ent_hi = ent_raw.quantile(0.01), ent_raw.quantile(0.99)
-        ent_norm   = ((ent_raw - ent_lo) / max(ent_hi - ent_lo, 1e-8)).clip(0, 1)
+        ent_raw           = base["raw_entropy"]
+        ent_lo, ent_hi    = ent_raw.quantile(0.01), ent_raw.quantile(0.99)
+        ent_norm          = ((ent_raw - ent_lo) / max(ent_hi - ent_lo, 1e-8)).clip(0, 1)
+        regime            = _classify_regime(stress, efficiency, ent_norm)
 
-        regime = _classify_regime(stress, efficiency, ent_norm)
-
-        # ── Normalizzazione colonne canoniche ───────────────────────────────
+        # ======================================================================
+        # STADIO 5 -- Colonne canoniche
+        # ======================================================================
         result = pd.DataFrame(index=df_raw.index)
         result["Thm_Pressure"]    = _norm_minmax(_sanitize(base["raw_pressure"]))
         result["Thm_Temperature"] = _norm_minmax(_sanitize(base["raw_temperature"]))
@@ -371,122 +405,37 @@ class ThermoStateBuilder:
         result["Thm_Entropy"]     = _sanitize(ent_norm, fill=0.5)
         result["Thm_Regime"]      = regime
 
-        # ── Gibbs Free Energy: G = H - T·S ─────────────────────────────────
-        # H (entalpia) ≈ pressione × |lavoro| → energia contenuta nel trend corrente.
-        # T = temperatura (agitazione locale), S = entropia (disordine).
-        # G < 0 → processo spontaneo → trade energeticamente favorevole.
-        # G > 0 → processo non spontaneo → il mercato sta "forzando" il movimento.
+        # ======================================================================
+        # STADIO 6 -- Colonne extended base
+        # ======================================================================
+
+        # Gibbs Free Energy: G = H - T*S
+        #   H ~= P * |W|  (energia contenuta nel trend)
+        #   G < 0 -> processo spontaneo -> trade energeticamente favorevole
+        #   G > 0 -> il mercato sta forzando il movimento -> attenzione
         H_raw = base["raw_pressure"].abs() * (base["raw_work"].abs() + 1e-8)
         G_raw = H_raw - base["raw_temperature"] * base["raw_entropy"]
         result["Thm_GibbsEnergy"] = _sanitize(_norm_minmax(_sanitize(G_raw)))
 
-        # ── Stress Acceleration: d²(Stress)/dt² ────────────────────────────
-        # Derivata seconda dello stress. Positivo = stress accelera verso l'alto
-        # (sell anticipato). Usata in TradingEnv [Fix #15] per il bonus sell precoce.
-        d1_stress = result["Thm_Stress"].diff()
-        d2_stress = d1_stress.diff()
+        # Stress Acceleration: d2(Stress)/dt2
+        #   Positivo -> stress accelera verso l'alto -> sell anticipato
+        d2_stress = result["Thm_Stress"].diff().diff()
         result["Thm_StressAccel"] = _sanitize(d2_stress.clip(-3.0, 3.0), fill=0.0)
 
-        # ── Psi per ticker (daily only) ─────────────────────────────────────
-        if self.is_daily:
-            rates_col = _find_rates_col(df_raw)
-            if rates_col:
-                psi_df = self._compute_psi(df_raw, tickers, rates_col)
-                if not psi_df.empty:
-                    result = pd.concat([result, psi_df], axis=1)
+        # ======================================================================
+        # STADIO 7 -- Resilienza Psi per ticker (solo daily)
+        # ======================================================================
+        if self.is_daily and rates_col:
+            psi_df = self._compute_psi(df_raw, tickers, rates_col)
+            if not psi_df.empty:
+                result = pd.concat([result, psi_df], axis=1)
 
-        result = result.ffill().bfill().fillna(0.0)
-
-        # ── Trust scores ────────────────────────────────────────────────────
-        if self.add_trust:
-            try:
-                from signal_trust import SignalTrustEngine
-            except ImportError:
-                from modelli.signal_trust import SignalTrustEngine
-
-            engine = SignalTrustEngine(
-                horizon     = self.trust_horizon,
-                window      = self.trust_window,
-                is_intraday = not self.is_daily,
-            )
-            trust_df = engine.fit_transform(result, close)
-            if not trust_df.empty:
-                result = pd.concat([result, trust_df], axis=1)
-                result = result.ffill().bfill().fillna(0.0)
-
-        n_trust    = len([c for c in result.columns if c.startswith("Trust_")])
-        n_psi      = len([c for c in result.columns if c.startswith("Thm_Psi")])
-        n_extended = len([c for c in result.columns if c in EXTENDED_THERMO_COLS])
-        print(
-            f"[ThermoBuilder] {'Daily' if self.is_daily else 'Intraday'} | "
-            f"{len(result.columns)} col totali: "
-            f"{len(CANONICAL_COLS)} canonical + {n_extended} extended "
-            f"+ {n_psi} Psi + {n_trust} Trust"
-        )
-        
-         # ★ NUOVO: Integra feature termodinamiche avanzate (innovations)
+        # ======================================================================
+        # STADIO 8 -- ThermoStatistics
+        #   Produce Thm_EntropyProd -- necessario per IIR nello stadio 10
+        # ======================================================================
         try:
-            # Prepara DataFrame temporaneo con dati necessari
-            temp_df = pd.DataFrame(index=df_raw.index)
-            temp_df['Close'] = close
-            temp_df['Market_Pressure'] = base["raw_pressure"]
-            temp_df['Market_Temperature'] = base["raw_temperature"]
-            temp_df['Market_Entropy'] = base["raw_entropy"]
-            temp_df['Market_Work_Cum'] = base["raw_work"]
-            
-            # Trova rates_col se disponibile
-            rates_col = _find_rates_col(df_raw)
-            if rates_col:
-                temp_df['DGS10'] = df_raw[rates_col]
-            else:
-                temp_df['DGS10'] = 0.045  # default
-            
-            # Calcola feature avanzate (lag adattivo, efficiency, phase, etc.)
-            temp_df_enhanced = compute_advanced_thermo_features(
-                temp_df,
-                pressure_col='Market_Pressure',
-                temp_col='Market_Temperature',
-                entropy_col='Market_Entropy',
-                work_col='Market_Work_Cum',
-                price_col='Close',
-                rates_col='DGS10'
-            )
-            
-            # Aggiungi solo le nuove colonne al result
-            new_cols = [
-                'Thm_Phase', 
-                'Thm_Efficiency',  # Sovrascrive quella esistente con versione avanzata
-                'Thm_MonetaryLag',
-                'Thm_StressThreshold',
-                'Thm_SellSignal',
-                'Thm_StressZScore'
-            ]
-            
-            for col in new_cols:
-                if col in temp_df_enhanced.columns:
-                    # Thm_Phase è stringa, converti in int per il modello
-                    if col == 'Thm_Phase':
-                        phase_map = {
-                            'Espansione': 0,
-                            'Compressione': 1,
-                            'Transizione': 2,
-                            'Caos': 3
-                        }
-                        result[col] = temp_df_enhanced[col].map(phase_map).fillna(2).astype(float)
-                    else:
-                        result[col] = temp_df_enhanced[col]
-            
-            print(f"[ThermoBuilder] ✅ Thermo Innovations integrate: {len(new_cols)} nuove feature")
-            
-        except Exception as e:
-            print(f"[ThermoBuilder] ⚠️  Errore in thermo innovations (continuo senza): {e}")
-        
-        # ── ThermoStatistics Engine (Z_market, Carnot, EntropyProd, MPRI, Helmholtz, Quality) ──
-        try:
-            rates_col_stat  = _find_rates_col(df_raw)
-            rates_series    = df_raw[rates_col_stat].ffill().bfill() if rates_col_stat else None
-            log_vol         = np.log1p(volume.clip(lower=1.0))
-
+            log_vol   = _sanitize(np.log1p(volume.clip(lower=1.0)))
             ts_engine = ThermoStatisticsEngine(
                 is_intraday = not self.is_daily,
                 n_particles = float(max(len(tickers), 1)),
@@ -497,17 +446,129 @@ class ThermoStateBuilder:
                 entropy     = result["Thm_Entropy"],
                 work_cum    = result["Thm_Work"],
                 log_volume  = log_vol,
-                rates       = rates_series,
+                rates       = rates,
             )
             result = pd.concat([result, stats_df], axis=1)
-            print(f"[ThermoBuilder] ✅ ThermoStatistics integrate: {STAT_COLS}")
-        except Exception as e:
-            print(f"[ThermoBuilder] ⚠️  ThermoStatistics skip: {e}")
+            print(f"[ThermoBuilder] \u2705 ThermoStatistics integrate: {STAT_COLS}")
+        except Exception as _e:
+            print(f"[ThermoBuilder] \u26a0\ufe0f  ThermoStatistics skip: {_e}")
 
-        # Assicurati che tutto sia sanitizzato
+        # ======================================================================
+        # STADIO 9 -- ThermoInnovations  (solo daily: richiede tassi)
+        #   Phase, MonetaryLag, SellSignal, StressZScore
+        #   Thm_Efficiency viene sovrascritto con la versione adattiva
+        # ======================================================================
+        if self.is_daily:
+            try:
+                _PHASE_MAP = {
+                    "Espansione": 0, "Compressione": 1,
+                    "Transizione": 2, "Caos": 3,
+                }
+                _INNO_COLS = [
+                    "Thm_Phase", "Thm_Efficiency", "Thm_MonetaryLag",
+                    "Thm_StressThreshold", "Thm_SellSignal", "Thm_StressZScore",
+                ]
+                tmp = pd.DataFrame({
+                    "Close":              close,
+                    "Market_Pressure":    base["raw_pressure"],
+                    "Market_Temperature": base["raw_temperature"],
+                    "Market_Entropy":     base["raw_entropy"],
+                    "Market_Work_Cum":    base["raw_work"],
+                    "DGS10": (
+                        rates if rates is not None
+                        else pd.Series(0.045, index=df_raw.index)
+                    ),
+                }, index=df_raw.index)
+
+                tmp_enh = compute_advanced_thermo_features(
+                    tmp,
+                    pressure_col = "Market_Pressure",
+                    temp_col     = "Market_Temperature",
+                    entropy_col  = "Market_Entropy",
+                    work_col     = "Market_Work_Cum",
+                    price_col    = "Close",
+                    rates_col    = "DGS10",
+                )
+                n_inno = 0
+                for col in _INNO_COLS:
+                    if col not in tmp_enh.columns:
+                        continue
+                    result[col] = (
+                        tmp_enh[col].map(_PHASE_MAP).fillna(2).astype(float)
+                        if col == "Thm_Phase"
+                        else tmp_enh[col]
+                    )
+                    n_inno += 1
+                print(f"[ThermoBuilder] \u2705 Thermo Innovations integrate: {n_inno} nuove feature")
+            except Exception as _e:
+                print(f"[ThermoBuilder] \u26a0\ufe0f  Thermo Innovations skip: {_e}")
+
+        # ======================================================================
+        # STADIO 10 -- ThermoNewFeatures: CSI / IIR / LDI
+        #   IIR usa Thm_EntropyProd prodotto dallo stadio 8.
+        #   CSI e LDI usano la pressione GREZZA (z-score interni piu' stabili).
+        # ======================================================================
+        try:
+            from modelli.thermo_new_features import compute_new_thermo_features
+
+            # IIR: usa dS/dt da ThermoStatistics se disponibile,
+            # altrimenti fallback alla diff prima dell'entropia canonica.
+            entropy_rate = (
+                result["Thm_EntropyProd"]
+                if "Thm_EntropyProd" in result.columns
+                else result["Thm_Entropy"].diff().fillna(0)
+            )
+            new_feats = compute_new_thermo_features(
+                pressure_raw = base["raw_pressure"],
+                work_raw     = base["raw_work"],
+                entropy_rate = entropy_rate,
+                rates        = rates,
+                is_intraday  = not self.is_daily,
+            )
+            result = pd.concat([result, new_feats], axis=1)
+            print("[ThermoBuilder] \u2705 ThermoNewFeatures integrate: CSI, IIR, LDI")
+        except Exception as _e:
+            print(f"[ThermoBuilder] \u26a0\ufe0f  ThermoNewFeatures skip: {_e}")
+
+        # ======================================================================
+        # STADIO 11 -- Trust scores
+        # ======================================================================
+        if self.add_trust:
+            try:
+                try:
+                    from signal_trust import SignalTrustEngine
+                except ImportError:
+                    from modelli.signal_trust import SignalTrustEngine
+
+                engine = SignalTrustEngine(
+                    horizon     = self.trust_horizon,
+                    window      = self.trust_window,
+                    is_intraday = not self.is_daily,
+                )
+                trust_df = engine.fit_transform(result, close)
+                if not trust_df.empty:
+                    result = pd.concat([result, trust_df], axis=1)
+            except Exception as _e:
+                print(f"[ThermoBuilder] \u26a0\ufe0f  SignalTrust skip: {_e}")
+
+        # ======================================================================
+        # STADIO 12 -- Sanitizzazione finale e log
+        # ======================================================================
         result = result.ffill().bfill().fillna(0.0)
 
+        n_canonical = len(CANONICAL_COLS)
+        n_extended  = len([c for c in result.columns if c in EXTENDED_THERMO_COLS])
+        n_psi       = len([c for c in result.columns if c.startswith("Thm_Psi_")])
+        n_trust     = len([c for c in result.columns if c.startswith("Trust_")])
+        print(
+            f"[ThermoBuilder] {'Daily' if self.is_daily else 'Intraday'} | "
+            f"{len(result.columns)} col totali: "
+            f"{n_canonical} canonical + {n_extended} extended "
+            f"+ {n_psi} Psi + {n_trust} Trust"
+        )
+
         return result
+
 
     @property
     def canonical_cols(self) -> list[str]:
