@@ -30,6 +30,15 @@ FIX H  [NUOVO] Integrazione thermo_vdw: compute_vdw_block chiamato dopo
        NOTA: questa aggiunge 8 colonne → state_dim cambia → i checkpoint
        DDPG esistenti sono incompatibili. Cancellare ddpg_*.pth e
        normalizer_*.npz prima di riaddestrare.
+
+FIX C1 [NUOVO v6.0] ruin_stop_pct / ruin_penalty propagati a TradingEnv
+       via _env_reward_kwargs. Hard stop-loss a -70% del capitale che
+       termina l'episodio prima dell'overflow numpy — causa radice dei
+       return -176992% / -1.16 miliardi% nei fold del walk-forward.
+
+FIX C4 [NUOVO v6.0] holding_urgency_* propagati a TradingEnv. Penalità
+       crescente linearmente oltre holding_urgency_start step, che risolve
+       il "18 BUY, 0 SELL" osservato nell'alpaca_replay.
 """
 
 from __future__ import annotations
@@ -259,7 +268,7 @@ def _plot_portfolio_daily(daily, tickers, initial_capital, results_dir, freq):
 
 
 def _plot_learning(history, results_dir, freq):
-    fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(13, 12), sharex=True)
     episodes  = list(range(1, len(history) + 1))
 
     rewards = [h["total_reward"] for h in history]
@@ -272,19 +281,41 @@ def _plot_learning(history, results_dir, freq):
     axes[0].set_ylabel("Reward")
     axes[0].grid(True, alpha=0.25)
 
+    # Solo Sharpe validi (no ruin, no piatti) — distingue segnale reale da garbage
     sharpes = [h["sharpe"] for h in history]
-    axes[1].plot(episodes, sharpes, color="green", linewidth=1.5)
+    is_ruin = [h.get("ruin", False) for h in history]
+    valid_eps   = [e for e, r in zip(episodes, is_ruin) if not r]
+    valid_sharp = [s for s, r in zip(sharpes, is_ruin) if not r]
+    ruin_eps    = [e for e, r in zip(episodes, is_ruin) if r]
+    axes[1].plot(valid_eps, valid_sharp, color="green", linewidth=1.5, label="Sharpe (valido)")
+    if ruin_eps:
+        axes[1].scatter(ruin_eps, [0.0] * len(ruin_eps),
+                        color="red", marker="x", s=30, zorder=5, label="Ruin (escluso da ES)")
     axes[1].axhline(0, color="gray", linestyle="--", linewidth=0.8)
-    axes[1].set_title("Sharpe ratio per episodio")
+    axes[1].axhline(0.5, color="green", linestyle=":", linewidth=0.8, alpha=0.6, label="Target 0.5")
+    axes[1].set_title("Sharpe ratio per episodio (solo validi)")
     axes[1].set_ylabel("Sharpe")
+    axes[1].legend(fontsize=8)
     axes[1].grid(True, alpha=0.25)
 
-    sigmas = [h["noise_sigma"] for h in history]
-    axes[2].plot(episodes, sigmas, color="purple", linewidth=1.5)
-    axes[2].set_title("Decadimento rumore σ")
-    axes[2].set_xlabel("Episodio")
-    axes[2].set_ylabel("σ")
+    # Ruin rate rolling — indica se l'agente sta imparando a non andare in ruin
+    ruin_int = [1 if r else 0 for r in is_ruin]
+    ruin_rate = pd.Series(ruin_int).rolling(20, min_periods=1).mean() * 100
+    axes[2].fill_between(episodes, ruin_rate, color="red", alpha=0.35, label="Ruin rate (MA 20 ep.)")
+    axes[2].plot(episodes, ruin_rate, color="darkred", linewidth=1.0)
+    axes[2].axhline(10, color="orange", linestyle=":", linewidth=0.8, label="Soglia 10%")
+    axes[2].set_title("Ruin rate % (rolling 20 ep.) — deve scendere nel tempo")
+    axes[2].set_ylabel("Ruin %")
+    axes[2].set_ylim(-5, 105)
+    axes[2].legend(fontsize=8)
     axes[2].grid(True, alpha=0.25)
+
+    sigmas = [h["noise_sigma"] for h in history]
+    axes[3].plot(episodes, sigmas, color="purple", linewidth=1.5)
+    axes[3].set_title("Decadimento rumore σ")
+    axes[3].set_xlabel("Episodio")
+    axes[3].set_ylabel("σ")
+    axes[3].grid(True, alpha=0.25)
 
     plt.tight_layout()
     out = os.path.join(results_dir, f"ddpg_learning_{freq}.png")
@@ -527,6 +558,8 @@ def _plot_fold_portfolio(
 
 def _env_reward_kwargs(bcfg) -> dict:
     """
+    Centralizza tutti i parametri passati a TradingEnv.__init__().
+
     [FIX E] lambda_inaction default: 0.2 → 0.005
             Con 0.2 l'agente imparava che non fare nulla era peggio di qualsiasi
             trade, causando overtrading sistematico.
@@ -537,20 +570,35 @@ def _env_reward_kwargs(bcfg) -> dict:
 
     [FIX G] transaction_cost ora viene propagato esplicitamente dal YAML
             così è garantito identico a quello usato in alpaca_live.py.
+
+    [FIX C1] ruin_stop_pct / ruin_penalty: hard stop-loss che termina l'episodio
+             prima che il portafoglio vada negativo, prevenendo overflow numpy
+             e NaN nel normalizzatore.
+
+    [FIX C4] holding_urgency_*: penalità crescente linearmente per posizioni
+             tenute troppo a lungo, diversa dall'holding_decay fisso del
+             ThermoRewardGate. Crea pressione dinamica a vendere.
     """
     return dict(
-        thermo_bonus_sell       = getattr(bcfg, "thermo_bonus_sell",          0.5),
-        thermo_penalty_buy      = getattr(bcfg, "thermo_penalty_buy",         0.1),
-        lambda_inaction         = getattr(bcfg, "lambda_inaction",            0.005),  # FIX E
-        lambda_concentration    = getattr(bcfg, "lambda_concentration",       0.6),
-        sell_profit_bonus       = getattr(bcfg, "sell_profit_bonus",          0.015),
-        max_holding_steps       = getattr(bcfg, "max_holding_steps",          60),
-        forced_sell_cooldown    = getattr(bcfg, "forced_sell_cooldown_steps", 10),
-        lambda_imbalance        = getattr(bcfg, "lambda_imbalance",           0.3),
-        imbalance_threshold     = getattr(bcfg, "imbalance_threshold",        2.0),
-        concentration_threshold = getattr(bcfg, "concentration_threshold",    0.4),
-        reward_clip             = getattr(bcfg, "reward_clip",                0.05),  # FIX F
-        fee_pct                 = getattr(bcfg, "transaction_cost",           0.001), # FIX G
+        thermo_bonus_sell       = getattr(bcfg, "thermo_bonus_sell",           0.5),
+        thermo_penalty_buy      = getattr(bcfg, "thermo_penalty_buy",          0.1),
+        lambda_inaction         = getattr(bcfg, "lambda_inaction",             0.005),  # FIX E
+        lambda_concentration    = getattr(bcfg, "lambda_concentration",        0.6),
+        sell_profit_bonus       = getattr(bcfg, "sell_profit_bonus",           0.015),
+        max_holding_steps       = getattr(bcfg, "max_holding_steps",           60),
+        forced_sell_cooldown    = getattr(bcfg, "forced_sell_cooldown_steps",  10),
+        lambda_imbalance        = getattr(bcfg, "lambda_imbalance",            0.3),
+        imbalance_threshold     = getattr(bcfg, "imbalance_threshold",         2.0),
+        concentration_threshold = getattr(bcfg, "concentration_threshold",     0.4),
+        reward_clip             = getattr(bcfg, "reward_clip",                 0.05),  # FIX F
+        fee_pct                 = getattr(bcfg, "transaction_cost",            0.001), # FIX G
+        # ── [Fix C1] Ruin prevention ─────────────────────────────────────────
+        ruin_stop_pct           = getattr(bcfg, "ruin_stop_pct",               0.30),
+        ruin_penalty            = getattr(bcfg, "ruin_penalty",                50.0),
+        # ── [Fix C4] Urgency holding crescente ───────────────────────────────
+        holding_urgency_start   = getattr(bcfg, "holding_urgency_start",       30),
+        holding_urgency_rate    = getattr(bcfg, "holding_urgency_rate",        0.008),
+        holding_urgency_max     = getattr(bcfg, "holding_urgency_max",         0.40),
     )
 
 
@@ -956,6 +1004,11 @@ def run_walk_forward(
             f"ratio={ts['buy_sell_ratio']:.1f} | Thm✅: {thermo_sell_ok:.1f}%"
         )
 
+        # [Fix C1] Calcola ruin_rate: quanti episodi del fold sono terminati
+        # per hard stop-loss. Con i fix implementati dovrebbe scendere a ~0.
+        ruin_episodes = sum(1 for h in history if h.get("ruin", False))
+        ruin_rate_pct = (ruin_episodes / max(1, len(history))) * 100.0
+
         from modelli.walk_forward import FoldResult
         fold_res = FoldResult(
             fold               = fold_n,
@@ -971,6 +1024,7 @@ def run_walk_forward(
             n_episodes_run     = len(history),
             best_episode       = best_ep["episode"],
             thermo_sell_ok_pct = thermo_sell_ok,
+            ruin_rate_pct      = ruin_rate_pct,
         )
         report.folds.append(fold_res)
         prev_best_path = fold_best

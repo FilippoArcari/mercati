@@ -1,14 +1,25 @@
 """
 modelli/obs_normalizer.py
 
-FIX (v2.1):
+FIX (v3.0) — NaN GUARD nel RunningMeanStd + reset automatico stats corrotte:
+  • [Fix C2b] RunningMeanStd.update() sanitizza batch_mean e batch_var con
+              nan_to_num prima di aggiornare le statistiche running. Un singolo
+              NaN in ingresso (es. da overflow in trading_env.py) avvelenava
+              mean/var per il resto dell'episodio e di quelli successivi.
+  • [Fix C2c] Se dopo l'update mean o var contengono ancora NaN/inf, le
+              statistiche vengono resettate al valore corrente (batch_mean/1.0).
+              Questo garantisce che il normalizzatore rimanga sempre in uno
+              stato valido anche in presenza di spike estremi.
+  • [Fix C2d] ObsNormalizer.normalize() esegue un nan_to_num difensivo sul
+              risultato finale prima del clip. Difesa in profondità: anche se
+              RunningMeanStd fosse corrotto, l'obs restituita all'agente è sempre
+              finita e clippa correttamente.
+
+FIX (v2.1) — precedente:
   • HistoryAndDecayCallback legge le metriche da infos[0]["episode"] invece
-    che dall'env già resettato da DummyVecEnv. Questo risolve il bug per cui
-    Portfolio=$100 e Sharpe=0.000 per tutti gli episodi (perché l'env veniva
-    auto-resettato da DummyVecEnv prima che il callback leggesse i dati).
-  • ThermoNoiseCallback riceve agent_wrapper (non base_sigma fisso) per far
-    funzionare correttamente il decay del sigma nel tempo.
-  • Normalizer salvato solo quando il checkpoint è salvato (stesso criterio).
+    che dall'env già resettato da DummyVecEnv.
+  • ThermoNoiseCallback riceve agent_wrapper per il decay corretto del sigma.
+  • Normalizer salvato solo quando il checkpoint è salvato.
 """
 
 import numpy as np
@@ -29,9 +40,14 @@ class RunningMeanStd:
         self.count = epsilon
 
     def update(self, x: np.ndarray):
-        batch_mean  = np.mean(x, axis=0)
-        batch_var   = np.var(x,  axis=0)
-        batch_count = x.shape[0] if x.ndim > 1 else 1
+        # [Fix C2b] Sanitizza l'input prima di usarlo per aggiornare le stats.
+        # Un NaN in x (es. da overflow del portafoglio) avvelena mean e var
+        # permanentemente, rendendo ogni normalizzazione successiva NaN.
+        x_safe = np.nan_to_num(x, nan=0.0, posinf=5.0, neginf=-5.0)
+
+        batch_mean  = np.mean(x_safe, axis=0)
+        batch_var   = np.var(x_safe,  axis=0)
+        batch_count = x_safe.shape[0] if x_safe.ndim > 1 else 1
 
         delta     = batch_mean - self.mean
         tot_count = self.count + batch_count
@@ -41,6 +57,13 @@ class RunningMeanStd:
         m_b      = batch_var * batch_count
         m2       = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
         new_var  = m2 / tot_count
+
+        # [Fix C2c] Se il nuovo stato è ancora corrotto (es. spike estremo
+        # che supera la sanitizzazione), resetta le statistiche al valore
+        # corrente piuttosto che propagare la corruzione.
+        if np.any(~np.isfinite(new_mean)) or np.any(~np.isfinite(new_var)):
+            new_mean = np.nan_to_num(new_mean, nan=batch_mean, posinf=0.0, neginf=0.0)
+            new_var  = np.nan_to_num(new_var,  nan=1.0,        posinf=1.0, neginf=1.0)
 
         self.mean  = new_mean
         self.var   = new_var
@@ -58,6 +81,11 @@ class ObsNormalizer:
 
         std      = np.sqrt(self.rms.var + 1e-8)
         norm_obs = (obs - self.rms.mean) / std
+
+        # [Fix C2d] Difesa in profondità: se std ≈ 0 o rms.mean è corrotto,
+        # norm_obs potrebbe essere inf/NaN. Sanitizziamo prima del clip finale
+        # così l'agente riceve sempre un tensore completamente finito.
+        norm_obs = np.nan_to_num(norm_obs, nan=0.0, posinf=self.clip, neginf=-self.clip)
 
         return np.clip(norm_obs, -self.clip, self.clip).astype(np.float32)
 
@@ -144,6 +172,16 @@ class HistoryAndDecayCallback(BaseCallback):
                                     e.portfolio_history()[-1] if hasattr(e, "portfolio_history") else e.initial_capital)
             sharpe    = ep_data.get("sharpe",       0.0)
             max_dd    = ep_data.get("max_drawdown", 0.0)
+            is_ruin   = ep_data.get("ruin", False)
+
+            # [Fix C5] Se l'episodio è terminato per ruin o senza trade,
+            # non aggiornare best_sharpe né resettare il contatore no_improve.
+            # Un ruin con Sharpe=0 non è "uguale a uno Sharpe 0 valido":
+            # deve essere trattato come un fallimento silenzioso.
+            sharpe_is_valid = (
+                not is_ruin
+                and abs(sharpe) > 1e-6  # esclude episodi completamente piatti
+            )
 
             # Noise decay a fine episodio (aggiorna solo agent.noise.sigma)
             self.agent_wrapper.decay_noise(
@@ -160,12 +198,13 @@ class HistoryAndDecayCallback(BaseCallback):
                 "noise_sigma":     self.agent_wrapper.noise.sigma,
                 "critic_loss":     0.0,
                 "actor_loss":      0.0,
+                "ruin":            is_ruin,
             }
             self.history.append(ep_info)
             self.ep_reward = 0.0
 
-            # Early Stopping / Saving
-            if sharpe > self.best_sharpe:
+            # Early Stopping / Saving — solo su Sharpe validi (no ruin, no piatto)
+            if sharpe_is_valid and sharpe > self.best_sharpe:
                 self.best_sharpe = sharpe
                 self.no_improve  = 0
                 if self.norm_path:
@@ -176,7 +215,8 @@ class HistoryAndDecayCallback(BaseCallback):
                 self.no_improve += 1
 
             if self.ep % self.log_every == 0:
-                best_tag = " ★" if self.no_improve == 0 else f" ({self.no_improve}/{self.es_patience})"
+                best_tag  = " ★" if self.no_improve == 0 else f" ({self.no_improve}/{self.es_patience})"
+                ruin_tag  = " 💀RUIN" if is_ruin else ""
                 print(
                     f"Ep {self.ep:4d}/{self.n_episodes} | "
                     f"Reward: {ep_info['total_reward']:+.4f} | "
@@ -184,7 +224,7 @@ class HistoryAndDecayCallback(BaseCallback):
                     f"Sharpe: {sharpe:.3f} | "
                     f"MaxDD: {max_dd:.3f} | "
                     f"σ: {self.agent_wrapper.noise.sigma:.3f}"
-                    f"{best_tag}"
+                    f"{ruin_tag}{best_tag}"
                 )
 
             if self.no_improve >= self.es_patience or self.ep >= self.n_episodes:

@@ -2,20 +2,35 @@
 modelli/trading_env.py — Ambiente di trading per DDPG con Reward Gate Termodinamico
 =====================================================================================
 
+FIX v6.0 — RUIN PREVENTION + NaN GUARD + SELL URGENCY:
+  • [Fix C1] Hard stop-loss: se il valore del portafoglio scende sotto
+             initial_capital * ruin_stop_pct (default 0.30), l'episodio
+             termina immediatamente con reward = -ruin_penalty (default 50.0).
+             Questo impedisce che il portafoglio vada negativo e che i valori
+             overflow compromettano il normalizzatore e il critic.
+  • [Fix C2] NaN/overflow guard in _get_state(): ogni osservazione viene
+             sanitizzata con np.nan_to_num prima di essere restituita.
+             Rompe la cascata: overflow in _df_values → NaN in obs → gradienti
+             esplosi → policy network collassa.
+  • [Fix C3] NaN guard in _get_portfolio_value(): impedisce che un singolo
+             prezzo NaN corrompa il valore totale del portafoglio.
+  • [Fix C4] Penalità holding CRESCENTE linearmente: oltre holding_urgency_start
+             (default 30 step) scala -holding_urgency_rate per step aggiuntivo,
+             creando urgenza crescente a chiudere le posizioni. Distinto dal
+             holding_decay del ThermoRewardGate (che è fisso dopo holding_decay_start).
+  • [Fix C5] sharpe_ratio() restituisce 0.0 se non ci sono trade effettuati,
+             impedendo che uno Sharpe garbage venga usato come segnale di early stopping.
+  • [Fix C6] max_drawdown() clippato a [-10.0, 0.0]: valori tipo -706722 erano
+             prodotti da equity negativa; ora impossibile per Fix C1 ma il clip
+             è una difesa in profondità.
+  • [Fix C7] Gymnasium (non gym) già in uso — confermato OK in questo file.
+
 FIX v5.0 — BUY/SELL IMBALANCE:
-  • [Fix B1] TradingEnv.__init__ ora accetta lambda_inaction, lambda_concentration,
-             sell_profit_bonus, max_holding_steps, forced_sell_cooldown_steps,
-             lambda_imbalance — precedentemente definiti nel YAML ma mai passati
-             all'ambiente (bug silenzioso che rendeva tutto il reward shaping inattivo).
-  • [Fix B2] sell_mult_expansion: 0.9 → 1.2 nel default ThermoRewardConfig.
-             Con 0.9 vendere in regime espansivo era penalizzato rispetto a comprare,
-             insegnando all'agente a non vendere mai.
-  • [Fix B3] Forced sell implementato in step(): quando _bars_in_position[t] >= max_holding_steps
-             la posizione viene liquidata forzatamente.
-  • [Fix B4] Buy/sell imbalance penalty nel reward: penalità proporzionale al ratio
-             episodico cumulative_buys / max(1, cumulative_sells) quando supera
-             imbalance_threshold (default 2.0).
-  • [Fix B5] Holding decay applicato sul ticker peggiore (max), non sulla media.
+  • [Fix B1] Tutti i parametri reward shaping ora effettivamente passati e usati.
+  • [Fix B2] sell_mult_expansion: 0.9 → 1.2.
+  • [Fix B3] Forced sell quando bars_in_position >= max_holding_steps.
+  • [Fix B4] Imbalance penalty episodico buy/sell.
+  • [Fix B5] Holding decay sul ticker peggiore (max), non media.
   • [Fix B6] Sell profit bonus proporzionale al gain realizzato.
 
 FIX v4.1:
@@ -158,6 +173,13 @@ class TradingEnv(gym.Env):
         imbalance_threshold:     float = 2.0,
         concentration_threshold: float = 0.4,
         reward_clip:             float = 10.0,
+        # ── [Fix C1] Ruin prevention ──────────────────────────────────────────
+        ruin_stop_pct:           float = 0.30,   # termina episodio se equity < capital * X
+        ruin_penalty:            float = 50.0,   # reward negativo al momento del ruin
+        # ── [Fix C4] Urgency holding crescente ───────────────────────────────
+        holding_urgency_start:   int   = 30,     # step oltre cui inizia l'urgenza
+        holding_urgency_rate:    float = 0.008,  # penalità aggiuntiva per step extra
+        holding_urgency_max:     float = 0.40,   # cap totale urgenza
     ):
         super().__init__()
 
@@ -192,6 +214,14 @@ class TradingEnv(gym.Env):
         self.imbalance_threshold     = imbalance_threshold
         self.concentration_threshold = concentration_threshold
         self.reward_clip             = reward_clip
+        # [Fix C1] Ruin prevention
+        self.ruin_stop_pct          = ruin_stop_pct
+        self.ruin_penalty           = ruin_penalty
+        self._ruin_threshold        = initial_capital * ruin_stop_pct
+        # [Fix C4] Urgency holding crescente
+        self.holding_urgency_start  = holding_urgency_start
+        self.holding_urgency_rate   = holding_urgency_rate
+        self.holding_urgency_max    = holding_urgency_max
 
         self._price_col_idx: dict[str, int] = {}
         df_cols = list(self.df.columns)
@@ -275,7 +305,14 @@ class TradingEnv(gym.Env):
         return obs, {}
 
     def _get_state(self, step: int) -> np.ndarray:
-        obs = self._df_values[step]
+        # [Fix C2] Sanitizza i dati grezzi prima di usarli come osservazione.
+        # Un singolo NaN/inf in _df_values (es. da overflow del portafoglio o
+        # da un ticker con dati mancanti) avvelena l'intera osservazione e
+        # corrompe il running mean/std del normalizzatore.
+        obs = np.nan_to_num(
+            self._df_values[step],
+            nan=0.0, posinf=5.0, neginf=-5.0,
+        ).astype(np.float32)
 
         holdings_val = sum(
             self.positions[t] * self._price(step, t) for t in self.tickers
@@ -284,11 +321,16 @@ class TradingEnv(gym.Env):
             self.balance / (self.initial_capital + 1e-8),
             holdings_val / (self.initial_capital + 1e-8),
         ], dtype=np.float32)
+        # Sanitizza anche le variabili di stato del portafoglio
+        port_state = np.nan_to_num(port_state, nan=0.0, posinf=10.0, neginf=-10.0)
 
         thermo_state = np.array([], dtype=np.float32)
         if self._has_thermo:
             idx = min(step, len(self._thermo_values) - 1)
-            thermo_state = self._thermo_values[idx]
+            thermo_state = np.nan_to_num(
+                self._thermo_values[idx],
+                nan=0.0, posinf=5.0, neginf=-5.0,
+            ).astype(np.float32)
 
         return np.concatenate([obs, port_state, thermo_state])
 
@@ -393,6 +435,29 @@ class TradingEnv(gym.Env):
         new_value = self._get_portfolio_value()
         self._portfolio_history.append(new_value)
 
+        # ── [Fix C1] Hard stop-loss: ruin prevention ─────────────────────────
+        # Se il portafoglio scende sotto la soglia minima, termina l'episodio
+        # immediatamente con una penalità pesante. Questo impedisce:
+        #   (a) che il valore vada negativo producendo percentuali impossibili
+        #   (b) che il cast numpy overflow corrompa le osservazioni successive
+        #   (c) che il normalizzatore riceva sequenze divergenti
+        if new_value < self._ruin_threshold and not self.done:
+            self.done = True
+            ruin_reward = -abs(self.ruin_penalty)
+            obs = self._get_state(self.current_step)
+            info = {
+                "step": self.current_step,
+                "ruin": True,
+                "episode_metrics": {
+                    "portfolio_value": new_value,
+                    "sharpe":          self.sharpe_ratio(),
+                    "max_drawdown":    self.max_drawdown(),
+                    "n_trades":        len(self._trades),
+                    "ruin":            True,
+                },
+            }
+            return obs, float(np.clip(ruin_reward, -self.reward_clip, self.reward_clip)), True, False, info
+
         reward = self._calculate_reward(prev_value, new_value, action_types)
         obs    = self._get_state(self.current_step)
 
@@ -408,10 +473,15 @@ class TradingEnv(gym.Env):
         return obs, reward, self.done, False, info
 
     def _get_portfolio_value(self) -> float:
+        # [Fix C3] Ogni price() potrebbe essere NaN se il df ha buchi.
+        # np.nan_to_num garantisce che un singolo ticker corrotto non
+        # azzeri (o renda NaN) l'intero valore del portafoglio.
         value = self.balance
         for t in self.tickers:
-            value += self.positions[t] * self._price(self.current_step, t)
-        return float(value)
+            raw_price = self._price(self.current_step, t)
+            safe_price = float(np.nan_to_num(raw_price, nan=0.0, posinf=0.0, neginf=0.0))
+            value += self.positions[t] * safe_price
+        return float(np.nan_to_num(value, nan=self.initial_capital))
 
     def _calculate_reward(
         self,
@@ -478,6 +548,16 @@ class TradingEnv(gym.Env):
                 imbalance_pen = self.lambda_imbalance * min(excess_ratio, 1.0)
                 reward -= imbalance_pen
 
+        # ── [Fix C4] Urgency holding CRESCENTE ───────────────────────────────
+        # Diverso da holding_decay (fisso dopo holding_decay_start):
+        # questa penalità cresce linearmente con ogni step extra oltre
+        # holding_urgency_start. L'agente sente crescente pressione a uscire.
+        if held_bars_max > self.holding_urgency_start:
+            urgency_steps = held_bars_max - self.holding_urgency_start
+            urgency_pen   = min(urgency_steps * self.holding_urgency_rate,
+                                self.holding_urgency_max)
+            reward -= urgency_pen
+
         # ── [Fix B6] Sell profit bonus proporzionale al gain ─────────────────
         # Il bonus cresce con il gain realizzato (max 3x sell_profit_bonus).
         # Incentiva a vendere in profitto invece di accumulare perdite latenti.
@@ -504,22 +584,41 @@ class TradingEnv(gym.Env):
         return np.array(self._portfolio_history, dtype=np.float64)
 
     def sharpe_ratio(self) -> float:
+        # [Fix C5] Restituisce 0.0 se non ci sono stati trade: uno Sharpe
+        # calcolato su serie piatte (0 operazioni) produce valori garbage
+        # (NaN o numeri enormi) che falsano l'early stopping basato su Sharpe.
+        n_sells = sum(1 for t in self._trades if t["type"] == "SELL")
+        n_buys  = sum(1 for t in self._trades if t["type"] == "BUY")
+        if n_sells == 0 and n_buys == 0:
+            return 0.0
+
         h = self.portfolio_history()
         if len(h) < 2:
             return 0.0
+        # Sanifica: equity negativa o NaN produce ritorni non stazionari
+        h = np.nan_to_num(h, nan=self.initial_capital, posinf=self.initial_capital)
+        h = np.clip(h, 1e-6, None)  # nessun valore negativo
         returns = np.diff(h) / (h[:-1] + 1e-8)
-        std     = np.std(returns)
-        if len(returns) < 2 or std == 0:
+        returns = np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+        std = np.std(returns)
+        if len(returns) < 2 or std < 1e-10:
             return 0.0
-        return float(np.mean(returns) / std * np.sqrt(self.bars_per_year))
+        return float(np.clip(
+            np.mean(returns) / std * np.sqrt(self.bars_per_year),
+            -100.0, 100.0,  # Sharpe fisico impossibile oltre ±100
+        ))
 
     def max_drawdown(self) -> float:
         h = self.portfolio_history()
         if len(h) < 2:
             return 0.0
+        # [Fix C6] Sanifica prima di calcolare: equity negativa produce drawdown
+        # in percentuale impossibili (tipo -706722%) che rendono i report inutili.
+        h = np.nan_to_num(h, nan=self.initial_capital)
+        h = np.clip(h, 1e-6, None)
         peak = np.maximum.accumulate(h)
         dd   = (h - peak) / (peak + 1e-8)
-        return float(np.min(dd))
+        return float(np.clip(np.min(dd), -10.0, 0.0))
 
     def trade_stats(self) -> dict:
         buys   = sum(1 for t in self._trades if t["type"] == "BUY")

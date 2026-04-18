@@ -60,6 +60,9 @@ class FoldResult:
     best_episode:       int
     thermo_sell_ok_pct: float = 0.0
     thermo_buy_bad_pct: float = 0.0
+    # [Fix C1] Traccia la percentuale di episodi terminati per ruin
+    # in questo fold — indicatore diagnostico della stabilità del training
+    ruin_rate_pct:      float = 0.0
 
 
 # ── Report aggregato ───────────────────────────────────────────────────────────
@@ -99,6 +102,11 @@ class WalkForwardReport:
     def mean_thermo_sell_ok(self) -> float:
         return float(np.mean([f.thermo_sell_ok_pct for f in self.folds])) if self.folds else 0.0
 
+    @property
+    def mean_ruin_rate(self) -> float:
+        """Percentuale media di episodi terminati per ruin tra i fold."""
+        return float(np.mean([f.ruin_rate_pct for f in self.folds])) if self.folds else 0.0
+
     # ── Giudizio produzione ────────────────────────────────────────────────
 
     @property
@@ -106,14 +114,16 @@ class WalkForwardReport:
         """
         Il modello è pronto per la produzione solo se supera TUTTI i criteri.
         Non basta un fold eccellente se gli altri sono disastrosi.
+        Aggiunto criterio [Fix C1]: ruin rate medio < 30%.
         """
         return (
-            len(self.folds) >= 3                  # almeno 3 fold per essere statisticamente significativo
+            len(self.folds) >= 3                  # almeno 3 fold statisticamente significativi
             and self.mean_sharpe > 0.5            # rendimento risk-adjusted soddisfacente
             and self.worst_sharpe > -0.3          # nessun fold catastrofico
             and self.mean_max_drawdown > -0.20    # drawdown medio contenuto
             and self.mean_return > 0.0            # rendimento netto positivo in media
             and self.std_sharpe < 0.8             # stabilità cross-fold (non fortuna)
+            and self.mean_ruin_rate < 30.0        # agente non va in ruin > 30% degli episodi
         )
 
     # ── Output ────────────────────────────────────────────────────────────
@@ -132,26 +142,32 @@ class WalkForwardReport:
         print(f"  WALK-FORWARD VALIDATION [{self.mode.upper()}] — {len(self.folds)} fold")
         print(sep)
 
-        # Tabella per fold
+        # Tabella per fold — i return vengono clippati a ±9999% per leggibilità.
+        # Valori tipo -1.16 miliardi% indicavano overflow; con Fix C1 non si
+        # verificheranno più, ma il clip garantisce output leggibile in ogni caso.
         hdr = (f"  {'Fold':<5} {'Train':>9} {'Test':>8} {'Sharpe':>8} "
-               f"{'Return':>9} {'MaxDD':>8} {'Thm✅%':>7} {'Ep':>5}")
+               f"{'Return':>10} {'MaxDD':>8} {'Thm✅%':>7} {'Ruin%':>6} {'Ep':>5}")
         print(hdr)
-        print(f"  {'-'*5} {'-'*9} {'-'*8} {'-'*8} {'-'*9} {'-'*8} {'-'*7} {'-'*5}")
+        print(f"  {'-'*5} {'-'*9} {'-'*8} {'-'*8} {'-'*10} {'-'*8} {'-'*7} {'-'*6} {'-'*5}")
 
         for f in self.folds:
             marker = " ★" if f.sharpe == self.best_sharpe else ""
             marker = " ✗" if f.sharpe == self.worst_sharpe and len(self.folds) > 1 else marker
+            ret_display = np.clip(f.total_return_pct, -9999.0, 9999.0)
+            overflow_tag = "~" if abs(f.total_return_pct) > 9999.0 else " "
             print(
                 f"  {f.fold:<5} {f.train_bars:>9,} {f.test_bars:>8,} "
-                f"{f.sharpe:>8.3f} {f.total_return_pct:>8.2f}% "
+                f"{f.sharpe:>8.3f} {overflow_tag}{ret_display:>8.2f}% "
                 f"{f.max_drawdown:>8.3f} {f.thermo_sell_ok_pct:>6.1f}% "
+                f"{f.ruin_rate_pct:>5.1f}% "
                 f"{f.best_episode:>5}{marker}"
             )
 
         print(sep)
+        mean_ret_display = np.clip(self.mean_return, -9999.0, 9999.0)
         print(
             f"  {'Media':<5} {'':>9} {'':>8} {self.mean_sharpe:>8.3f} "
-            f"{self.mean_return:>8.2f}% {self.mean_max_drawdown:>8.3f} "
+            f" {mean_ret_display:>8.2f}% {self.mean_max_drawdown:>8.3f} "
             f"{self.mean_thermo_sell_ok:>6.1f}%"
         )
         print(f"  Std Sharpe cross-fold: {self.std_sharpe:.3f}  "
@@ -164,8 +180,9 @@ class WalkForwardReport:
             ("Sharpe medio > 0.5",       self.mean_sharpe > 0.5,         f"{self.mean_sharpe:.3f}"),
             ("Worst fold Sharpe > -0.3", self.worst_sharpe > -0.3,       f"{self.worst_sharpe:.3f}"),
             ("MaxDD medio > -20%",       self.mean_max_drawdown > -0.20, f"{self.mean_max_drawdown:.3f}"),
-            ("Rendimento medio > 0%",    self.mean_return > 0.0,         f"{self.mean_return:.2f}%"),
+            ("Rendimento medio > 0%",    self.mean_return > 0.0,         f"{mean_ret_display:.2f}%"),
             ("Std Sharpe < 0.8",         self.std_sharpe < 0.8,          f"{self.std_sharpe:.3f}"),
+            ("Ruin rate medio < 30%",    self.mean_ruin_rate < 30.0,     f"{self.mean_ruin_rate:.1f}%"),
         ]
 
         verdict = (

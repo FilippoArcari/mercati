@@ -5,32 +5,53 @@ transaction_cost: 0.001
 
 buffer_capacity: 250000
 batch_size:      256
-n_episodes:      300           # ← Aumentato da 100 (più training)
-warmup:          5000          # ← Aumentato da 3000 (più esplorazione)
+n_episodes:      500           # aumentato: più episodi per convergenza stabile
+warmup_steps:    5000
 log_every:       50
-es_patience:     40            # ← Aumentato da 20 (less aggressive stopping)
+es_patience:     75            # aumentato: evita stop prematuro prima della convergenza
 es_metric:       sharpe        # "sharpe" | "portfolio" | "reward"
 
-# ── Reward shaping per INTRADAY ───────────────────────────────────────────────
-# Aggressivo: spingiamo l'agente a VENDERE e DIVERSIFICARE
-lambda_concentration: 0.8      # ← Aumentato da 0.1 (penalizza concentration)
-lambda_inaction:      0.3      # ← Aumentato da 0.05 (penalizza HOLD eccessivo)
-action_threshold:     0.01     # ← Ridotto da 0.05 (più sensibile alle azioni)
-lambda_loss:          0.5      # Penalità per perdite eccessive
-loss_threshold:       -0.5     # Soglia di perdita (-50%)
+# ── [Fix C1] Ruin prevention ─────────────────────────────────────────────────
+# Se il portafoglio scende al 30% del capitale iniziale l'episodio termina.
+# Impedisce overflow numpy, NaN nel normalizzatore e drawdown impossibili.
+ruin_stop_pct:  0.30           # termina se equity < capital * 0.30
+ruin_penalty:   50.0           # reward negativo applicato al momento del ruin
 
-# ── DDPG INTRADAY ────────────────────────────────────────────────────────────
+# ── Reward shaping ───────────────────────────────────────────────────────────
+reward_clip:              0.05  # [Fix F] max ±5% per step — riduce gradienti catastrofici
+lambda_concentration:     0.6   # penalizza troppi ticker aperti contemporaneamente
+lambda_inaction:          0.005 # [Fix E] penalità hold — bassa per non indurre overtrading
+lambda_loss:              0.5   # penalità per perdite eccessive
+lambda_imbalance:         0.3   # penalità se ratio buy/sell > imbalance_threshold
+imbalance_threshold:      2.0   # ratio buy/sell massimo tollerato
+action_threshold:         0.01  # soglia minima azione per triggherare un trade
+loss_threshold:           -0.5  # soglia perdita episodica
+
+# ── Holding management ───────────────────────────────────────────────────────
+sell_profit_bonus:         0.015  # bonus proporzionale al gain realizzato alla vendita
+max_holding_steps:         60     # barre massime prima del forced sell
+forced_sell_cooldown_steps: 10   # cooldown barre post forced-sell
+concentration_threshold:   0.4   # frazione ticker aperti oltre cui scatta penalità
+
+# ── [Fix C4] Urgency holding crescente ───────────────────────────────────────
+# Penalità che cresce linearmente per ogni step oltre holding_urgency_start.
+# Distinta da holding_decay (fissa): crea pressione crescente a vendere.
+holding_urgency_start: 30    # step da cui inizia la pressione crescente
+holding_urgency_rate:  0.008 # penalità aggiuntiva per step extra
+holding_urgency_max:   0.40  # cap massimo urgenza per episodio
+
+# ── DDPG ─────────────────────────────────────────────────────────────────────
 ddpg:
   actor_hidden:  [512, 256, 128]
   critic_hidden: [512, 256, 128]
-  lr_actor:      0.0002        # ← Aumentato da 0.0001 (convergenza più veloce)
-  lr_critic:     0.0005        # ← Aumentato da 0.0003
+  lr_actor:      0.0002
+  lr_critic:     0.0005
   gamma:         0.99
   tau:           0.005
   update_every:  10
-  noise_sigma:   0.1           # ← Ridotto da 0.2 (meno esplorazione random)
-  noise_decay:   0.99          # ← Ridotto da 0.995 (decay più lento, esplora più a lungo)
-  noise_floor:   0.02          # ← Ridotto da 0.05 (rumore minimo più basso)
+  noise_sigma:   0.1
+  noise_decay:   0.99
+  noise_floor:   0.02
 
 # ── DQN (placeholder) ────────────────────────────────────────────────────────
 dqn:
