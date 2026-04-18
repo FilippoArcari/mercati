@@ -3,7 +3,7 @@
 interval: "2m"
 label: "minute"
 bars_per_day: 390
-bars_per_year: 98280    # 390 barre/giorno × 252 giorni di trading
+bars_per_year: 49140    # 390 barre/giorno × 252 giorni di trading
 cache_path: "./data_minute.csv"
 max_history_days: 60      #Massimo 60 giorni di dati intraday (circa 2730 barre per asset) Limite di Yahoo Finance per dati intraday
 
