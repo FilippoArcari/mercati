@@ -556,49 +556,52 @@ def _plot_fold_portfolio(
 
 # ─── reward kwargs ────────────────────────────────────────────────────────────
 
-def _env_reward_kwargs(bcfg) -> dict:
+def _env_reward_kwargs(bcfg, freq_cfg=None) -> dict:
     """
     Centralizza tutti i parametri passati a TradingEnv.__init__().
 
     [FIX E] lambda_inaction default: 0.2 → 0.005
-            Con 0.2 l'agente imparava che non fare nulla era peggio di qualsiasi
-            trade, causando overtrading sistematico.
-
     [FIX F] reward_clip default: 10.0 → 0.05
-            Con clip=10 i gradienti catastrofici destabilizzavano il critic.
-            0.05 = max ±5% per step, già abbondante per intraday 2m.
-
-    [FIX G] transaction_cost ora viene propagato esplicitamente dal YAML
-            così è garantito identico a quello usato in alpaca_live.py.
-
-    [FIX C1] ruin_stop_pct / ruin_penalty: hard stop-loss che termina l'episodio
-             prima che il portafoglio vada negativo, prevenendo overflow numpy
-             e NaN nel normalizzatore.
-
-    [FIX C4] holding_urgency_*: penalità crescente linearmente per posizioni
-             tenute troppo a lungo, diversa dall'holding_decay fisso del
-             ThermoRewardGate. Crea pressione dinamica a vendere.
+    [FIX G] transaction_cost propagato esplicitamente dal YAML.
+    [FIX C1] ruin_stop_pct / ruin_penalty.
+    [FIX C4] holding_urgency_*.
+    [FIX D1] bars_per_year_override: inietta il valore dal config/frequency/*.yaml
+             nel TradingEnv così non viene ricalcolato dall'indice stridato del df
+             delle predizioni (stride=3 su 2m → avg_sec=360 → 16380 invece di 49140).
+    [FIX D2] max_total_exposure_pct: cap globale esposizione portafoglio.
+    [FIX D3] sell_unconditional_bonus: rompe il bootstrap problem del BUY-only.
     """
+    # bars_per_year dal config di frequenza (es. config/frequency/minute.yaml)
+    bpy = None
+    if freq_cfg is not None:
+        bpy = int(getattr(freq_cfg, "bars_per_year", 0)) or None
+
     return dict(
-        thermo_bonus_sell       = getattr(bcfg, "thermo_bonus_sell",           0.5),
-        thermo_penalty_buy      = getattr(bcfg, "thermo_penalty_buy",          0.1),
-        lambda_inaction         = getattr(bcfg, "lambda_inaction",             0.005),  # FIX E
-        lambda_concentration    = getattr(bcfg, "lambda_concentration",        0.6),
-        sell_profit_bonus       = getattr(bcfg, "sell_profit_bonus",           0.015),
-        max_holding_steps       = getattr(bcfg, "max_holding_steps",           60),
-        forced_sell_cooldown    = getattr(bcfg, "forced_sell_cooldown_steps",  10),
-        lambda_imbalance        = getattr(bcfg, "lambda_imbalance",            0.3),
-        imbalance_threshold     = getattr(bcfg, "imbalance_threshold",         2.0),
-        concentration_threshold = getattr(bcfg, "concentration_threshold",     0.4),
-        reward_clip             = getattr(bcfg, "reward_clip",                 0.05),  # FIX F
-        fee_pct                 = getattr(bcfg, "transaction_cost",            0.001), # FIX G
+        thermo_bonus_sell        = getattr(bcfg, "thermo_bonus_sell",            0.5),
+        thermo_penalty_buy       = getattr(bcfg, "thermo_penalty_buy",           0.1),
+        lambda_inaction          = getattr(bcfg, "lambda_inaction",              0.005),  # FIX E
+        lambda_concentration     = getattr(bcfg, "lambda_concentration",         0.6),
+        sell_profit_bonus        = getattr(bcfg, "sell_profit_bonus",            0.015),
+        max_holding_steps        = getattr(bcfg, "max_holding_steps",            60),
+        forced_sell_cooldown     = getattr(bcfg, "forced_sell_cooldown_steps",   10),
+        lambda_imbalance         = getattr(bcfg, "lambda_imbalance",             0.3),
+        imbalance_threshold      = getattr(bcfg, "imbalance_threshold",          2.0),
+        concentration_threshold  = getattr(bcfg, "concentration_threshold",      0.4),
+        reward_clip              = getattr(bcfg, "reward_clip",                  0.05),  # FIX F
+        fee_pct                  = getattr(bcfg, "transaction_cost",             0.001), # FIX G
         # ── [Fix C1] Ruin prevention ─────────────────────────────────────────
-        ruin_stop_pct           = getattr(bcfg, "ruin_stop_pct",               0.30),
-        ruin_penalty            = getattr(bcfg, "ruin_penalty",                50.0),
+        ruin_stop_pct            = getattr(bcfg, "ruin_stop_pct",                0.70),
+        ruin_penalty             = getattr(bcfg, "ruin_penalty",                 50.0),
         # ── [Fix C4] Urgency holding crescente ───────────────────────────────
-        holding_urgency_start   = getattr(bcfg, "holding_urgency_start",       30),
-        holding_urgency_rate    = getattr(bcfg, "holding_urgency_rate",        0.008),
-        holding_urgency_max     = getattr(bcfg, "holding_urgency_max",         0.40),
+        holding_urgency_start    = getattr(bcfg, "holding_urgency_start",        30),
+        holding_urgency_rate     = getattr(bcfg, "holding_urgency_rate",         0.008),
+        holding_urgency_max      = getattr(bcfg, "holding_urgency_max",          0.40),
+        # ── [Fix D1] bars_per_year corretto ──────────────────────────────────
+        bars_per_year_override   = bpy,
+        # ── [Fix D2] Cap esposizione totale ──────────────────────────────────
+        max_total_exposure_pct   = getattr(bcfg, "max_total_exposure_pct",       1.0),
+        # ── [Fix D3] Sell bootstrap bonus ────────────────────────────────────
+        sell_unconditional_bonus = getattr(bcfg, "sell_unconditional_bonus",     0.0),
     )
 
 
@@ -663,20 +666,22 @@ def run_trade(
 
     # ── 4. Ambienti ───────────────────────────────────────────────────────────
     buyer_cfg = cfg.buyer
-    rw        = _env_reward_kwargs(buyer_cfg)
+    rw        = _env_reward_kwargs(buyer_cfg, freq_cfg=cfg.frequency)
 
     env_train = TradingEnv(
-        df              = prices_real_train,
-        tickers         = tickers,
-        initial_capital = buyer_cfg.initial_capital,
-        thermo_df       = thermo_train,
+        df               = prices_real_train,
+        tickers          = tickers,
+        initial_capital  = buyer_cfg.initial_capital,
+        max_position_pct = getattr(buyer_cfg, "max_position_pct", 0.05),
+        thermo_df        = thermo_train,
         **rw,
     )
     env_test = TradingEnv(
-        df              = prices_real_test,
-        tickers         = tickers,
-        initial_capital = buyer_cfg.initial_capital,
-        thermo_df       = thermo_test,
+        df               = prices_real_test,
+        tickers          = tickers,
+        initial_capital  = buyer_cfg.initial_capital,
+        max_position_pct = getattr(buyer_cfg, "max_position_pct", 0.05),
+        thermo_df        = thermo_test,
         **rw,
     )
 
@@ -854,7 +859,7 @@ def run_walk_forward(
     checkpoint_dir = cfg.paths.checkpoint_dir
     results_dir    = cfg.paths.results_dir
     es_patience    = getattr(buyer_cfg, "es_patience", 20)
-    rw             = _env_reward_kwargs(buyer_cfg)  # [FIX E/F/G] centralizzato
+    rw             = _env_reward_kwargs(buyer_cfg, freq_cfg=cfg.frequency)  # [FIX D1+E+F+G]
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(results_dir,    exist_ok=True)
@@ -862,8 +867,14 @@ def run_walk_forward(
     builder = ThermoStateBuilder(interval=freq)
     report  = WalkForwardReport(mode=mode)
 
-    # _env_common usa rw che già include fee_pct (FIX G)
-    _env_common = dict(tickers=tickers, initial_capital=buyer_cfg.initial_capital, **rw)
+    # _env_common usa rw che già include fee_pct (FIX G), bars_per_year_override (FIX D1), ecc.
+    # max_position_pct viene aggiunto esplicitamente perché non transitava via _env_reward_kwargs.
+    _env_common = dict(
+        tickers         = tickers,
+        initial_capital = buyer_cfg.initial_capital,
+        max_position_pct = getattr(buyer_cfg, "max_position_pct", 0.05),
+        **rw,
+    )
 
     prev_best_path:  str | None          = None
     prev_thermo_df:  pd.DataFrame | None = None

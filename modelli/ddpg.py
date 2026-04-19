@@ -127,7 +127,7 @@ class DDPGAgent:
         self.noise = DummyNoise(noise_sigma)
         self.episodic_buffer = None
 
-    def set_env(self, env):
+    def set_env(self, env, learning_starts: int = 500):
         if self.model is None:
             action_noise = OrnsteinUhlenbeckActionNoise(**self.action_noise_kwargs)
             self.model = DDPG(
@@ -141,6 +141,11 @@ class DDPGAgent:
                 train_freq=(self.update_every, "step"),
                 action_noise=action_noise,
                 policy_kwargs=self.policy_kwargs,
+                # [Fix D5] learning_starts esplicito: quanti step random prima
+                # di iniziare gli update del critic. 500 step = ~2-3 episodi
+                # brevi (invece del default SB3 = 100, troppo pochi per
+                # popolare il buffer con esperienze eterogenee BUY+SELL).
+                learning_starts=learning_starts,
                 device=self.device,
                 verbose=0,
             )
@@ -277,4 +282,4 @@ def compute_thermo_profile(
         raise ValueError("Nessuna colonna Thm_* trovata in thermo_df.")
 
     window = thermo_df.iloc[start_idx:end_idx][available]
-    return window.mean(axis=0).values.astype(np.float32)
+    return window.mean(axis=0).values.astype(np.float32)p

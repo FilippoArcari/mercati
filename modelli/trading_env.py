@@ -2,6 +2,23 @@
 modelli/trading_env.py — Ambiente di trading per DDPG con Reward Gate Termodinamico
 =====================================================================================
 
+FIX v7.0 — SELL BOOTSTRAP + EXPOSURE CAP + SHARPE CORRETTO:
+  • [Fix D1] bars_per_year ora iniettabile dal config (parametro esplicito).
+             Prima veniva calcolato dall'indice del dataframe delle predizioni
+             (stride=3 → avg_sec=360s → 16380 barre/anno invece di 49140),
+             producendo uno Sharpe gonfiato di sqrt(49140/16380) = 1.73×.
+  • [Fix D2] max_total_exposure_pct: limite globale sull'esposizione del
+             portafoglio. Impedisce che l'agente compri 20 ticker a 20%
+             ciascuno svuotando il cash in un episodio.
+  • [Fix D3] sell_unconditional_bonus: piccolo reward per QUALSIASI SELL,
+             anche in perdita. Rompe il problema di bootstrap: nei primi
+             episodi tutti i SELL sono no-op (nessuna posizione aperta) →
+             il buffer si riempie di esperienze "SELL = 0 reward" → l'actor
+             impara che le azioni negative non servono.
+  • [Fix D4] ruin_stop_pct default alzato a 0.70 (stop a -30% drawdown
+             invece di -70%). Con 0.30 l'agente accumulava perdite enormi
+             prima dello stop, intossicando il buffer con esperienze da ruin.
+
 FIX v6.0 — RUIN PREVENTION + NaN GUARD + SELL URGENCY:
   • [Fix C1] Hard stop-loss: se il valore del portafoglio scende sotto
              initial_capital * ruin_stop_pct (default 0.30), l'episodio
@@ -180,6 +197,14 @@ class TradingEnv(gym.Env):
         holding_urgency_start:   int   = 30,     # step oltre cui inizia l'urgenza
         holding_urgency_rate:    float = 0.008,  # penalità aggiuntiva per step extra
         holding_urgency_max:     float = 0.40,   # cap totale urgenza
+        # ── [Fix D1] bars_per_year iniettabile ───────────────────────────────
+        # Se None, viene calcolato dall'indice del df (può essere sbagliato
+        # per df con stride, es. stride=3 su 2m → 16380 invece di 49140).
+        bars_per_year_override:  "int | None" = None,
+        # ── [Fix D2] Cap esposizione totale portafoglio ───────────────────────
+        max_total_exposure_pct:  float = 1.0,   # max % capitale investito in tot
+        # ── [Fix D3] Bonus SELL incondizionato (bootstrap) ───────────────────
+        sell_unconditional_bonus: float = 0.0,  # reward per qualsiasi SELL
     ):
         super().__init__()
 
@@ -222,6 +247,11 @@ class TradingEnv(gym.Env):
         self.holding_urgency_start  = holding_urgency_start
         self.holding_urgency_rate   = holding_urgency_rate
         self.holding_urgency_max    = holding_urgency_max
+        # [Fix D2/D3] Nuovi parametri v7.0
+        self.max_total_exposure_pct  = max_total_exposure_pct
+        self.sell_unconditional_bonus = sell_unconditional_bonus
+        # [Fix D1] bars_per_year_override (viene applicato dopo il calcolo automatico)
+        self._bars_per_year_override = bars_per_year_override
 
         self._price_col_idx: dict[str, int] = {}
         df_cols = list(self.df.columns)
@@ -236,12 +266,16 @@ class TradingEnv(gym.Env):
         diffs = self.df.index.to_series().diff().dt.total_seconds().dropna()
         avg_sec = diffs.median() if not diffs.empty else 120
         self.bars_per_year = max(1, int((252 * 6.5 * 3600) / avg_sec))
-        # Log di verifica: mostra il valore calcolato per individuare YAML errati
+        # [Fix D1] Se fornito dall'esterno usa quello (evita errori da stride nel df predizioni)
+        if self._bars_per_year_override is not None and self._bars_per_year_override > 0:
+            self.bars_per_year = self._bars_per_year_override
+        # Log di verifica
         _expected_map = {60: 98280, 120: 49140, 300: 19656, 900: 6552, 3600: 1764, 86400: 252}
         _nearest_expected = min(_expected_map, key=lambda k: abs(k - avg_sec))
+        override_note = f" [OVERRIDE da config: {self.bars_per_year}]" if self._bars_per_year_override else ""
         print(
             f"[TradingEnv] bars_per_year={self.bars_per_year} "
-            f"(avg_sec={avg_sec:.0f}s ≈ {_expected_map.get(_nearest_expected, '?')} atteso)"
+            f"(avg_sec={avg_sec:.0f}s ≈ {_expected_map.get(_nearest_expected, '?')} atteso){override_note}"
         )
 
         self.action_space = spaces.Box(
@@ -371,6 +405,16 @@ class TradingEnv(gym.Env):
             if act > 0.1:
                 # Nessun rebuy durante cooldown post forced-sell
                 if self._cooldown[ticker] > 0:
+                    action_types[ticker] = "hold"
+                    continue
+                # [Fix D2] Cap esposizione totale: se già investito troppo, no BUY
+                total_invested = sum(
+                    self.positions[t] * self._price(self.current_step, t)
+                    for t in self.tickers
+                )
+                portfolio_val = self.balance + total_invested
+                exposure_pct  = total_invested / (portfolio_val + 1e-8)
+                if exposure_pct >= self.max_total_exposure_pct:
                     action_types[ticker] = "hold"
                     continue
                 max_qty = (self.balance * self.max_position_pct) / (price + 1e-8)
@@ -562,6 +606,14 @@ class TradingEnv(gym.Env):
         # Il bonus cresce con il gain realizzato (max 3x sell_profit_bonus).
         # Incentiva a vendere in profitto invece di accumulare perdite latenti.
         if dominant == "sell":
+            n_sells_this_step = sum(1 for t in self.tickers if action_types.get(t) == "sell")
+            # [Fix D3] Bonus incondizionato per QUALSIASI SELL.
+            # Rompe il bootstrap problem: nei primi episodi le posizioni sono 0,
+            # quindi tutti i SELL sono no-op. Il buffer si riempie di "SELL=0 reward",
+            # l'actor impara che azioni negative non servono a nulla.
+            # Questo bonus piccolo ma costante distingue un SELL eseguito da un no-op.
+            if n_sells_this_step > 0:
+                reward += self.sell_unconditional_bonus * n_sells_this_step
             for t in self.tickers:
                 if action_types.get(t) == "sell":
                     price    = self._price(self.current_step, t)

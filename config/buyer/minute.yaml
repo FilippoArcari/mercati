@@ -1,83 +1,78 @@
-# config/buyer/minute.yaml (ex intraday_override)
-# ── BUYER INTRADAY OVERRIDE ───────────────────────────────────────────────────
-# Caricato SOLO quando frequency=minute.
-#
-# FIX v5.0 — BUY/SELL IMBALANCE:
-#   [Fix B1] Tutti i parametri reward shaping ora vengono effettivamente passati
-#            a TradingEnv (prima erano nel YAML ma ignorati dal codice Python).
-#   [Fix B2] sell_mult_expansion portato a 1.2 nel ThermoRewardConfig (era 0.9,
-#            che penalizzava attivamente le vendite in regime espansivo).
-#   [Fix B3] max_holding_steps abbassato a 60 (2 ore su 2m) da 120 (4 ore):
-#            il forced sell ora si attiva il doppio delle volte.
-#   [Fix B4] lambda_imbalance e imbalance_threshold: nuovi parametri che
-#            introducono una penalità crescente quando buy/sell ratio > 2.0.
-#   [Fix B6] sell_profit_bonus portato a 0.015 da 0.002 (7.5x più alto):
-#            il bonus è proporzionale al gain realizzato, quindi vendere in
-#            profitto diventa significativamente più attraente.
+# config/buyer/minute.yaml — INTRADAY OVERRIDE (2m bars)
+# ═══════════════════════════════════════════════════════════
+# FIX v7.0 — Root cause fixes per BUY-only + Ruin + Sharpe
+# ═══════════════════════════════════════════════════════════
 
 agent: ddpg
 initial_capital:  100.0
 transaction_cost: 0.001
 
-buffer_capacity: 250000
+buffer_capacity: 100000
 log_every:       50
 
 # ── Training ──────────────────────────────────────────────────────────────────
-n_episodes:  500
-batch_size:  4096
-warmup:      5000
-es_patience: 75
+n_episodes:  300
+batch_size:  512
+warmup:      500
+es_patience: 40
 es_metric:   sharpe
 
-# ── Reward shaping (ora effettivamente usati in TradingEnv) ───────────────────
-lambda_concentration:    0.6
-lambda_inaction:         0.2
-action_threshold:        0.005
-inaction_threshold:      0.05
-reward_clip:             10.0
+# ── Reward shaping ────────────────────────────────────────────────────────────
+# [Fix F] CRITICO: abbassato da 10.0 a 0.05
+reward_clip: 0.05
 
-# [Fix B6] Portato da 0.002 a 0.015. Il bonus è proporzionale al gain %
-# (max 3x), quindi vendere a +1% genera un bonus di ~0.030. Con 0.002
-# era impercettibile rispetto alla reward base.
-sell_profit_bonus: 0.015
+lambda_concentration: 0.6
+lambda_inaction:      0.005
+action_threshold:     0.005
+inaction_threshold:   0.05
 
-# Penalità per perdite eccessive
+# [Fix D3] Bonus per qualsiasi SELL eseguito (anche in perdita)
+sell_unconditional_bonus: 0.004
+sell_profit_bonus:        0.08
+
 lambda_loss:    0.5
 loss_threshold: -0.5
 
 # ── Gestione posizioni ────────────────────────────────────────────────────────
-max_position_pct:  0.20
+# [Fix D2] 0.20 → 0.05: ogni ticker usa max il 5% del cash disponibile
+max_position_pct: 0.05
 
-# [Fix B3] Abbassato da 120 a 60 barre (120 min → 60 min su 2m bars).
-# Il forced sell ora scatta dopo 2 ore invece di 4, forzando il turnover.
-max_holding_steps:          60
-forced_sell_cooldown_steps: 10   # abbassato da 20
+# [Fix D2] Nuovo: cap globale esposizione totale investita
+max_total_exposure_pct: 0.40
 
-# ── [Fix B4] Parametri imbalance buy/sell (nuovi) ────────────────────────────
-# Penalità episodica quando cumulative_buys / cumulative_sells > imbalance_threshold.
-# Scala linearmente: a ratio=4.0 la penalità è piena (lambda_imbalance = 0.3).
-lambda_imbalance:    0.3
-imbalance_threshold: 2.0
+# [Fix B3] 60 → 15 barre (30 min): forced sell inietta SELL nel buffer
+max_holding_steps:          15
+forced_sell_cooldown_steps:  3
 
-# Frazione di ticker che possono essere aperti contemporaneamente prima della
-# penalità concentrazione. Su 51 ticker: 0.35 → max ~18 posizioni aperte.
-concentration_threshold: 0.35
+# ── [Fix B4] Imbalance buy/sell ───────────────────────────────────────────────
+lambda_imbalance:    1.0
+imbalance_threshold: 1.5
 
-# ── Sharpe corretto per intraday ─────────────────────────────────────────────
-bars_per_year: 98280
+# Su 51 ticker: 0.10 → max ~5 posizioni aperte contemporaneamente
+concentration_threshold: 0.10
+
+# ── [Fix C1] Ruin prevention ──────────────────────────────────────────────────
+# [Fix D4] 0.30 → 0.70: stop a -30% drawdown invece di -70%
+ruin_stop_pct: 0.70
+ruin_penalty:  50.0
+
+# ── [Fix C4] Urgency holding crescente ───────────────────────────────────────
+holding_urgency_start: 8
+holding_urgency_rate:  0.003
+holding_urgency_max:   0.02
 
 # ── DDPG ─────────────────────────────────────────────────────────────────────
 ddpg:
-  actor_hidden:  [512, 256, 128]
-  critic_hidden: [512, 256, 128]
-  lr_actor:      0.0001
-  lr_critic:     0.0003
-  gamma:         0.98
-  tau:           0.005
-  update_every:  50
-  noise_sigma:   0.15
-  noise_decay:   0.995
-  noise_floor:   0.02
+  actor_hidden:  [256, 128]
+  critic_hidden: [256, 128]
+  lr_actor:      0.0003
+  lr_critic:     0.001
+  gamma:         0.95
+  tau:           0.01
+  update_every:  10
+  noise_sigma:   0.20
+  noise_decay:   0.998
+  noise_floor:   0.05
 
 # ── Thermo shaping ────────────────────────────────────────────────────────────
 lambda_thermo:             0.15
@@ -89,9 +84,6 @@ thermo_bonus_buy:          0.001
 thermo_penalty_buy:        0.003
 
 # ── Trust range ───────────────────────────────────────────────────────────────
-# Con trust medio 0.477:
-#   w = (0.477 - 0.35) / (0.65 - 0.35) = 0.127 / 0.30 = 0.42
-# Thermo opera al ~42% della forza massima.
 trust_min: 0.35
 trust_max: 0.65
 
