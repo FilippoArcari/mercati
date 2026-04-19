@@ -282,4 +282,4 @@ def compute_thermo_profile(
         raise ValueError("Nessuna colonna Thm_* trovata in thermo_df.")
 
     window = thermo_df.iloc[start_idx:end_idx][available]
-    return window.mean(axis=0).values.astype(np.float32)p
+    return window.mean(axis=0).values.astype(np.float32)
