@@ -1,5 +1,0 @@
-- step=train
-- frequency=minute
-- training.epochs=3000
-- training=minute
-- prediction=minute

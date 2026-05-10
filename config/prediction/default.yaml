@@ -1,4 +1,19 @@
-# config/prediction/default.yaml
-# Parametri di predizione per frequenza giornaliera
-window_size: 30
-stride: 1
+name: prediction_config
+optimizer: adam
+learning_rate: 0.001
+epochs: 30
+batch_size: 32
+weight_decay: 0.0001
+hidden_size: 128
+num_heads: 4
+num_layers: 2
+forecast_horizon: 3 
+sliding_window: 500 
+stride: 5 
+kernel_size: 3
+dilation: 3
+patience: 3
+min_delta: 0.001
+dropout: 0.1
+mc_iteration: 1 #TODO: aumentare 
+

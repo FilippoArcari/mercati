@@ -6,7 +6,6 @@ tickers:
   - META
   - NVDA
   - T
-  - VSLA
   - JPM
   - MA
   - UNH
@@ -60,13 +59,14 @@ inflation_series:
   - VIXCLS
   - STLFSI4
   - BAMLH0A0HYM2
-  - CP0000EZ19M086NEST
+  - CPHPTT01EZM659N
   #- CP0000ITM086NEST # inflazione italiana 
   - CP0000ITM086NEST
   - IR3TIB01EZM156N #Euribor 3 mesi
   
-start_date: "2018-01-01"
-end_date: "2026-12-31"
-cache_path: "./data.csv"
+start_date: "2010-01-01"
+end_date: "2026-12-31" #if frequency is less than daily, end_date is ignored and data is fetched until 60 days after start_date 
 fred_api_key: ${oc.env:FRED_API_KEY}
-split_date: "2023-01-01"
+split_train: 0.7
+split_validation: 0.1
+split_test: 0.2

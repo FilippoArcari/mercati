@@ -35,6 +35,7 @@ checkpoints/*.ckpt
 # ── Output e log ─────────────────────────────────────────────────────────────
 outputs/
 results/
+lightning_logs/
 *.log
 *.png
 *.jpg
@@ -42,3 +43,6 @@ results/
 
 # ── Hydra ────────────────────────────────────────────────────────────────────
 .hydra/
+
+.parquet
+
