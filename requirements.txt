@@ -1,39 +1,44 @@
 # Project Dependencies - Mercati
+# Generated from pyproject.toml
+# Python >= 3.13
 
-# Core Dependencies (from pyproject.toml)
+alpaca-py>=0.43.2
 fredapi>=0.5.2
 google-api-python-client>=2.193.0
 google-auth-httplib2>=0.3.1
 google-auth-oauthlib>=1.3.1
+gymnasium>=1.2.3
 hydra-core>=1.3.2
+lightning>=2.6.1
 matplotlib>=3.10.0
+nolds>=0.6.3
+optuna>=4.8.0
+optuna-integration[pytorch-lightning]>=4.8.0
 pandas>=2.3.0
 pandas-datareader>=0.10.0
+powerlaw>=2.0.0
+pyarrow>=24.0.0
+pyinform>=0.2.0
 python-dotenv>=1.2.2
+pytorch-lightning>=2.6.1
+scikit-learn>=1.5.0
+scipy>=1.17.1
+seaborn>=0.13.0
+stable-baselines3[extra]>=2.8.0
+tensorboard>=2.20.0
 torch>=2.10.0
-pytorch-lightning>=2.0.0
-stable-baselines3>=2.0.0
 yfinance>=0.2.66
 
-# Transitive Dependencies (explicitly declared for clarity)
-numpy>=1.26.0
-scipy>=1.14.0
-scikit-learn>=1.5.0
-seaborn>=0.13.0
-
-# ── Acceleratore hardware (installa UNO dei seguenti) ─────────────────────────
+# ── Hardware Accelerator (install ONE of the following) ──────────────────────
 #
 # CUDA (GPU NVIDIA T4 / P100 / etc.):
 #   pip install torch --index-url https://download.pytorch.org/whl/cu118
-#   oppure lascia la dipendenza torch>=2.10.0 sopra (Kaggle la gestisce in auto)
+#   or keep torch>=2.10.0 above (Kaggle handles it automatically)
 #
 # TPU v5e-8 (Kaggle TPU runtime):
-#   torch_xla è pre-installato automaticamente — non serve aggiungerlo.
-#   Su GCP TPU VM manuale:
+#   torch_xla is pre-installed automatically — no need to add it.
+#   On manual GCP TPU VM:
 #     pip install torch_xla[tpu] -f https://storage.googleapis.com/libtpu-releases/index.html
 #
-# In locale (sviluppo su CPU):
-#   nessuna dipendenza aggiuntiva — il codice rileva automaticamente CPU come fallback.
-
-# Python Version Requirement
-# Python >= 3.13
+# Local (CPU development):
+#   no additional dependencies needed — the code automatically detects CPU as fallback.
