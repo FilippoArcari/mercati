@@ -1,13 +1,12 @@
 defaults:
   - data: default
-  - training: default
   - prediction: default
   - trader : default
   - paths: default
   - _self_
  
-step: train  # train | test | trade | stats 
-frequency: 2m #1d
+step: train  # train | test | trade | trade_only | stats 
+frequency: 1d 
 optuna:
   n_trials:   50
   max_epochs: 30

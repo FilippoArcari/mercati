@@ -1,0 +1,287 @@
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    max_batch_size: null
+    params: null
+  help:
+    app_name: ${hydra.job.name}
+    header: '${hydra.help.app_name} is powered by Hydra.
+
+      '
+    footer: 'Powered by Hydra (https://hydra.cc)
+
+      Use --hydra-help to view Hydra specific help
+
+      '
+    template: '${hydra.help.header}
+
+      == Configuration groups ==
+
+      Compose your configuration from those groups (group=option)
+
+
+      $APP_CONFIG_GROUPS
+
+
+      == Config ==
+
+      Override anything in the config (foo.bar=value)
+
+
+      $CONFIG
+
+
+      ${hydra.help.footer}
+
+      '
+  hydra_help:
+    template: 'Hydra (${hydra.runtime.version})
+
+      See https://hydra.cc for more info.
+
+
+      == Flags ==
+
+      $FLAGS_HELP
+
+
+      == Configuration groups ==
+
+      Compose your configuration from those groups (For example, append hydra/job_logging=disabled
+      to command line)
+
+
+      $HYDRA_CONFIG_GROUPS
+
+
+      Use ''--cfg hydra'' to Show the Hydra config.
+
+      '
+    hydra_help: ???
+  hydra_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '[%(asctime)s][HYDRA] %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+    root:
+      level: INFO
+      handlers:
+      - console
+    loggers:
+      logging_example:
+        level: DEBUG
+    disable_existing_loggers: false
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '[%(asctime)s][%(name)s][%(levelname)s] - %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+      file:
+        class: logging.FileHandler
+        formatter: simple
+        filename: ${hydra.runtime.output_dir}/${hydra.job.name}.log
+    root:
+      level: INFO
+      handlers:
+      - console
+      - file
+    disable_existing_loggers: false
+  env: {}
+  mode: MULTIRUN
+  searchpath: []
+  callbacks: {}
+  output_subdir: .hydra
+  overrides:
+    hydra:
+    - hydra.mode=MULTIRUN
+    task:
+    - step=train,test
+    - prediction.epochs=500
+    - prediction.batch_size=128
+  job:
+    name: main
+    chdir: null
+    override_dirname: prediction.batch_size=128,prediction.epochs=500,step=train,test
+    id: ???
+    num: ???
+    config_name: config
+    env_set: {}
+    env_copy: []
+    config:
+      override_dirname:
+        kv_sep: '='
+        item_sep: ','
+        exclude_keys: []
+  runtime:
+    version: 1.3.2
+    version_base: '1.3'
+    cwd: /home/filippo/filippo/progettiPersonali/mercati
+    config_sources:
+    - path: hydra.conf
+      schema: pkg
+      provider: hydra
+    - path: /home/filippo/filippo/progettiPersonali/mercati/config
+      schema: file
+      provider: main
+    - path: ''
+      schema: structured
+      provider: schema
+    output_dir: ???
+    choices:
+      paths: default
+      trader: default
+      prediction: default
+      training: default
+      data: default
+      hydra/env: default
+      hydra/callbacks: null
+      hydra/job_logging: default
+      hydra/hydra_logging: default
+      hydra/hydra_help: default
+      hydra/help: default
+      hydra/sweeper: basic
+      hydra/launcher: basic
+      hydra/output: default
+  verbose: false
+data:
+  tickers:
+  - AAPL
+  - MSFT
+  - AMZN
+  - GOOGL
+  - META
+  - NVDA
+  - T
+  - JPM
+  - MA
+  - UNH
+  - JNJ
+  - LDO.MI
+  - ENI.MI
+  - ENEL.MI
+  - ISP.MI
+  - RACE.MI
+  - ^GSPC
+  - ^IXIC
+  - FTSEMIB.MI
+  - SPY
+  - QQQ
+  - IVV
+  - EEM
+  - EFA
+  - XLF
+  - VNQ
+  - GC=F
+  - CL=F
+  - SI=F
+  - NG=F
+  - HG=F
+  - GLD
+  - SLV
+  - USO
+  - EURUSD=X
+  - USDJPY=X
+  - TLT
+  - BND
+  - IEF
+  - XLE
+  - BTC-USD
+  - ETH-USD
+  - XOM
+  - CVX
+  - WMT
+  - NFLX
+  - BA
+  - KO
+  - PFE
+  - SHOP
+  inflation_series:
+  - CPILFESL
+  - T10YIE
+  - MICH
+  - FEDFUNDS
+  - GS10
+  - T10Y2Y
+  - VIXCLS
+  - STLFSI4
+  - BAMLH0A0HYM2
+  - CPHPTT01EZM659N
+  - CP0000ITM086NEST
+  - IR3TIB01EZM156N
+  start_date: '2010-01-01'
+  end_date: '2026-12-31'
+  fred_api_key: ${oc.env:FRED_API_KEY}
+  split_train: 0.7
+  split_validation: 0.1
+  split_test: 0.2
+training:
+  epochs: 1000
+  learning_rate: 0.001
+  batch_size: 32
+  optimizer: adam
+  weight_decay: 1.0e-05
+  scheduler:
+    enabled: false
+    type: cosine
+    warmup_steps: 100
+  early_stopping:
+    enabled: true
+    patience: 50
+    min_delta: 1.0e-05
+  mre:
+    enabled: true
+    update_mode: simultaneous
+    lambda_entropy: 0.05
+    lambda_moment: 0.1
+    epochs_phase1: 30
+prediction:
+  name: prediction_config
+  optimizer: adam
+  learning_rate: 0.001
+  epochs: 500
+  batch_size: 128
+  weight_decay: 0.0001
+  hidden_size: 128
+  num_heads: 4
+  num_layers: 2
+  forecast_horizon: 3
+  sliding_window: 500
+  stride: 5
+  kernel_size: 3
+  dilation: 3
+  patience: 3
+  min_delta: 0.001
+  dropout: 0.1
+  mc_iteration: 1
+trader:
+  total_timesteps: 50
+  log_every: 25
+paths:
+  output_dir: ${hydra:runtime.output_dir}
+  results_dir: ./results
+  checkpoint_dir: ./checkpoints
+step: train
+frequency: 2m
+optuna:
+  n_trials: 50
+  max_epochs: 30
+  batch_size: 64
+  pruner: hyperband
+  storage: sqlite:///hpo.db
