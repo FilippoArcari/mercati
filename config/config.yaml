@@ -3,6 +3,7 @@ defaults:
   - prediction: default
   - trader : default
   - paths: default
+  - training: default
   - _self_
  
 step: train  # train | test | trade | trade_only | stats 
